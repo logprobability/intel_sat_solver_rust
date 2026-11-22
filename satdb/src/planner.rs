@@ -17,7 +17,8 @@
 //!   (one of its variables has no binder), the solver's UNSAT core names it, and the planner plans the rest, reporting the predicate as pending.
 //! * Cost: a mode literal `m(c,k) <- conditions of mode k` and pairwise literals `z <- before(c,d) AND m(c,k)`, all weighted by `w(c,k)`.
 //!   The weighted sum is a binary adder network; each new clause adds its terms (and the old clauses' terms against it) to the previous sum.
-//!   Only lower bounds on the indicators are encoded: minimizing the sum pushes every indicator down to its true value.
+//!   Only lower bounds are encoded, both on the indicators and in the adders (which guarantee `encoded sum >= true sum`, see `full_adder`):
+//!   the comparators bound the sum from above only, so the exact values always remain a solution, and minimizing pushes everything down to them.
 //! * Optimization: `sum <= K` comparators, each guarded by its own activation literal (assumed by one solve only). The bound starts below the greedy plan's cost
 //!   and tightens after every model, until UNSAT (optimal) or the conflict budget runs out (the best plan so far).
 
@@ -158,6 +159,10 @@ pub(crate) struct Planner
 	plan: Plan,
 	// The solver's explanation, once a solver error has disabled the SAT planner
 	error: Option<String>,
+	// The activation literal of the latest sum <= K bound
+	act: Option<TLit>,
+	// Decision hints for the literals added since the latest solve (see `solve`)
+	hints: Vec<TLit>,
 	pub(crate) solves: u64,
 }
 
@@ -179,6 +184,8 @@ impl Planner
 			sum: Vec::new(),
 			plan: Plan { order: Vec::new(), cost: 0, optimal: true, pending: Vec::new(), source: PlanSource::Sat },
 			error: None,
+			act: None,
+			hints: Vec::new(),
 			solves: 0,
 		};
 		p.t = p.new_var();
@@ -213,6 +220,7 @@ impl Planner
 	{
 		let w = shape.weights;
 		assert!(w[1] <= w[0] && w[2] <= w[0] && w[3] <= w[1] && w[3] <= w[2], "the weights must not increase when a slot becomes bound");
+		self.retire_bound();
 		let c = self.shapes.len();
 		self.nvars = nvars;
 
@@ -239,6 +247,7 @@ impl Planner
 			let mut cls = vec![-b, tail];
 			cls.extend(self.binders.get(&v).into_iter().flatten().map(|&d| self.before(d, c)));
 			self.solver.AddClause(&cls);
+			self.hints.push(b);
 			bound.push((v, b, tail));
 		}
 		self.bound.push(bound);
@@ -308,6 +317,10 @@ impl Planner
 				cls.push(m);
 				self.solver.AddClause(&cls);
 			}
+			if m != self.t
+			{
+				self.hints.push(-m);
+			}
 			modes.push((m, shape.weights[k]));
 		}
 		self.modes.push(modes);
@@ -323,6 +336,7 @@ impl Planner
 					let (m, w) = self.modes[x][k];
 					let z = self.new_var();
 					self.solver.AddClause(&[-self.before(x, y), -m, z]);
+					self.hints.push(-z);
 					terms.push((z, w));
 				}
 			}
@@ -355,6 +369,8 @@ impl Planner
 				}
 			}
 		}
+		// Each column is reduced as a chain (each adder's sum goes into the next adder of the column); measured, this propagates much better
+		// than reducing the column in rounds of disjoint triples, despite the depth
 		let mut sum = Vec::new();
 		let mut j = 0;
 		while j < cols.len()
@@ -377,29 +393,40 @@ impl Planner
 		self.sum = sum;
 	}
 
-	// s <-> a xor b xor c, carry <-> majority(a, b, c)
+	// A full adder that only bounds its value from below: s + 2 * carry >= a + b + c.
+	// That suffices, since the comparators only bound the sum from above, and the exact value always satisfies it.
+	// (The parity equivalences of an exact adder propagate poorly and make the solver search even when the sum is unconstrained.)
 	fn full_adder(&mut self, a: TLit, b: TLit, c: TLit) -> (TLit, TLit)
 	{
 		let (s, carry) = (self.new_var(), self.new_var());
-		// One clause per assignment of a, b, c (bit i of `asg`), falsified by exactly that assignment, fixing s to its parity
-		for asg in 0..8
+		for x in [a, b, c]
 		{
-			let neg_if_set = |l: TLit, i: u32| if asg >> i & 1 == 1 { -l } else { l };
-			let s_lit = if (asg as u32).count_ones() % 2 == 1 { s } else { -s };
-			self.solver.AddClause(&[neg_if_set(a, 0), neg_if_set(b, 1), neg_if_set(c, 2), s_lit]);
+			self.solver.AddClause(&[-x, s, carry]);
 		}
 		for (x, y) in [(a, b), (a, c), (b, c)]
 		{
 			self.solver.AddClause(&[-x, -y, carry]);
-			self.solver.AddClause(&[x, y, -carry]);
 		}
+		self.solver.AddClause(&[-a, -b, -c, s]);
+		self.hints.extend([-s, -carry]);
 		(s, carry)
+	}
+
+	// Turn off the latest bound for good, so that the solver can't set its activation literal by a decision in a later solve
+	fn retire_bound(&mut self)
+	{
+		if let Some(act) = self.act.take()
+		{
+			self.solver.AddClause(&[-act]);
+		}
 	}
 
 	// A fresh activation literal, which implies sum <= k
 	fn at_most(&mut self, k: u64) -> TLit
 	{
+		self.retire_bound();
 		let act = self.new_var();
+		self.act = Some(act);
 		let n = self.sum.len();
 		if n >= 64 || k < 1 << n
 		{
@@ -437,8 +464,28 @@ impl Planner
 		Some(order)
 	}
 
+	// Decision hints (each measured to speed up the optimization): boundness prefers true, the cost indicators and the adder outputs prefer false
+	// (they are only ever implied), and the order starts from the best plan so far.
+	// The upstream solver requires that these calls be followed by Solve (and not by AddClause), hence they are made here.
 	fn solve(&mut self, assumps: &[TLit], budget: &mut u64) -> TToporReturnVal
 	{
+		for l in std::mem::take(&mut self.hints)
+		{
+			self.solver.FixPolarity(l, false);
+		}
+		let mut pos = vec![0; self.shapes.len()];
+		for (p, &c) in self.plan.order.iter().enumerate()
+		{
+			pos[c] = p;
+		}
+		for j in 0..self.prec.len()
+		{
+			for i in 0..j
+			{
+				let l = self.prec[j][i];
+				self.solver.FixPolarity(if pos[i] < pos[j] { l } else { -l }, true);
+			}
+		}
 		let before = self.solver.GetConflictsNumber();
 		let r = self.solver.Solve(assumps, (f64::MAX, true), *budget);
 		self.solves += 1;
@@ -476,6 +523,7 @@ impl Planner
 		{
 			return &self.plan;
 		}
+		self.retire_bound();
 		let tails: Vec<TLit> = self.bound.iter().flatten().map(|e| -e.2).collect();
 
 		// Find the predicates that can't be satisfied: drop the requirements in each UNSAT core, then re-admit those which hold on their own
