@@ -1,6 +1,7 @@
 //! satdb: a Datomic-inspired immutable database whose query planner runs on the Intel(R) SAT Solver.
 //!
-//! * `db`: database values (`Db`) made of datoms in persistent EAVT/AEVT/AVET indexes; `transact` returns a new value,
+//! * `db`: database values (`Db`) made of datoms in persistent EAVT/AEVT/AVET/VAET indexes; `transact` applies a transaction
+//!   (a set of assertions and retractions, with upserts, lookup refs, `retract_entity` and a reified transaction entity) and returns a new value,
 //!   and `Conn` keeps every past value (`as_of`) at the cost of the changed index paths only.
 //! * `query`: Datalog-style conjunctive queries (patterns and comparison predicates), planned online while they are assembled.
 //! * `planner`: the incremental SAT encoding of the join-order problem (see its documentation).
@@ -30,7 +31,7 @@ pub mod planner;
 pub mod pmap;
 pub mod query;
 
-pub use db::{Attr, AttrId, AttrStats, Cardinality, Conn, Datom, Db, Eid, Entity, Error, Tx, TxReport, TxValue, Value, ValueType, T};
+pub use db::{Attr, AttrId, AttrStats, Cardinality, Conn, Datom, Db, Eid, Entity, Error, Tx, TxReport, TxValue, Unique, Value, ValueType, T, TX_INSTANT};
 pub use planner::{Plan, PlanSource};
 pub use query::{Clause, Cmp, Query, Term};
 

@@ -2,9 +2,20 @@
 
 A Datomic-inspired immutable database whose query planner runs on the Rust fork of the Intel(R) SAT Solver (`../rust`).
 
-* **Database values** (`src/db.rs`). A `Db` is an immutable value: datoms `[e a v]` in three covering indexes (EAVT, AEVT, AVET),
-  the schema (value type, cardinality one/many) and per-attribute statistics (datoms, distinct entities, distinct values).
-  `Db::transact` returns a new value; `Conn` keeps every past one, so `as_of(t)` is a lookup.
+* **Database values** (`src/db.rs`). A `Db` is an immutable value: datoms `[e a v]` in four indexes (EAVT, AEVT, AVET, and VAET for refs),
+  the schema (value type, cardinality one/many, `Unique::Identity`/`Unique::Value`, component refs) and per-attribute statistics
+  (datoms, distinct entities, distinct values). `Db::transact` returns a new value; `Conn` keeps every past one, so `as_of(t)` is a lookup.
+* **Transactions** (`src/db.rs`). As in Datomic, a transaction is a *set* of assertions and retractions against the database before it,
+  so the order of its operations doesn't matter:
+  * a tempid asserting an existing `:db.unique/identity` value upserts to that entity, and tempids asserting the same new identity value
+    unify into one entity (to a fixed point, so ref-valued identities chain); a tempid resolving to two entities is an `UpsertConflict`;
+  * lookup refs (`Tx::lookup(attr, v)` in transactions, `Query::lookup` in queries) name an entity by a unique attribute's value, resolved against
+    the database before the transaction;
+  * `retract_entity` retracts an entity's datoms and the refs to it (through VAET), and cascades to the entities it owns through component attributes;
+  * conflicting operations are errors: a datom both asserted and retracted, two values of a cardinality-one attribute, and a unique value
+    that would belong to two entities after the transaction (checked on the result, so handing a value over in one transaction is fine);
+  * every transaction is an entity with a `db/txInstant` supplied by the caller (`Tx::with_instant`; by default the previous instant;
+    it may not go backwards), which `Datom::tx` refers to and the transaction itself can annotate (`Entity::Tx`). `db/` names are reserved.
 * **Persistent indexes** (`src/pmap.rs`). A treap with `Arc`-shared nodes and hash-of-key priorities: an update copies one root-to-leaf path,
   and the tree's shape depends on its key set only.
 * **Queries** (`src/query.rs`). Datalog-style conjunctions of patterns `[e attr v]` and comparison predicates, run as nested loops,
@@ -26,7 +37,8 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
 
 The crate depends on the solver by path (`../rust`), with the solver's profiles mirrored (it relies on wrap-around arithmetic).
 
-    cargo test              # unit tests, incl. the planner against brute force (every order of random queries of up to 6 clauses)
+    cargo test              # unit tests, incl. the planner against brute force (every order of random queries of up to 6 clauses),
+                            # and transactions and retract_entity against naive reference models
     cargo test --release
 
 ## Status and next steps
@@ -34,7 +46,10 @@ The crate depends on the solver by path (`../rust`), with the solver's profiles 
 This is a start. What is missing, roughly in order of value:
 
 * Pull, rules/recursion, aggregates, `not`/`or` clauses, and a Datalog text syntax (queries are built through the Rust API).
-* Unique/identity attributes, upserts and lookup refs; `retractEntity`; transaction entities and a reified `:db/txInstant`.
+* Schema evolution (altering an attribute's cardinality or uniqueness, which needs validating the existing datoms); today a definition
+  that differs from the existing one is an `AttrConflict`. Also: tempid unification through identity values that are themselves new tempids
+  (a ref-valued identity pointing at a tempid that resolves to nothing existing doesn't unify), transaction functions (e.g. CAS),
+  an Instant value type, and `as_of` by transaction entity or instant.
 * Hard user constraints in the planner (e.g., "run clause A before B"). They would be assumptions like the predicates' requirements,
   and that's where the UNSAT cores become non-trivial: today a predicate is unsatisfiable exactly when one of its variables has no binder,
   which the tests check against the cores.

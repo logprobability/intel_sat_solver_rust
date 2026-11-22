@@ -140,6 +140,14 @@ impl Query
 		Term::Var(i)
 	}
 
+	/// The lookup ref [attr v] as a constant entity term (resolved now, as the query's database is fixed); unknown values are an error
+	pub fn lookup(&self, attr: &str, v: impl Into<Value>) -> Result<Term, Error>
+	{
+		let v = v.into();
+		let e = self.db.lookup(attr, &v)?.ok_or_else(|| Error::LookupNotFound { attr: attr.to_string(), value: v })?;
+		Ok(Term::Val(Value::Ref(e)))
+	}
+
 	pub fn clauses(&self) -> &[Clause]
 	{
 		&self.clauses
