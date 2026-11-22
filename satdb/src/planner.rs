@@ -448,13 +448,22 @@ impl Planner
 		self.solver.GetLitValue(l) == TToporLitVal::VAL_SATISFIED
 	}
 
+	// Each pair's variable is read once, so that a don't-care value (either value satisfies the formula) decides both directions consistently
 	fn decode_order(&self) -> Option<Vec<usize>>
 	{
 		let n = self.shapes.len();
+		let mut preds = vec![0; n];
+		for j in 0..n
+		{
+			for i in 0..j
+			{
+				preds[if self.lit_true(self.prec[j][i]) { j } else { i }] += 1;
+			}
+		}
 		let mut order = vec![usize::MAX; n];
 		for c in 0..n
 		{
-			let p = (0..n).filter(|&d| d != c && self.lit_true(self.before(d, c))).count();
+			let p = preds[c];
 			if order[p] != usize::MAX
 			{
 				return None;
