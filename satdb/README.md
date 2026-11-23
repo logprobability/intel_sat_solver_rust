@@ -2,7 +2,7 @@
 
 A Datomic-inspired immutable database whose query planner runs on the Rust fork of the Intel(R) SAT Solver (`../rust`).
 
-* **Database values** (`src/db.rs`). A `Db` is an immutable value: datoms `[e a v]` in four indexes (EAVT, AEVT, AVET, and VAET for refs),
+* **Database values** (`src/db.rs`). A `Db` is an immutable value: the current datoms `[e a v]` in four indexes (EAVT, AEVT, AVET, and VAET for refs; the history has three more, see below),
   the schema (value type, cardinality one/many, `Unique::Identity`/`Unique::Value`, component refs) and per-attribute statistics
   (datoms, distinct entities, distinct values). `Db::transact` returns a new value; `Conn` keeps every past one, so `as_of(t)` is a lookup.
 * **Transactions** (`src/db.rs`). As in Datomic, a transaction is a *set* of assertions and retractions against the database before it,
@@ -16,10 +16,19 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     that would belong to two entities after the transaction (checked on the result, so handing a value over in one transaction is fine);
   * every transaction is an entity with a `db/txInstant` supplied by the caller (`Tx::with_instant`; by default the previous instant;
     it may not go backwards), which `Datom::tx` refers to and the transaction itself can annotate (`Entity::Tx`). `db/` names are reserved.
+* **History and time** (`src/db.rs`). The current indexes map each datom to the transaction that asserted it, and three append-only
+  history indexes (EAVT/AEVT/AVET order, keys ending in `(tx, added)`) keep every assertion and retraction, all persistent, so a past value
+  holds exactly the history up to its basis. Two views, each a cheap clone with a marker, filter the reads: `Db::history()` (every change, with
+  its `added` flag; history statistics for the planner) and `Db::since(t)` (only the datoms of transactions after basis `t`, for every read,
+  pull included); they compose. `Db::datoms(e, a, v)` scans a view; transacting against a view is an error.
+* **Pull** (`src/query.rs`). `Db::pull(pattern, eid)` reads an entity as a tree (`Pulled`): attribute lists, the wildcard (which pulls
+  components recursively, stopping at cycles), nested patterns for Ref attributes, and reverse refs through VAET (`Pull::reverse`, key `ns/_name`).
+  Cardinality-one attributes and reverse components give one value, the others a list; absent attributes are left out. The pattern is
+  validated before anything is pulled.
 * **Persistent indexes** (`src/pmap.rs`). A treap with `Arc`-shared nodes and hash-of-key priorities: an update copies one root-to-leaf path,
   and the tree's shape depends on its key set only.
-* **Queries** (`src/query.rs`). Datalog-style conjunctions of patterns `[e attr v]` and comparison predicates, run as nested loops,
-  each pattern using the index selected by its bound positions.
+* **Queries** (`src/query.rs`). Datalog-style conjunctions of patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`)
+  and comparison predicates, over any view, run as nested loops, each pattern using the index selected by its bound positions.
 * **The planner** (`src/planner.rs`). It chooses the join order with one incremental SAT solver per query, *while the query is being assembled*:
   every added clause extends the encoding (nothing is retracted) and is followed by a short, conflict-bounded refinement, so a good plan exists
   before the query is complete, and `run` finishes the optimization. The module documentation has the details; in short:
@@ -38,18 +47,23 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
 The crate depends on the solver by path (`../rust`), with the solver's profiles mirrored (it relies on wrap-around arithmetic).
 
     cargo test              # unit tests, incl. the planner against brute force (every order of random queries of up to 6 clauses),
-                            # and transactions and retract_entity against naive reference models
+                            # transactions and retract_entity against naive reference models, the history and since views of
+                            # every past value against the transactions' logs, history queries and pull against brute force
     cargo test --release
 
 ## Status and next steps
 
 This is a start. What is missing, roughly in order of value:
 
-* Pull, rules/recursion, aggregates, `not`/`or` clauses, and a Datalog text syntax (queries are built through the Rust API).
+* Rules/recursion, aggregates, `not`/`or` clauses, and a Datalog text syntax (queries are built through the Rust API).
+* Time: `as_of` on a `Db` (today `Conn` keeps every past value; the history indexes would allow a filter instead) and by transaction
+  entity or instant, a transaction-log API (Datomic's `tx-range`), and the planner's estimates for a `since` view (it uses the whole database's).
+  In a history view, the current-state accessors (`values`, `lookup`, ...) still read the current datoms; only scans and queries see the history.
+* Pull: recursion limits (`...`), attribute options (defaults, limits, renaming) and pulling from a query's find spec.
 * Schema evolution (altering an attribute's cardinality or uniqueness, which needs validating the existing datoms); today a definition
   that differs from the existing one is an `AttrConflict`. Also: tempid unification through identity values that are themselves new tempids
   (a ref-valued identity pointing at a tempid that resolves to nothing existing doesn't unify), transaction functions (e.g. CAS),
-  an Instant value type, and `as_of` by transaction entity or instant.
+  and an Instant value type.
 * Hard user constraints in the planner (e.g., "run clause A before B"). They would be assumptions like the predicates' requirements,
   and that's where the UNSAT cores become non-trivial: today a predicate is unsatisfiable exactly when one of its variables has no binder,
   which the tests check against the cores.

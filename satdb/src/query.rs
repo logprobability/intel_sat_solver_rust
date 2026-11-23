@@ -3,11 +3,20 @@
 //! A `Query` is assembled clause by clause, and every clause is handed to the query's planner as soon as it is added:
 //! the planner keeps one incremental SAT solver for the whole query and refines the join order within a small conflict budget per clause,
 //! so a good (often optimal) plan already exists when the query is complete. `run` then finishes the optimization and executes the plan as nested loops,
-//! each clause using the index that its bound positions select (EAVT, AVET or AEVT).
+//! each clause using the index that its bound positions select (EAVT, AVET or AEVT; their history counterparts in a history view,
+//! where a pattern can also match the datom's transaction and added flag, see `Query::pattern_tx`).
+//!
+//! # Pull
+//! `Db::pull` reads an entity as a tree, by a pattern of attributes: forward ones (a cardinality-one attribute gives one value,
+//! a cardinality-many one the list of its values), reverse ones (the entities referring to it through a Ref attribute: one entity
+//! for a component attribute, as a component has one owner, otherwise a list), nested patterns for the entities of a Ref attribute,
+//! and the wildcard (every attribute of the entity, pulling the entities of its component attributes with the wildcard, recursively).
+//! As in Datomic, absent attributes are left out, explicit entries override the wildcard's entry for the same attribute,
+//! and a reverse attribute's key is its name with `_` before the local part (`person/_friend`).
 
-use crate::db::{AttrId, AttrStats, Db, Eid, Error, Value, ValueType};
+use crate::db::{AttrId, AttrStats, Cardinality, Db, Eid, Error, Value, ValueType};
 use crate::planner::{monotone, weight_of_fanout, ClauseShape, Plan, Planner, VarId};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The conflict budget of the refinement that follows every added clause
 const ONLINE_BUDGET: u64 = 1000;
@@ -93,10 +102,11 @@ impl Cmp
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Clause
 {
-	/// [e a v]: the entity term must be a variable or a `Value::Ref`
+	/// [e a v tx added]: the entity term must be a variable or a `Value::Ref`; tx (a Ref) and added (a Bool), when given,
+	/// match the datom's transaction entity and flag (in the current view, every datom has added true)
 	Pattern
 	{
-		e: Term, a: AttrId, v: Term
+		e: Term, a: AttrId, v: Term, tx: Option<Term>, added: Option<Term>
 	},
 	Pred
 	{
@@ -156,31 +166,42 @@ impl Query
 	/// Add the pattern [e attr v]; returns the clause's index
 	pub fn pattern(&mut self, e: impl Into<Term>, attr: &str, v: impl Into<Term>) -> Result<usize, Error>
 	{
-		let (e, v) = (e.into(), v.into());
+		self.add_pattern(e.into(), attr, v.into(), None, None)
+	}
+
+	/// Add the pattern [e attr v tx added], which also matches the datom's transaction entity and its added flag
+	/// (false for a retraction, which only a history view has); a variable used nowhere else ignores a position.
+	/// Returns the clause's index
+	pub fn pattern_tx(&mut self, e: impl Into<Term>, attr: &str, v: impl Into<Term>, tx: impl Into<Term>, added: impl Into<Term>) -> Result<usize, Error>
+	{
+		self.add_pattern(e.into(), attr, v.into(), Some(tx.into()), Some(added.into()))
+	}
+
+	fn add_pattern(&mut self, e: Term, attr: &str, v: Term, tx: Option<Term>, added: Option<Term>) -> Result<usize, Error>
+	{
 		let a = self.db.attr_id(attr).ok_or_else(|| Error::UnknownAttr(attr.to_string()))?;
 		let def = self.db.attr(a);
-		let mismatch = |expected: ValueType, got: &Value| Error::TypeMismatch { attr: attr.to_string(), expected, got: got.value_type() };
-		if let Term::Val(x) = &e
+		let typed = [(Some(&e), ValueType::Ref), (Some(&v), def.value_type), (tx.as_ref(), ValueType::Ref), (added.as_ref(), ValueType::Bool)];
+		for (t, expected) in typed
 		{
-			if x.value_type() != ValueType::Ref
+			if let Some(Term::Val(x)) = t
 			{
-				return Err(mismatch(ValueType::Ref, x));
+				if x.value_type() != expected
+				{
+					return Err(Error::TypeMismatch { attr: attr.to_string(), expected, got: x.value_type() });
+				}
 			}
 		}
-		if let Term::Val(x) = &v
-		{
-			if x.value_type() != def.value_type
-			{
-				return Err(mismatch(def.value_type, x));
-			}
-		}
-		let slots = [&e, &v].map(|t| match t
+		let var = |t: &Term| match t
 		{
 			Term::Var(x) => Some(*x),
 			Term::Val(_) => None,
-		});
-		let shape = ClauseShape { slots, needs: vec![], binds: slots.iter().flatten().copied().collect(), weights: pattern_weights(self.db.stats(a)) };
-		Ok(self.add(Clause::Pattern { e, a, v }, shape))
+		};
+		// The tx and added positions bind their variables, but the cost model only distinguishes the entity and value positions
+		let slots = [var(&e), var(&v)];
+		let binds = [Some(&e), Some(&v), tx.as_ref(), added.as_ref()].into_iter().flatten().filter_map(var).collect();
+		let shape = ClauseShape { slots, needs: vec![], binds, weights: pattern_weights(self.db.stats(a)) };
+		Ok(self.add(Clause::Pattern { e, a, v, tx, added }, shape))
 	}
 
 	/// Add the predicate `l op r`; its variables must be bound by patterns. Returns the clause's index
@@ -243,9 +264,9 @@ impl Query
 		let mut bindable = vec![false; self.vars.len()];
 		for c in &self.clauses
 		{
-			if let Clause::Pattern { e, v, .. } = c
+			if let Clause::Pattern { e, v, tx, added, .. } = c
 			{
-				for t in [e, v]
+				for t in [Some(e), Some(v), tx.as_ref(), added.as_ref()].into_iter().flatten()
 				{
 					if let Term::Var(x) = t
 					{
@@ -306,7 +327,7 @@ impl Query
 		};
 		match &self.clauses[c]
 		{
-			Clause::Pattern { e, a, v } =>
+			Clause::Pattern { e, a, v, tx, added } =>
 			{
 				let eid = match Self::eval(e, env)
 				{
@@ -315,18 +336,16 @@ impl Query
 					Some(_) => return Ok(()),
 					None => None,
 				};
-				let db = &self.db;
-				let rows: Vec<(Eid, Value)> = match (eid, Self::eval(v, env))
-				{
-					(Some(x), Some(val)) => if db.has(x, *a, &val) { vec![(x, val)] } else { vec![] },
-					(Some(x), None) => db.values(x, *a).map(|val| (x, val.clone())).collect(),
-					(None, Some(val)) => db.entities(*a, &val).map(|x| (x, val.clone())).collect(),
-					(None, None) => db.attr_datoms(*a).map(|(x, val)| (x, val.clone())).collect(),
-				};
-				for (x, val) in rows
+				// The index scan of the view (the bound tx and added terms filter its rows)
+				let rows = self.db.datoms(eid, *a, Self::eval(v, env).as_ref());
+				for d in rows
 				{
 					let mut newly = Vec::new();
-					if Self::unify(e, Value::Ref(x), env, &mut newly) && Self::unify(v, val, env, &mut newly)
+					let ok = Self::unify(e, Value::Ref(d.e), env, &mut newly)
+						&& Self::unify(v, d.v, env, &mut newly)
+						&& tx.as_ref().map_or(true, |t| Self::unify(t, Value::Ref(d.tx), env, &mut newly))
+						&& added.as_ref().map_or(true, |t| Self::unify(t, Value::Bool(d.added), env, &mut newly));
+					if ok
 					{
 						self.step(rest, env, find, out)?;
 					}
@@ -353,6 +372,198 @@ impl Query
 				Ok(())
 			}
 		}
+	}
+}
+
+/// An element of a pull pattern (see the module documentation)
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Pull
+{
+	/// Every attribute of the entity, with the entities of its component attributes pulled by the wildcard
+	/// (an entity already being pulled further up stays a Ref, so a component cycle ends)
+	Wildcard,
+	/// The attribute `name`, or its reverse (the entities referring to this one through it); `nested` pulls the referenced entities
+	Attr
+	{
+		name: String, reverse: bool, nested: Option<Vec<Pull>>
+	},
+}
+
+impl Pull
+{
+	pub fn attr(name: &str) -> Self
+	{
+		Pull::Attr { name: name.to_string(), reverse: false, nested: None }
+	}
+
+	pub fn reverse(name: &str) -> Self
+	{
+		Pull::Attr { name: name.to_string(), reverse: true, nested: None }
+	}
+
+	/// Pull the attribute's entities by `pattern` (the attribute must be a Ref, which `Db::pull` checks); panics on the wildcard
+	pub fn nest(self, pattern: Vec<Pull>) -> Self
+	{
+		match self
+		{
+			Pull::Attr { name, reverse, .. } => Pull::Attr { name, reverse, nested: Some(pattern) },
+			Pull::Wildcard => panic!("the wildcard has no entities to nest a pattern in"),
+		}
+	}
+}
+
+/// A value of a pulled attribute
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum PullValue
+{
+	/// A value (a Ref, when the pattern doesn't pull the entity)
+	Val(Value),
+	/// A referenced entity, pulled by a nested pattern or the wildcard
+	Entity(Pulled),
+	/// The values of a cardinality-many attribute, or of a reverse attribute that isn't a component, in index order
+	Many(Vec<PullValue>),
+}
+
+/// A pulled entity: its id and the attributes the pattern selected that it has
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Pulled
+{
+	pub id: Eid,
+	pub attrs: BTreeMap<String, PullValue>,
+}
+
+impl Pulled
+{
+	pub fn get(&self, key: &str) -> Option<&PullValue>
+	{
+		self.attrs.get(key)
+	}
+}
+
+/// A pull pattern with its attributes resolved
+struct PullSpec
+{
+	wildcard: bool,
+	/// (attribute, reverse, nested pattern)
+	attrs: Vec<(AttrId, bool, Option<PullSpec>)>,
+}
+
+impl PullSpec
+{
+	const WILDCARD: PullSpec = PullSpec { wildcard: true, attrs: Vec::new() };
+
+	// Resolved before pulling anything, so that the errors don't depend on the data
+	fn compile(db: &Db, pattern: &[Pull]) -> Result<PullSpec, Error>
+	{
+		let mut spec = PullSpec { wildcard: false, attrs: Vec::new() };
+		for p in pattern
+		{
+			match p
+			{
+				Pull::Wildcard => spec.wildcard = true,
+				Pull::Attr { name, reverse, nested } =>
+				{
+					let a = db.attr_id(name).ok_or_else(|| Error::UnknownAttr(name.clone()))?;
+					let t = db.attr(a).value_type;
+					if (*reverse || nested.is_some()) && t != ValueType::Ref
+					{
+						return Err(Error::TypeMismatch { attr: name.clone(), expected: ValueType::Ref, got: t });
+					}
+					let nested = nested.as_ref().map(|n| Self::compile(db, n)).transpose()?;
+					spec.attrs.push((a, *reverse, nested));
+				}
+			}
+		}
+		Ok(spec)
+	}
+}
+
+/// The result key of a reverse attribute: `ns/_name` for `ns/name`
+fn reverse_key(name: &str) -> String
+{
+	match name.rsplit_once('/')
+	{
+		Some((ns, local)) => format!("{ns}/_{local}"),
+		None => format!("_{name}"),
+	}
+}
+
+// One value for a cardinality-one attribute (the first, if a reverse component has several owners), a list otherwise; items is not empty
+fn shape(one: bool, items: Vec<PullValue>) -> PullValue
+{
+	if one { items.into_iter().next().expect("not empty") } else { PullValue::Many(items) }
+}
+
+impl Db
+{
+	/// Pull entity `e` by `pattern` (see the module documentation); an entity without any of the attributes gives an empty map.
+	/// Reads the current-state accessors, so a `since` view filters the result; a history view is refused (`FilteredDb`)
+	pub fn pull(&self, pattern: &[Pull], e: Eid) -> Result<Pulled, Error>
+	{
+		if self.is_history()
+		{
+			return Err(Error::FilteredDb);
+		}
+		self.check_eid(e)?;
+		let spec = PullSpec::compile(self, pattern)?;
+		Ok(self.pull_spec(&spec, e, &mut Vec::new()))
+	}
+
+	// path: the entities being pulled above this one, where the wildcard stops following components
+	fn pull_spec(&self, spec: &PullSpec, e: Eid, path: &mut Vec<Eid>) -> Pulled
+	{
+		path.push(e);
+		let mut attrs = BTreeMap::new();
+		if spec.wildcard
+		{
+			let mut by_attr: BTreeMap<AttrId, Vec<Value>> = BTreeMap::new();
+			for (a, v) in self.entity_datoms(e)
+			{
+				by_attr.entry(a).or_default().push(v.clone());
+			}
+			for (a, vals) in by_attr
+			{
+				let def = self.attr(a);
+				let mut items = Vec::with_capacity(vals.len());
+				for v in vals
+				{
+					items.push(match v
+					{
+						Value::Ref(c) if def.component && !path.contains(&c) => PullValue::Entity(self.pull_spec(&PullSpec::WILDCARD, c, path)),
+						v => PullValue::Val(v),
+					});
+				}
+				attrs.insert(def.name.to_string(), shape(def.cardinality == Cardinality::One, items));
+			}
+		}
+		for (a, reverse, nested) in &spec.attrs
+		{
+			let def = self.attr(*a);
+			let (key, one, vals): (String, bool, Vec<Value>) = if *reverse
+			{
+				(reverse_key(&def.name), def.component, self.referrers(e).filter(|(b, _)| b == a).map(|(_, x)| Value::Ref(x)).collect())
+			}
+			else
+			{
+				(def.name.to_string(), def.cardinality == Cardinality::One, self.values(e, *a).cloned().collect())
+			};
+			if vals.is_empty()
+			{
+				continue;
+			}
+			let mut items = Vec::with_capacity(vals.len());
+			for v in vals
+			{
+				items.push(match (nested, v)
+				{
+					(Some(n), Value::Ref(c)) => PullValue::Entity(self.pull_spec(n, c, path)),
+					(_, v) => PullValue::Val(v),
+				});
+			}
+			attrs.insert(key, shape(one, items));
+		}
+		path.pop();
+		Pulled { id: e, attrs }
 	}
 }
 
@@ -476,5 +687,335 @@ mod tests
 		assert!(matches!(q.pattern(x.clone(), "person/age", "old"), Err(Error::TypeMismatch { .. })));
 		assert!(matches!(q.pattern(5, "person/age", x.clone()), Err(Error::TypeMismatch { .. })));
 		assert!(q.clauses().is_empty());
+	}
+
+	fn permutations(n: usize) -> Vec<Vec<usize>>
+	{
+		if n == 0
+		{
+			return vec![vec![]];
+		}
+		let mut out = Vec::new();
+		for p in permutations(n - 1)
+		{
+			for i in 0..n
+			{
+				let mut q = p.clone();
+				q.insert(i, n - 1);
+				out.push(q);
+			}
+		}
+		out
+	}
+
+	// The query's answer, which every order of its clauses (patterns only) must give too
+	fn run_every_order(q: &mut Query, find: &[Term]) -> Vec<Vec<Value>>
+	{
+		let got = q.run(find).unwrap();
+		for order in permutations(q.clauses().len())
+		{
+			assert_eq!(q.run_in_order(&order, find).unwrap(), got, "order {order:?}");
+		}
+		got
+	}
+
+	fn sorted(rows: impl IntoIterator<Item = Vec<Value>>) -> Vec<Vec<Value>>
+	{
+		rows.into_iter().collect::<BTreeSet<_>>().into_iter().collect()
+	}
+
+	// Patterns with transaction and added terms over the history, since and current views, against brute force over the transaction log
+	#[test]
+	fn queries_over_history_match_the_log()
+	{
+		use crate::db::tests::{random_conn, replay};
+		use crate::db::{Datom, TX_INSTANT};
+		let (conn, reports) = random_conn(31, 80);
+		let db = conn.db();
+		let log: Vec<&Datom> = reports.iter().flat_map(|r| &r.tx_data).collect();
+		let id = |n: &str| db.attr_id(n).unwrap();
+		let (n_a, tag_a, ref_a) = (id("n"), id("tag"), id("ref"));
+		let instant: BTreeMap<Eid, Value> = log.iter().filter(|d| d.a == id(TX_INSTANT)).map(|d| (d.tx, d.v.clone())).collect();
+		let r = |e: Eid| Value::Ref(e);
+
+		// The retractions of tags, with their transactions' instants
+		let mut q = db.history().query();
+		let (e, v, tx, i) = (q.var("?e"), q.var("?v"), q.var("?tx"), q.var("?i"));
+		q.pattern_tx(e.clone(), "tag", v.clone(), tx.clone(), false).unwrap();
+		q.pattern(tx.clone(), TX_INSTANT, i.clone()).unwrap();
+		let want = sorted(log.iter().filter(|d| d.a == tag_a && !d.added).map(|d| vec![r(d.e), d.v.clone(), instant[&d.tx].clone()]));
+		assert!(want.len() >= 3);
+		assert_eq!(run_every_order(&mut q, &[e, v, i]), want);
+
+		// An assertion of n and a change of a tag (of any entity) in the same transaction: a join on ?tx alone
+		let mut q = db.history().query();
+		let (e, f, nv, g, tx, ad) = (q.var("?e"), q.var("?f"), q.var("?n"), q.var("?g"), q.var("?tx"), q.var("?added"));
+		q.pattern_tx(e.clone(), "n", nv.clone(), tx.clone(), true).unwrap();
+		q.pattern_tx(f.clone(), "tag", g.clone(), tx.clone(), ad.clone()).unwrap();
+		let mut want = Vec::new();
+		for x in log.iter().filter(|d| d.a == n_a && d.added)
+		{
+			for y in log.iter().filter(|d| d.a == tag_a && d.tx == x.tx)
+			{
+				want.push(vec![r(x.e), r(y.e), x.v.clone(), y.v.clone(), Value::Bool(y.added), r(x.tx)]);
+			}
+		}
+		let want = sorted(want);
+		assert!(!want.is_empty());
+		assert_eq!(run_every_order(&mut q, &[e, f, nv, g, ad, tx]), want);
+
+		// The current refs asserted after basis 15
+		let mut q = db.since(15).unwrap().query();
+		let (e, x, tx, ad) = (q.var("?e"), q.var("?x"), q.var("?tx"), q.var("?added"));
+		q.pattern_tx(e.clone(), "ref", x.clone(), tx.clone(), ad.clone()).unwrap();
+		let after = reports[14].tx;
+		let current = replay(log.iter().copied());
+		let want = sorted(current.iter().filter(|((_, a, _), t)| *a == ref_a && **t > after).map(|((e, _, v), t)| vec![r(*e), v.clone(), r(*t), Value::Bool(true)]));
+		assert!(!want.is_empty());
+		assert_eq!(run_every_order(&mut q, &[e, x, tx, ad]), want);
+		// A lookup ref in a since view sees only the later datoms too
+		let key_a = id("key");
+		let ((holder, _, k), t) = current.iter().find(|((_, a, _), _)| *a == key_a).unwrap();
+		let s = 1 + reports.iter().position(|rep| rep.tx == *t).unwrap() as u64;
+		assert_eq!(db.since(s - 1).unwrap().query().lookup("key", k.clone()), Ok(Term::Val(r(*holder))));
+		assert!(matches!(db.since(s).unwrap().query().lookup("key", k.clone()), Err(Error::LookupNotFound { .. })));
+
+		// A constant transaction in the history after basis 1
+		let k = (1..reports.len()).find(|&k| reports[k].tx_data.iter().any(|d| d.a == n_a)).unwrap();
+		let mut q = db.history().since(1).unwrap().query();
+		let (e, v, ad) = (q.var("?e"), q.var("?v"), q.var("?added"));
+		q.pattern_tx(e.clone(), "n", v.clone(), r(reports[k].tx), ad.clone()).unwrap();
+		let want = sorted(reports[k].tx_data.iter().filter(|d| d.a == n_a).map(|d| vec![r(d.e), d.v.clone(), Value::Bool(d.added)]));
+		assert_eq!(run_every_order(&mut q, &[e, v, ad.clone()]), want);
+
+		// The current view: the asserting transaction of each datom, and no retractions
+		let mut q = db.query();
+		let (e, v, tx, i) = (q.var("?e"), q.var("?v"), q.var("?tx"), q.var("?i"));
+		q.pattern_tx(e.clone(), "n", v.clone(), tx.clone(), true).unwrap();
+		q.pattern(tx.clone(), TX_INSTANT, i.clone()).unwrap();
+		let want = sorted(current.iter().filter(|((_, a, _), _)| *a == n_a).map(|((e, _, v), t)| vec![r(*e), v.clone(), instant[t].clone()]));
+		assert_eq!(run_every_order(&mut q, &[e.clone(), v.clone(), i]), want);
+		let mut q = db.query();
+		let (e, v, tx) = (q.var("?e"), q.var("?v"), q.var("?tx"));
+		q.pattern_tx(e.clone(), "n", v.clone(), tx.clone(), false).unwrap();
+		assert!(q.run(&[e.clone()]).unwrap().is_empty());
+
+		// Validation of the new positions
+		let mut q = db.history().query();
+		let (e, v, tx, ad) = (q.var("?e"), q.var("?v"), q.var("?tx"), q.var("?added"));
+		assert!(matches!(q.pattern_tx(e.clone(), "n", v.clone(), 5, ad.clone()), Err(Error::TypeMismatch { expected: ValueType::Ref, .. })));
+		assert!(matches!(q.pattern_tx(e.clone(), "n", v.clone(), tx.clone(), 1), Err(Error::TypeMismatch { expected: ValueType::Bool, .. })));
+		assert!(q.clauses().is_empty());
+		// The planner estimates a history view with the history's statistics
+		assert!(db.history().stats(tag_a).datoms > db.stats(tag_a).datoms);
+	}
+
+	fn val(v: impl Into<Value>) -> PullValue
+	{
+		PullValue::Val(v.into())
+	}
+
+	fn ent(id: Eid, attrs: Vec<(&str, PullValue)>) -> PullValue
+	{
+		PullValue::Entity(Pulled { id, attrs: attrs.into_iter().map(|(k, v)| (k.to_string(), v)).collect() })
+	}
+
+	#[test]
+	fn pull_examples()
+	{
+		use crate::db::Attr;
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		tx.define("person/name", ValueType::Str, Cardinality::One)
+			.define("person/aka", ValueType::Str, Cardinality::Many)
+			.define("person/friend", ValueType::Ref, Cardinality::Many)
+			.define_attr(Attr::new("person/address", ValueType::Ref, Cardinality::One).component())
+			.define("address/city", ValueType::Str, Cardinality::One)
+			.define_attr(Attr::new("node/child", ValueType::Ref, Cardinality::Many).component());
+		let (a, b, c, addr, n1, n2, empty) = (tx.temp(), tx.temp(), tx.temp(), tx.temp(), tx.temp(), tx.temp(), tx.temp());
+		tx.add(a, "person/name", "Alice").add(a, "person/aka", "Al").add(a, "person/aka", "Ali").add(a, "person/friend", b).add(a, "person/friend", c);
+		tx.add(b, "person/name", "Bob").add(b, "person/friend", a).add(c, "person/name", "Carol");
+		tx.add(a, "person/address", addr).add(addr, "address/city", "Haifa");
+		// A component cycle
+		tx.add(n1, "node/child", n2).add(n2, "node/child", n1);
+		let rep = conn.transact(&tx).unwrap();
+		let [a, b, c, addr, n1, n2, empty] = [a, b, c, addr, n1, n2, empty].map(|e| rep.eid(e));
+		let db = conn.db();
+		let name = || Pull::attr("person/name");
+
+		// Cardinality one and many, refs as values
+		let p = db.pull(&[name(), Pull::attr("person/aka"), Pull::attr("person/friend")], a).unwrap();
+		assert_eq!(PullValue::Entity(p), ent(a, vec![("person/aka", PullValue::Many(vec![val("Al"), val("Ali")])), ("person/friend", PullValue::Many(vec![val(Value::Ref(b)), val(Value::Ref(c))])), ("person/name", val("Alice"))]));
+		// Nested, and reverse (a list, or one entity for a component)
+		let p = db.pull(&[name(), Pull::attr("person/friend").nest(vec![name()])], a).unwrap();
+		assert_eq!(p.get("person/friend"), Some(&PullValue::Many(vec![ent(b, vec![("person/name", val("Bob"))]), ent(c, vec![("person/name", val("Carol"))])])));
+		let p = db.pull(&[Pull::reverse("person/friend").nest(vec![name()])], c).unwrap();
+		assert_eq!(p.get("person/_friend"), Some(&PullValue::Many(vec![ent(a, vec![("person/name", val("Alice"))])])));
+		let p = db.pull(&[Pull::reverse("person/address")], addr).unwrap();
+		assert_eq!(p.get("person/_address"), Some(&val(Value::Ref(a))));
+		// The wildcard pulls components, and an explicit entry overrides it
+		let p = db.pull(&[Pull::Wildcard], a).unwrap();
+		assert_eq!(p.get("person/address"), Some(&ent(addr, vec![("address/city", val("Haifa"))])));
+		assert_eq!(p.get("person/friend"), Some(&PullValue::Many(vec![val(Value::Ref(b)), val(Value::Ref(c))])));
+		assert_eq!(p.attrs.len(), 4);
+		let p = db.pull(&[Pull::Wildcard, Pull::attr("person/friend").nest(vec![name()])], a).unwrap();
+		assert_eq!(p.get("person/friend"), Some(&PullValue::Many(vec![ent(b, vec![("person/name", val("Bob"))]), ent(c, vec![("person/name", val("Carol"))])])));
+		assert_eq!(p.attrs.len(), 4);
+		// A component cycle ends at the entity being pulled
+		let p = db.pull(&[Pull::Wildcard], n1).unwrap();
+		assert_eq!(p.get("node/child"), Some(&PullValue::Many(vec![ent(n2, vec![("node/child", PullValue::Many(vec![val(Value::Ref(n1))]))])])));
+		// Absent attributes are left out
+		assert!(db.pull(&[Pull::Wildcard, name()], empty).unwrap().attrs.is_empty());
+		assert!(db.pull(&[Pull::attr("person/aka")], b).unwrap().attrs.is_empty());
+
+		// Errors, independent of the data
+		assert_eq!(db.pull(&[Pull::attr("nope")], empty).err(), Some(Error::UnknownAttr("nope".into())));
+		assert!(matches!(db.pull(&[Pull::reverse("person/name")], empty), Err(Error::TypeMismatch { .. })));
+		assert!(matches!(db.pull(&[Pull::attr("person/aka").nest(vec![])], empty), Err(Error::TypeMismatch { .. })));
+		assert!(matches!(db.pull(&[Pull::attr("person/friend").nest(vec![Pull::attr("nope")])], empty), Err(Error::UnknownAttr(_))));
+		assert_eq!(db.pull(&[name()], 9999).err(), Some(Error::UnknownEntity(9999)));
+		assert_eq!(db.history().pull(&[name()], a).err(), Some(Error::FilteredDb));
+
+		// A since view filters the pull, reverse refs included
+		let mut tx = Tx::new();
+		let d = tx.temp();
+		tx.add(d, "person/name", "Dan").add(Entity::Id(a), "person/friend", d).add(d, "person/friend", Entity::Id(c));
+		let rep = conn.transact(&tx).unwrap();
+		let d = rep.eid(d);
+		let since = conn.db().since(1).unwrap();
+		let p = since.pull(&[name(), Pull::attr("person/friend")], a).unwrap();
+		assert_eq!(PullValue::Entity(p), ent(a, vec![("person/friend", PullValue::Many(vec![val(Value::Ref(d))]))]));
+		assert_eq!(since.pull(&[Pull::reverse("person/friend")], c).unwrap().get("person/_friend"), Some(&PullValue::Many(vec![val(Value::Ref(d))])));
+		// ... and the past value is unaffected
+		assert_eq!(conn.as_of(1).unwrap().pull(&[Pull::reverse("person/friend")], c).unwrap().get("person/_friend"), Some(&PullValue::Many(vec![val(Value::Ref(a))])));
+	}
+
+	// A naive pull over a set of (e, a, v) triples, by scanning it
+	fn naive_pull(db: &Db, facts: &BTreeSet<(Eid, AttrId, Value)>, pattern: &[Pull], e: Eid, path: &mut Vec<Eid>) -> Pulled
+	{
+		path.push(e);
+		let mut attrs = BTreeMap::new();
+		let mut put = |key: String, one: bool, items: Vec<PullValue>| {
+			if !items.is_empty()
+			{
+				attrs.insert(key, if one { items.into_iter().next().unwrap() } else { PullValue::Many(items) });
+			}
+		};
+		if pattern.contains(&Pull::Wildcard)
+		{
+			let mine: BTreeSet<AttrId> = facts.iter().filter(|f| f.0 == e).map(|f| f.1).collect();
+			for a in mine
+			{
+				let def = db.attr(a).clone();
+				let mut items = Vec::new();
+				for f in facts.iter().filter(|f| f.0 == e && f.1 == a)
+				{
+					items.push(match f.2
+					{
+						Value::Ref(x) if def.component && !path.contains(&x) => PullValue::Entity(naive_pull(db, facts, &[Pull::Wildcard], x, path)),
+						_ => PullValue::Val(f.2.clone()),
+					});
+				}
+				put(def.name.to_string(), def.cardinality == Cardinality::One, items);
+			}
+		}
+		for p in pattern
+		{
+			let Pull::Attr { name, reverse, nested } = p else { continue };
+			let a = db.attr_id(name).unwrap();
+			let def = db.attr(a).clone();
+			let vals: Vec<Value> = if *reverse
+			{
+				facts.iter().filter(|f| f.1 == a && f.2 == Value::Ref(e)).map(|f| Value::Ref(f.0)).collect()
+			}
+			else
+			{
+				facts.iter().filter(|f| f.0 == e && f.1 == a).map(|f| f.2.clone()).collect()
+			};
+			let mut items = Vec::new();
+			for v in vals
+			{
+				items.push(match (nested, v)
+				{
+					(Some(n), Value::Ref(x)) => PullValue::Entity(naive_pull(db, facts, n, x, path)),
+					(_, v) => PullValue::Val(v),
+				});
+			}
+			let key = if *reverse { format!("_{name}") } else { name.clone() };
+			put(key, if *reverse { def.component } else { def.cardinality == Cardinality::One }, items);
+		}
+		path.pop();
+		Pulled { id: e, attrs }
+	}
+
+	fn random_pull(rng: &mut Rng, depth: u32) -> Vec<Pull>
+	{
+		use crate::db::tests::RANDOM_ATTRS;
+		let refs = ["ref", "best", "part"];
+		let mut p = Vec::new();
+		if rng.next() % 4 == 0
+		{
+			p.push(Pull::Wildcard);
+		}
+		for _ in 0..1 + rng.next() % 3
+		{
+			if rng.next() % 2 == 0
+			{
+				let name = refs[(rng.next() % 3) as usize];
+				let x = if rng.next() % 2 == 0 { Pull::reverse(name) } else { Pull::attr(name) };
+				p.push(if depth > 0 && rng.next() % 2 == 0 { x.nest(random_pull(rng, depth - 1)) } else { x });
+			}
+			else
+			{
+				p.push(Pull::attr(RANDOM_ATTRS[(rng.next() % 6) as usize]));
+			}
+		}
+		p
+	}
+
+	fn count_entities(v: &PullValue) -> usize
+	{
+		match v
+		{
+			PullValue::Val(_) => 0,
+			PullValue::Entity(p) => 1 + p.attrs.values().map(count_entities).sum::<usize>(),
+			PullValue::Many(vs) => vs.iter().map(count_entities).sum(),
+		}
+	}
+
+	// Pulls of random patterns (forward, reverse, nested, wildcard) of every entity, in past values and since views, against a naive scan
+	#[test]
+	fn pull_matches_a_naive_scan()
+	{
+		use crate::db::tests::{random_conn, replay};
+		let (conn, reports) = random_conn(41, 40);
+		let mut rng = Rng::new(9);
+		let mut nested = 0;
+		for t in [10, 25, 40]
+		{
+			let db = conn.as_of(t).unwrap();
+			let log: Vec<_> = reports[..t as usize].iter().flat_map(|r| &r.tx_data).collect();
+			let ents: BTreeSet<Eid> = log.iter().map(|d| d.e).collect();
+			let current = replay(log.iter().copied());
+			for s in [0, 1, t / 2]
+			{
+				let view = db.since(s).unwrap();
+				let after = db.tx_of(s).unwrap_or(0);
+				// The naive reference keeps the user datoms, so that the wildcard of a transaction entity compares too
+				let facts: BTreeSet<(Eid, AttrId, Value)> = current.iter().filter(|(_, tx)| **tx > after).map(|(k, _)| k.clone()).collect();
+				for _ in 0..40
+				{
+					let pattern = random_pull(&mut rng, 2);
+					for &e in &ents
+					{
+						let got = view.pull(&pattern, e).unwrap();
+						// The naive keys of reverse attributes are _name, the library's ns/_name (these attributes have no namespace)
+						assert_eq!(got, naive_pull(&view, &facts, &pattern, e, &mut Vec::new()), "pattern {pattern:?} e {e} t {t} since {s}");
+						nested += count_entities(&PullValue::Entity(got)) - 1;
+					}
+				}
+			}
+		}
+		assert!(nested > 500, "too few nested entities: {nested}");
 	}
 }

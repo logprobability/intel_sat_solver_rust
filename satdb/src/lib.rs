@@ -2,8 +2,10 @@
 //!
 //! * `db`: database values (`Db`) made of datoms in persistent EAVT/AEVT/AVET/VAET indexes; `transact` applies a transaction
 //!   (a set of assertions and retractions, with upserts, lookup refs, `retract_entity` and a reified transaction entity) and returns a new value,
-//!   and `Conn` keeps every past value (`as_of`) at the cost of the changed index paths only.
-//! * `query`: Datalog-style conjunctive queries (patterns and comparison predicates), planned online while they are assembled.
+//!   and `Conn` keeps every past value (`as_of`) at the cost of the changed index paths only. Every value also holds its history
+//!   (every assertion and retraction, with its transaction), which the `history()` and `since(t)` views expose.
+//! * `query`: Datalog-style conjunctive queries (patterns and comparison predicates, over any view), planned online while they are assembled,
+//!   and `Db::pull`, which reads an entity as a tree.
 //! * `planner`: the incremental SAT encoding of the join-order problem (see its documentation).
 //! * `pmap`: the persistent sorted map under the indexes.
 //!
@@ -33,7 +35,7 @@ pub mod query;
 
 pub use db::{Attr, AttrId, AttrStats, Cardinality, Conn, Datom, Db, Eid, Entity, Error, Tx, TxReport, TxValue, Unique, Value, ValueType, T, TX_INSTANT};
 pub use planner::{Plan, PlanSource};
-pub use query::{Clause, Cmp, Query, Term};
+pub use query::{Clause, Cmp, Pull, PullValue, Pulled, Query, Term};
 
 #[cfg(test)]
 pub(crate) mod testutil
