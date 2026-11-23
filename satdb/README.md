@@ -111,6 +111,24 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     | history `datoms(e, a)`               | 271 (509)      | 97 (216)                 |
     | as-of `attr_datoms(a)`, per datom    | 32 (53)        | 16 (15)                  |
     | `tx_range`, per datom                | 45 (80)        | 29 (28)                  |
+  * `Conn::compact()` (and `Db::compacted()`, for a value) merges each history index into one segment, which is what a value opened
+    from a checkpoint has: the value reads the same, and its history, `since` and `as_of` reads move from the first column to the second.
+    It needs no mode: the connection takes transactions as before (they go to a new tail and to segments of their own), the values taken
+    earlier keep their indexes, and neither the data nor the log changes. On the database of the table, it took 153 ms, and in the same
+    run the reads by entity or value took 135 to 251 ns compacted, against 516 to 596 ns before and 182 to 281 ns opened from the
+    checkpoint (one run on a busy machine, so higher than the table's minima; `history_read_timings` prints the three).
+* **Text transactions** (`src/txparse.rs`). `Conn::transact_str(text)` (and `Db::transact_str`, `Db::parse_tx`) reads Datomic's
+  transaction data in EDN into the `Tx` builder, so a database can be defined and written without Rust code:
+  `[{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+  {:db/id "alice" :person/name "Alice" :person/friend ["bob" {:person/name "Carol"}]} [:db/add "bob" :person/name "Bob"]
+  [:db/retract [:person/name "Dave"] :person/friend 17] [:db/retractEntity 18] [:db/cas 17 :person/age nil 30]]`.
+  * Attribute maps (those with `:db/ident`) define attributes, or alter existing ones, giving only what changes (`:db/unique nil` drops
+    uniqueness); they are read first, so the transaction's data can use them. `:db/doc` and `:db/index` are accepted and ignored.
+  * Entities are ids, tempid strings (`"datomic.tx"` is the transaction's entity, and its `:db/txInstant` the transaction's instant) and
+    lookup refs. Entity maps assert their attributes of `:db/id` (or of a new entity), a vector giving the values of a cardinality-many
+    attribute, and a nested map an entity that a Ref attribute refers to. The report (`TextTxReport`) maps each tempid string to its entity.
+  * The operations are `:db/add`, `:db/retract`, `:db/retractEntity` and `:db/cas` (and `:db.fn/retractEntity`, `:db.fn/cas`).
+    Syntax errors carry their line and column; the transaction's own errors are the builder's.
 * **Queries** (`src/query.rs`). Datalog-style queries over any view: patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`),
   comparison predicates, `not`/`not-join` and `or`/`or-join` (nested to any depth) and rule calls (see Rules), run as nested loops, each pattern using the index selected by its bound positions.
   * `not` keeps the rows for which its body has no solution; its join variables (all of its body's, or the `not-join` list) must be bound when it runs,
@@ -197,7 +215,9 @@ The crate depends on the solver by path (`../rust`), with the solver's profiles 
                             # through string and ref-valued identities against a naive fixpoint, foreign tempids and lookups, the history and since views of
                             # every past value against the transactions' logs, history queries and pull against brute force,
                             # random queries with (nested) not and or in every clause order against a bottom-up relational
-                            # evaluator, aggregates against a hand grouping, text queries against the builder, blanks in not and or, transitive closure
+                            # evaluator, aggregates against a hand grouping, text queries against the builder, text transactions against the builder
+                            # (the same database, entity ids and history included) and their errors' positions, compaction against the
+                            # value it came from (and the same transactions after it), blanks in not and or, transitive closure
                             # (four formulations, random graphs with cycles) against Floyd-Warshall, mutual recursion against a
                             # parity search, stratified negation, random rule programs against a naive simultaneous fixpoint,
                             # and the plan count of semi-naive evaluation on a long chain; the durable log: a random history reopened
@@ -221,6 +241,9 @@ This is a start. What is missing, roughly in order of value:
   brute-force test extended to such clauses); attribute variables in patterns; function and binding expressions (`[(f ?x) ?y]`);
   the aggregates `median`, `variance` and `stddev`. The cost model doesn't see inside `not` and `or`
   (a `not` has a fixed selectivity, a binding `or` the cost of its branches with nothing bound).
+* Writes in the language: transactions driven by a query (a transaction template instantiated for each row of a query's result, as
+  SQL's `UPDATE`/`DELETE ... WHERE`; atomic for free, since a connection has one writer), with expressions in the template;
+  `[:db/retract e :attr]` without a value; reverse attributes (`:ns/_name`) in entity maps; a place for `:db/doc`.
 * Time: the planner's estimates for `since` and `as_of` views
   (they use the latest value's statistics). An as-of view derives each read from the history, so it costs more than a read of the current value.
   In a history view, the current-state accessors (`values`, `lookup`, ...) still read the current datoms; only scans and queries see the history.
@@ -245,3 +268,5 @@ This is a start. What is missing, roughly in order of value:
   history (`Conn` keeps one value, whose history indexes serve every past one). Missing: index segments on disk, read lazily (so that memory
   isn't bounded by the database's size), log compaction (the log keeps every record, the checkpoint only caches them), an automatic
   checkpoint policy, access by several processes (today one connection holds the file's lock), and group commit (each transaction syncs on its own).
+  `Conn::compact` only merges the history; a read-only mode would add to it a shared file lock (several reading processes), a static layout
+  of the current indexes (to be measured against the treaps) and rule relations cached across queries.

@@ -986,6 +986,20 @@ impl Db
 		self.history
 	}
 
+	/// This value (or view) with each history index merged into one segment: it reads the same, and its history, `since` and `as_of`
+	/// reads are faster (they search one segment rather than merge several; the README has the timings). It takes time linear in the
+	/// history, and the values derived from the result by `transact` stay nearly as compact (they add small segments).
+	/// A value opened from a checkpoint is compact already
+	pub fn compacted(&self) -> Db
+	{
+		let mut db = self.clone();
+		for index in [&mut db.heavt, &mut db.haevt, &mut db.havet, &mut db.hvaet, &mut db.tlog]
+		{
+			index.compact();
+		}
+		db
+	}
+
 	/// The statistics of the attribute's datoms in this view: the history's in a history view; in a `since` or `as_of` view,
 	/// those of the whole (latest) database, an estimate
 	pub fn stats(&self, a: AttrId) -> AttrStats
@@ -1840,6 +1854,13 @@ impl Conn
 			Some(log) => log.checkpoint(&self.db),
 			None => Err(Error::Io("an in-memory connection has no log to checkpoint".into())),
 		}
+	}
+
+	/// Compact the current value's history indexes (see `Db::compacted`), for the values and views taken from now on; the values
+	/// taken before keep their indexes. It changes neither the data nor the log, and the connection takes transactions as before
+	pub fn compact(&mut self)
+	{
+		self.db = self.db.compacted();
 	}
 
 	/// The database as of basis `t` (None if `t` is in the future): a view of the current value (see `Db::as_of`)
@@ -3119,5 +3140,50 @@ pub(crate) mod tests
 			assert_eq!(view.transact(&Tx::new()).err(), Some(Error::FilteredDb));
 		}
 		assert_eq!(latest.as_of(latest.basis_t()).unwrap().upto, None);
+	}
+
+	// A compacted value is the same database, with one segment per history index, and so are its views; the value it came from keeps
+	// its segments; and the same transactions on both (one of them compacted again now and then) give the same values
+	#[test]
+	fn compaction_keeps_the_database()
+	{
+		let (mut conn, reports) = random_conn(31, 60);
+		let mut plain = conn.db();
+		conn.compact();
+		let mut compact = conn.db();
+		for index in [&compact.heavt, &compact.haevt, &compact.havet, &compact.hvaet, &compact.tlog]
+		{
+			assert_eq!(index.segments(), 1);
+		}
+		assert!(plain.heavt.segments() > 1 && plain.tlog.segments() > 1, "the history was in several segments");
+		assert_same_db(&compact, &plain, "compacted");
+		for t in (0..=reports.len() as T).step_by(7)
+		{
+			assert_same_reads(&conn.as_of(t).unwrap(), &plain.as_of(t).unwrap(), &format!("compacted, as of {t}"));
+			assert_same_reads(&compact.history().since(t).unwrap(), &plain.history().since(t).unwrap(), &format!("compacted, history since {t}"));
+		}
+		assert_same_db(&compact.as_of(20).unwrap().compacted(), &plain.as_of(20).unwrap(), "a compacted view");
+
+		let mut rng = Rng::new(5);
+		for i in 0..80
+		{
+			let mut tx = Tx::new();
+			let e = if i % 3 == 0 { tx.temp() } else { Entity::Id(reports[0].tempids[(rng.next() % 10) as usize]) };
+			tx.add(e, "n", (rng.next() % 5) as i64).add(e, "tag", ["a", "b", "c"][(rng.next() % 3) as usize]);
+			tx.add(e, "ref", Entity::Id(reports[0].tempids[(rng.next() % 10) as usize])).with_instant(1000 + i);
+			plain = plain.transact(&tx).unwrap().db_after;
+			compact = compact.transact(&tx).unwrap().db_after;
+			if i % 7 == 3
+			{
+				compact = compact.compacted();
+			}
+			if i % 10 == 9
+			{
+				assert_same_db(&compact, &plain, &format!("{i} transactions after the compaction"));
+			}
+		}
+		assert!(compact.heavt.segments() > 1, "the transactions after a compaction go to segments of their own");
+		assert_same_reads(&compact.as_of(70).unwrap(), &plain.as_of(70).unwrap(), "as of 70, after the compaction");
+		assert_same_reads(&compact.history(), &plain.history(), "the history, after the compaction");
 	}
 }

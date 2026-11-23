@@ -220,7 +220,7 @@ impl Db
 
 	fn parse(&self, text: &str, rules: Option<&str>, inputs: &[Input]) -> Result<TextQuery, Error>
 	{
-		let node = Reader { text, pos: 0 }.read_all()?;
+		let node = Reader::new(text, "query").read_all()?;
 		Parser { text, q: self.query(), inputs: HashMap::new(), fresh: 0, rule_names: HashMap::new() }.query(node, rules, inputs)
 	}
 
@@ -243,7 +243,7 @@ impl Db
 	/// (`...`: until an entity repeats, or a depth)
 	pub fn pull_str(&self, pattern: &str, e: Eid) -> Result<Pulled, Error>
 	{
-		let node = Reader { text: pattern, pos: 0 }.read_all()?;
+		let node = Reader::new(pattern, "pull pattern").read_all()?;
 		self.pull(&pull_pattern(pattern, &node)?, e)
 	}
 }
@@ -329,7 +329,7 @@ fn pull_attr(text: &str, node: &Node) -> Result<Pull, Error>
 }
 
 /// The error at byte offset `pos` of `text`
-fn error_at(text: &str, pos: usize, msg: impl Into<String>) -> Error
+pub(crate) fn error_at(text: &str, pos: usize, msg: impl Into<String>) -> Error
 {
 	let before = &text[..pos];
 	let line = before.matches('\n').count() + 1;
@@ -338,7 +338,7 @@ fn error_at(text: &str, pos: usize, msg: impl Into<String>) -> Error
 }
 
 #[derive(Debug)]
-enum Form
+pub(crate) enum Form
 {
 	Vector(Vec<Node>),
 	List(Vec<Node>),
@@ -352,6 +352,8 @@ enum Form
 	/// `#inst "..."`, in milliseconds since the Unix epoch
 	Instant(i64),
 	Bool(bool),
+	/// Only transactions take `nil` (see `txparse`)
+	Nil,
 }
 
 /// The instant of an RFC 3339 timestamp (`2024-02-29T13:45:00Z`, `...:00.25+02:00`; also a date alone, at midnight UTC),
@@ -417,17 +419,19 @@ pub(crate) fn parse_instant(s: &str) -> Option<i64>
 
 /// A form and its byte offset in the text
 #[derive(Debug)]
-struct Node
+pub(crate) struct Node
 {
-	form: Form,
-	pos: usize,
+	pub(crate) form: Form,
+	pub(crate) pos: usize,
 }
 
 /// The EDN subset reader
-struct Reader<'a>
+pub(crate) struct Reader<'a>
 {
 	text: &'a str,
 	pos: usize,
+	/// What the text is, for the errors: a query, a transaction, ...
+	what: &'static str,
 }
 
 fn is_delimiter(c: char) -> bool
@@ -437,6 +441,11 @@ fn is_delimiter(c: char) -> bool
 
 impl<'a> Reader<'a>
 {
+	pub(crate) fn new(text: &'a str, what: &'static str) -> Self
+	{
+		Reader { text, pos: 0, what }
+	}
+
 	fn peek(&self) -> Option<char>
 	{
 		self.text[self.pos..].chars().next()
@@ -462,13 +471,13 @@ impl<'a> Reader<'a>
 	}
 
 	// Exactly one form
-	fn read_all(mut self) -> Result<Node, Error>
+	pub(crate) fn read_all(mut self) -> Result<Node, Error>
 	{
 		let node = self.read()?;
 		self.skip_space();
 		if self.pos < self.text.len()
 		{
-			return Err(error_at(self.text, self.pos, "unexpected text after the query"));
+			return Err(error_at(self.text, self.pos, format!("unexpected text after the {}", self.what)));
 		}
 		Ok(node)
 	}
@@ -480,7 +489,7 @@ impl<'a> Reader<'a>
 		let Some(c) = self.peek()
 		else
 		{
-			return Err(error_at(self.text, pos, "unexpected end of the query"));
+			return Err(error_at(self.text, pos, format!("unexpected end of the {}", self.what)));
 		};
 		let form = match c
 		{
@@ -566,7 +575,7 @@ impl<'a> Reader<'a>
 					{
 						"true" => Form::Bool(true),
 						"false" => Form::Bool(false),
-						"nil" => return Err(error_at(self.text, pos, "nil is not supported")),
+						"nil" => Form::Nil,
 						_ => Form::Symbol(token.to_string()),
 					}
 				}
@@ -924,6 +933,7 @@ impl<'a> Parser<'a>
 			Form::Instant(i) => Ok(Term::Val(Value::Instant(*i))),
 			Form::Bool(b) => Ok(Term::Val((*b).into())),
 			Form::Keyword(k) => Err(self.err(node, format!("the keyword :{k} is not a value (keywords only name attributes)"))),
+			Form::Nil => Err(self.err(node, "nil is not supported")),
 			Form::Vector(_) | Form::List(_) | Form::Map(_) => Err(self.err(node, "expected a variable or a constant")),
 		}
 	}
@@ -1127,7 +1137,7 @@ impl<'a> Parser<'a>
 
 	fn read_rules(&mut self) -> Result<(), Error>
 	{
-		let node = Reader { text: self.text, pos: 0 }.read_all()?;
+		let node = Reader::new(self.text, "rules").read_all()?;
 		let Form::Vector(rules) = &node.form
 		else
 		{

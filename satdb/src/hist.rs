@@ -480,6 +480,23 @@ impl HIndex
 		tail.clear();
 	}
 
+	/// Merge the segments and the tail into one segment, which a read then searches alone (a no-op on an index that is one segment already).
+	/// The entries added afterwards go to a new tail, and to segments of their own, as before
+	pub(crate) fn compact(&mut self)
+	{
+		if self.segs.len() > 1 || !self.tail.is_empty()
+		{
+			self.segs = Arc::new(vec![Arc::new(Segment::merge(&self.order, &self.segs, &self.tail))]);
+			self.tail = Arc::default();
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn segments(&self) -> usize
+	{
+		self.segs.len() + usize::from(!self.tail.is_empty())
+	}
+
 	/// The entries whose leading columns are `prefix` (which must be leading columns of the index's order), in order
 	pub(crate) fn scan<'a>(&'a self, prefix: &[Key]) -> Scan<'a>
 	{
@@ -616,5 +633,40 @@ mod tests
 		}
 		assert_reads(&HIndex::new(EAVT), &[], &[random_entry(&mut Rng::new(1), false)], "empty");
 		assert_reads(&HIndex::from_sorted(LOG, Vec::new()), &[], &[], "built empty");
+	}
+
+	// In every order: compaction leaves one segment that reads like the index it came from (whose clone still reads the same),
+	// from an empty index, a tail alone, and several segments with a tail; and the insertions after it read as they would have
+	#[test]
+	fn compaction_keeps_the_entries()
+	{
+		for (o, order) in [EAVT, AEVT, AVET, VAET, LOG].iter().enumerate()
+		{
+			let mut rng = Rng::new(40 + o as u64);
+			let mut index = HIndex::new(*order);
+			let mut model: Vec<Datom> = Vec::new();
+			let mut probes: Vec<Datom> = (0..20).map(|_| random_entry(&mut rng, false)).collect();
+			for stop in [0, 3, TAIL_CAP, 700, 1500, 1501]
+			{
+				while model.len() < stop
+				{
+					let d = random_entry(&mut rng, *order == VAET);
+					if let Err(at) = model.binary_search_by(|x| cmp_datoms(order, x, &d))
+					{
+						model.insert(at, d.clone());
+						index.insert(d);
+					}
+				}
+				probes.extend(model.iter().step_by(97).cloned());
+				let before = index.clone();
+				assert!(stop != 700 || before.segments() > 2, "{order:?}: several segments and a tail");
+				index.compact();
+				assert_eq!(index.segments(), usize::from(stop > 0), "{order:?} at {stop}");
+				assert_reads(&index, &model, &probes, &format!("{order:?} compacted at {stop}"));
+				assert_reads(&before, &model, &probes, &format!("{order:?} before the compaction at {stop}"));
+				index.compact();
+				assert_eq!(index.segments(), usize::from(stop > 0), "{order:?} at {stop}, twice");
+			}
+		}
 	}
 }

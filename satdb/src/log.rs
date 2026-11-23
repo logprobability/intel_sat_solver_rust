@@ -1196,7 +1196,7 @@ mod tests
 		}
 	}
 
-	// The time of the reads served by the history indexes, on a replayed value and on one opened from a checkpoint
+	// The time of the reads served by the history indexes, on a replayed value, on that value compacted, and on one opened from a checkpoint
 	// (release: cargo test --release history_read_timings -- --ignored --nocapture)
 	#[test]
 	#[ignore]
@@ -1210,7 +1210,10 @@ mod tests
 		conn.checkpoint().unwrap();
 		drop(conn);
 		let reopened = Conn::open(&path).unwrap().db();
-		for (what, db) in [("replayed", replayed), ("from the checkpoint", reopened)]
+		let t = std::time::Instant::now();
+		let compacted = replayed.compacted();
+		println!("compacted in {:?}", t.elapsed());
+		for (what, db) in [("replayed", replayed), ("compacted", compacted), ("from the checkpoint", reopened)]
 		{
 			let (n, tag, rf) = (db.attr_id("n").unwrap(), db.attr_id("tag").unwrap(), db.attr_id("ref").unwrap());
 			let (entries, bytes) = db.history_size();
