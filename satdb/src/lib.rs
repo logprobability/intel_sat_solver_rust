@@ -1,6 +1,6 @@
 //! satdb: a Datomic-inspired immutable database whose query planner runs on the Intel(R) SAT Solver.
 //!
-//! * `db`: database values (`Db`) made of datoms in persistent EAVT/AEVT/AVET/VAET indexes; `transact` applies a transaction
+//! * `db`: database values (`Db`) made of datoms (Bool, Int, Float, Str, Instant and Ref values) in persistent EAVT/AEVT/AVET/VAET indexes; `transact` applies a transaction
 //!   (a set of assertions and retractions, with upserts, lookup refs, `retract_entity` and a reified transaction entity) and returns a new value,
 //!   sharing the unchanged index nodes. Every value also holds its history (every assertion and retraction, with its transaction, and every
 //!   schema change), which the `history()`, `since(t)` and `as_of(t)` views expose; so `Conn` keeps only its latest value.
@@ -8,10 +8,10 @@
 //!   and every committed transaction is appended and synced before `transact` returns.
 //! * `log` (private): the durable log's format, commit and recovery (a torn final record is truncated, any other damage refused), and checkpoints.
 //! * `query`: Datalog-style queries (patterns, comparison predicates, `not`/`not-join`, `or`/`or-join`, over any view), planned online while
-//!   they are assembled, with aggregates in the find spec; and `Db::pull`, which reads an entity as a tree.
+//!   they are assembled, with aggregates in the find spec; and `Db::pull`, which reads an entity as a tree (with attribute options and recursion).
 //! * `rules`: Datalog rules, recursive and mutually recursive ones included, evaluated bottom-up (stratified, semi-naive,
 //!   each body planned by the SAT planner once per stratum) when a query first calls them.
-//! * `parse`: the text syntax of queries (a subset of Datomic's Datalog, in EDN), read into the query builder (`Db::q`, `Db::q_rules`).
+//! * `parse`: the text syntax of queries (a subset of Datomic's Datalog, in EDN), read into the query builder (`Db::q`, `Db::q_rules`), and of pull patterns (`Db::pull_str`).
 //! * `planner`: the join order, by an exact dynamic program for queries of up to 16 clauses and an incremental SAT encoding beyond,
 //!   with hard ordering constraints (`Query::require_before`), whose conflicts the SAT solver's UNSAT cores explain (see its documentation).
 //! * `pmap`: the persistent sorted map under the indexes.
@@ -36,7 +36,7 @@
 //!
 //! // The same query as text, with an input and an aggregate
 //! let text = "[:find (count ?p) :in $ ?min :where [?p :person/age ?age] [(> ?age ?min)] (not [?p :person/name \"Carol\"])]";
-//! assert_eq!(conn.db().q(text, &[Value::from(20)]).unwrap(), vec![vec![Value::from(2)]]);
+//! assert_eq!(conn.db().q(text, &[Value::from(20).into()]).unwrap(), vec![vec![Value::from(2)]]);
 //!
 //! // A recursive rule: everyone above Alice in a chain of bosses
 //! let (alice, bob) = (Entity::Id(first.eid(alice)), Entity::Id(first.eid(bob)));
@@ -60,9 +60,9 @@ pub mod query;
 pub mod rules;
 
 pub use db::{Attr, AttrId, AttrStats, Cardinality, Conn, Datom, Db, Eid, Entity, Error, Tx, TxLogEntry, TxReport, TxValue, Unique, Value, ValueType, T, TX_INSTANT};
-pub use parse::TextQuery;
+pub use parse::{Cell, Found, Input, TextQuery};
 pub use planner::{Plan, PlanSource};
-pub use query::{Agg, Clause, Cmp, Find, Pull, PullValue, Pulled, Query, Term};
+pub use query::{Agg, Clause, Cmp, Find, Nested, Pull, PullOpts, PullValue, Pulled, Query, Term};
 pub use rules::RuleStats;
 
 #[cfg(test)]

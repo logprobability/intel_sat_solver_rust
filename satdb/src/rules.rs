@@ -21,6 +21,9 @@
 //! * The relations keep, per combination of bound argument positions that a call has used, a hash index, which grows with the relation.
 //!
 //! Evaluation is bottom-up: a rule's whole relation is derived, whatever constants its calls have (there is no magic-sets rewriting).
+//!
+//! A *base relation* (`Query::relation`) is a rule given by its tuples instead of definitions; text queries pass their collection
+//! and relation inputs as base relations.
 
 use crate::db::{AttrStats, Error, Value};
 use crate::planner::VarId;
@@ -47,6 +50,8 @@ pub(crate) struct Rule
 	pub(crate) arity: usize,
 	/// Empty for a rule that is called but not (yet) defined
 	defs: Vec<Def>,
+	/// The tuples of a base relation (`Query::relation`), which has no definitions
+	facts: Option<Vec<Vec<Value>>>,
 }
 
 /// What evaluating the query's rules took
@@ -215,7 +220,7 @@ impl Query
 			Some(i) => Ok(i),
 			None =>
 			{
-				self.rules.push(Rule { name: name.to_string(), arity, defs: Vec::new() });
+				self.rules.push(Rule { name: name.to_string(), arity, defs: Vec::new(), facts: None });
 				Ok(self.rules.len() - 1)
 			}
 		}
@@ -251,8 +256,35 @@ impl Query
 			return Err(Error::Unbound(self.vars[x].clone()));
 		}
 		let id = self.rule_id(name, vars.len())?;
+		if self.rules[id].facts.is_some()
+		{
+			return Err(Error::InvalidQuery(format!("{name} is a base relation, which has no definitions")));
+		}
 		self.rules[id].defs.push(Def { head: vars, body });
 		// Relations evaluated for a clause that then failed to be added are out of date
+		self.rels = Rels::default();
+		Ok(())
+	}
+
+	/// Define the base relation `name` of `arity`, whose tuples are `tuples` (duplicates count once): a rule without definitions, called
+	/// like any (`call`, `call_clause`, and from rule bodies), and planned with its size. It is how a text query's collection and relation
+	/// inputs reach its clauses. Like rules, base relations are defined before any clause of the query calls a rule
+	pub fn relation(&mut self, name: &str, arity: usize, tuples: Vec<Vec<Value>>) -> Result<(), Error>
+	{
+		if self.rules_used
+		{
+			return Err(Error::InvalidQuery(format!("the relation {name} is defined after a clause of the query called a rule (the rules are fixed then)")));
+		}
+		if let Some(t) = tuples.iter().find(|t| t.len() != arity)
+		{
+			return Err(Error::InvalidQuery(format!("the relation {name} has {arity} positions, but a tuple has {}", t.len())));
+		}
+		let id = self.rule_id(name, arity)?;
+		if !self.rules[id].defs.is_empty() || self.rules[id].facts.is_some()
+		{
+			return Err(Error::InvalidQuery(format!("{name} is already defined")));
+		}
+		self.rules[id].facts = Some(tuples);
 		self.rels = Rels::default();
 		Ok(())
 	}
@@ -328,7 +360,7 @@ impl Query
 		let needed: Vec<usize> = (0..n).filter(|&r| called.contains(&r) || called.iter().any(|&c| reach[c][r])).collect();
 		for &r in &needed
 		{
-			if self.rules[r].defs.is_empty()
+			if self.rules[r].defs.is_empty() && self.rules[r].facts.is_none()
 			{
 				return Err(Error::InvalidQuery(format!("the rule {} is called but never defined", self.rules[r].name)));
 			}
@@ -349,6 +381,18 @@ impl Query
 	{
 		if rels.full[r].ready
 		{
+			return Ok(());
+		}
+		// A base relation is its tuples (it calls nothing, so it is a stratum of its own)
+		if let Some(facts) = &self.rules[r].facts
+		{
+			let mut rel = Relation::default();
+			for t in facts
+			{
+				rel.insert(t.clone());
+			}
+			rel.ready = true;
+			rels.full[r] = rel;
 			return Ok(());
 		}
 		let stratum: Vec<usize> = (0..self.rules.len()).filter(|&s| s == r || reach[r][s] && reach[s][r]).collect();

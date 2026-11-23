@@ -24,6 +24,9 @@
 //!
 //! The file is locked (`File::try_lock`) while a connection holds it, so a second connection can't interleave appends.
 //!
+//! The Float and Instant value tags (4 and 5) came after the format's version 1 and keep it: older logs read as before, but a log that
+//! holds such values reads as `CorruptLog` in builds from before them.
+//!
 //! # Checkpoints
 //! `Conn::checkpoint` writes `<log>.ckpt`: a 36-byte header (magic, format version, the length of the log prefix it covers, the CRC-32
 //! of that prefix, the payload's length and CRC-32) and the payload, a `Snapshot` of the database after the covered records (what can't be
@@ -41,6 +44,8 @@ use std::path::{Path, PathBuf};
 const MAGIC: &[u8; 8] = b"satdblog";
 const CKPT_MAGIC: &[u8; 8] = b"satdbckp";
 const VERSION: u32 = 1;
+/// The checkpoint format: 2 since `db/txInstant` holds Instants (a checkpoint of another version is ignored, as any unusable one)
+const CKPT_VERSION: u32 = 2;
 const FILE_HEADER: usize = 12;
 const RECORD_HEADER: usize = 12;
 const CKPT_HEADER: usize = 36;
@@ -110,6 +115,16 @@ fn put_value(out: &mut Vec<u8>, v: &Value)
 			out.push(3);
 			out.extend_from_slice(&r.to_le_bytes());
 		}
+		Value::Float(f) =>
+		{
+			out.push(4);
+			out.extend_from_slice(&f.to_bits().to_le_bytes());
+		}
+		Value::Instant(i) =>
+		{
+			out.push(5);
+			out.extend_from_slice(&i.to_le_bytes());
+		}
 	}
 }
 
@@ -153,6 +168,8 @@ fn put_attr(out: &mut Vec<u8>, def: &Attr)
 		ValueType::Int => 1,
 		ValueType::Str => 2,
 		ValueType::Ref => 3,
+		ValueType::Float => 4,
+		ValueType::Instant => 5,
 	};
 	let unique = match def.unique
 	{
@@ -257,19 +274,21 @@ impl<'a> Reader<'a>
 
 	fn value(&mut self) -> Result<Value, String>
 	{
-		Ok(match self.tag("value tag", 3)?
+		Ok(match self.tag("value tag", 5)?
 		{
 			0 => Value::Bool(self.tag("boolean", 1)? == 1),
 			1 => Value::Int(self.u64()? as i64),
 			2 => Value::from(self.str()?),
-			_ => Value::Ref(self.u64()?),
+			3 => Value::Ref(self.u64()?),
+			4 => Value::Float(f64::from_bits(self.u64()?)),
+			_ => Value::Instant(self.u64()? as i64),
 		})
 	}
 
 	fn attr(&mut self) -> Result<Attr, String>
 	{
 		let name = self.str()?;
-		let value_type = [ValueType::Bool, ValueType::Int, ValueType::Str, ValueType::Ref][self.tag("value type", 3)? as usize];
+		let value_type = [ValueType::Bool, ValueType::Int, ValueType::Str, ValueType::Ref, ValueType::Float, ValueType::Instant][self.tag("value type", 5)? as usize];
 		let cardinality = [Cardinality::One, Cardinality::Many][self.tag("cardinality", 1)? as usize];
 		let unique = [None, Some(Unique::Identity), Some(Unique::Value)][self.tag("uniqueness", 2)? as usize];
 		let component = self.tag("component flag", 1)? == 1;
@@ -351,7 +370,7 @@ fn checkpoint_bytes(snapshot: &Snapshot, log_prefix: &[u8]) -> Vec<u8>
 	let payload = encode_snapshot(snapshot);
 	let mut out = Vec::with_capacity(CKPT_HEADER + payload.len());
 	out.extend_from_slice(CKPT_MAGIC);
-	out.extend_from_slice(&VERSION.to_le_bytes());
+	out.extend_from_slice(&CKPT_VERSION.to_le_bytes());
 	out.extend_from_slice(&(log_prefix.len() as u64).to_le_bytes());
 	out.extend_from_slice(&crc32(log_prefix).to_le_bytes());
 	out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
@@ -364,7 +383,7 @@ fn checkpoint_bytes(snapshot: &Snapshot, log_prefix: &[u8]) -> Vec<u8>
 /// (whose records start at `starts`, and whose complete records end at `end`); None otherwise, so that the log is replayed in full
 fn load_checkpoint(ckpt: &[u8], bytes: &[u8], starts: &[usize], end: usize) -> Option<(Db, usize)>
 {
-	if ckpt.len() < CKPT_HEADER || ckpt[..8] != *CKPT_MAGIC || ckpt[8..12] != VERSION.to_le_bytes()
+	if ckpt.len() < CKPT_HEADER || ckpt[..8] != *CKPT_MAGIC || ckpt[8..12] != CKPT_VERSION.to_le_bytes()
 	{
 		return None;
 	}
@@ -657,6 +676,15 @@ mod tests
 		// A schema alteration and a compare-and-swap
 		let mut tx = Tx::new();
 		tx.alter_attr(Attr::new("note", ValueType::Str, Cardinality::One)).cas(Entity::Tx, "n", None, 3);
+		out.push(conn.transact(&tx).unwrap());
+		// Floats (NaN and -0.0 too) and instants
+		let mut tx = Tx::new();
+		tx.define("f", ValueType::Float, Cardinality::Many).define("at", ValueType::Instant, Cardinality::One);
+		for f in [1.25, -0.0, f64::NAN, f64::NEG_INFINITY]
+		{
+			tx.add(Entity::Tx, "f", f);
+		}
+		tx.add(Entity::Tx, "at", Value::Instant(-86_400_000));
 		out.push(conn.transact(&tx).unwrap());
 		out.push(conn.transact(&Tx::new()).unwrap());
 		let mut tx = Tx::new();

@@ -19,11 +19,15 @@
 //!  [(follows* ?a ?b) [?a :person/follows ?c] (follows* ?c ?b)]]
 //! ```
 //! * The sections `:find`, `:with`, `:in` and `:where`, each at most once, in any order; `:find` is required.
-//! * `:find` takes variables and aggregates `(count ?x)`, `(count-distinct ?x)`, `(sum ?x)`, `(min ?x)`, `(max ?x)`, `(avg ?x)`
-//!   (see `Query::find`); `:with` takes variables.
+//! * `:find` takes variables, aggregates `(count ?x)`, `(count-distinct ?x)`, `(sum ?x)`, `(min ?x)`, `(max ?x)`, `(avg ?x)`
+//!   (see `Query::find`) and pulls `(pull ?e [pattern])` (see `Db::pull_str`), in one of Datomic's shapes, which the result
+//!   (`Found`) follows: `?a ?b` (a relation), `[?a ...]` (a collection), `[?a ?b]` (a tuple: the first row) and `?a .` (a scalar).
+//!   Rows are distinct and sorted by their values (a pulled position by its entity), then pulled; `:with` takes variables.
 //! * `:in` takes `$` (the database; one at most, and it may be left out), `%` (the rules, given as a text of their own to
-//!   `Db::q_rules`) and scalar inputs `?x`, which are bound to `inputs` in order and become constants of the query
-//!   (so the planner sees them as bound).
+//!   `Db::q_rules`) and bindings, each bound to the `Input` at its position among them: a scalar `?x` (`Input::Scalar`) and a tuple
+//!   `[?a ?b]` (`Input::Tuple`) become constants of the query (so the planner sees them as bound); a collection `[?x ...]`
+//!   (`Input::Coll`) and a relation `[[?a ?b]]` (`Input::Rel`) become base relations (`Query::relation`) that the query joins, like
+//!   rule calls, so its solutions (and its aggregates) range over all of them. `_` in a binding ignores that position.
 //! * Rules are written as in Datomic, `[[(name ?a ?b) clause ...] ...]`: a head of distinct variables, then the body; definitions
 //!   with the same name are a union, and rules can call each other in any order. A call `(name arg ...)` is a clause, in the query
 //!   or in a rule, whose arguments are terms or lookup refs (see the `rules` module). Required variables (`(name [?a] ?b)`) are not supported.
@@ -35,64 +39,293 @@
 //! * Comparisons `[(op a b)]` with `=`, `!=` (or `not=`), `<`, `<=`, `>` and `>=`.
 //! * `(not clause ...)`, `(not-join [?v ...] clause ...)`, `(or branch ...)` and `(or-join [?v ...] branch ...)`, where a branch
 //!   is a clause or `(and clause ...)`.
-//! * Constants: strings (with the escapes `\"`, `\\`, `\n`, `\t` and `\r`), integers and booleans. There is no keyword value type,
+//! * Constants: strings (with the escapes `\"`, `\\`, `\n`, `\t` and `\r`), integers, floats (`1.5`, `-2e3`), booleans and instants
+//!   (`#inst "2024-02-29T13:45:00Z"`, RFC 3339 with `Z` or an offset, or a date alone). There is no keyword value type,
 //!   so a keyword can only name an attribute.
+//! * Pull patterns (`Db::pull_str`, and in `:find`) are EDN too, the only place where maps are allowed.
 //!
 //! Commas are whitespace and `;` starts a comment. Syntax errors are `Error::Parse`, with the line and column; the errors of the clauses
 //! themselves (an unknown attribute, a type mismatch, ...) are those of the builder.
 
-use crate::db::{Db, Error, Value};
-use crate::query::{Agg, Clause, Cmp, Find, Query, Term};
+use crate::db::{Db, Eid, Error, Value};
+use crate::query::{Agg, Clause, Cmp, Find, Pull, Pulled, Query, Term};
 use std::collections::{BTreeSet, HashMap};
+
+/// An input of a text query, for the binding in its `:in` section at the same position (`$` and `%` take none)
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Input
+{
+	/// For `?x`
+	Scalar(Value),
+	/// For `[?x ...]`: the query's solutions for each value
+	Coll(Vec<Value>),
+	/// For `[?a ?b]`: a value for each variable
+	Tuple(Vec<Value>),
+	/// For `[[?a ?b]]`: the query's solutions for each tuple
+	Rel(Vec<Vec<Value>>),
+}
+
+impl From<Value> for Input
+{
+	fn from(v: Value) -> Self
+	{
+		Input::Scalar(v)
+	}
+}
+
+/// An element of a text query's result: a value, or an entity pulled by `(pull ?e pattern)`
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Cell
+{
+	Val(Value),
+	Pull(Pulled),
+}
+
+/// A text query's result, in the shape of its find spec (Datomic's): rows are distinct and sorted by their values, before any pull
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Found
+{
+	/// `:find ?a ?b`: the rows
+	Rel(Vec<Vec<Cell>>),
+	/// `:find [?a ...]`: the first element of each row
+	Coll(Vec<Cell>),
+	/// `:find [?a ?b]`: the first row, if any
+	Tuple(Option<Vec<Cell>>),
+	/// `:find ?a .`: the first element of the first row, if any
+	Scalar(Option<Cell>),
+}
+
+impl Found
+{
+	/// The rows, whatever the shape (a collection's elements as rows of one, a tuple as one row, a scalar as one row of one)
+	pub fn rows(&self) -> Vec<Vec<Cell>>
+	{
+		match self
+		{
+			Found::Rel(rows) => rows.clone(),
+			Found::Coll(cells) => cells.iter().map(|c| vec![c.clone()]).collect(),
+			Found::Tuple(row) => row.iter().cloned().collect(),
+			Found::Scalar(cell) => cell.iter().map(|c| vec![c.clone()]).collect(),
+		}
+	}
+
+	/// The rows as values (see `rows`), if no cell is a pull
+	pub fn values(&self) -> Option<Vec<Vec<Value>>>
+	{
+		self.rows()
+			.into_iter()
+			.map(|r| {
+				r.into_iter()
+					.map(|c| match c
+					{
+						Cell::Val(v) => Some(v),
+						Cell::Pull(_) => None,
+					})
+					.collect()
+			})
+			.collect()
+	}
+
+	pub fn len(&self) -> usize
+	{
+		self.rows().len()
+	}
+
+	pub fn is_empty(&self) -> bool
+	{
+		self.len() == 0
+	}
+}
+
+/// A relation of values: equal to the rows of a `Found::Rel` without pulls (so that a plain result compares with its values)
+impl PartialEq<Vec<Vec<Value>>> for Found
+{
+	fn eq(&self, other: &Vec<Vec<Value>>) -> bool
+	{
+		match self
+		{
+			Found::Rel(rows) => rows.len() == other.len() && rows.iter().zip(other).all(|(r, o)| r.len() == o.len() && r.iter().zip(o).all(|(c, v)| *c == Cell::Val(v.clone()))),
+			_ => false,
+		}
+	}
+}
+
+/// The shape of a find spec (see `Found`)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shape
+{
+	Rel,
+	Coll,
+	Tuple,
+	Scalar,
+}
 
 /// A parsed text query: the query (planned as its clauses were read), its find spec and its `with` terms
 pub struct TextQuery
 {
 	pub query: Query,
+	/// The find spec as the builder runs it: a pulled position as its variable
 	pub find: Vec<Find>,
 	pub with: Vec<Term>,
+	/// The pull patterns, by position in `find`
+	pulls: Vec<(usize, Vec<Pull>)>,
+	shape: Shape,
 }
 
 impl TextQuery
 {
-	/// Optimize the plan and run the query (see `Query::find`)
-	pub fn run(&mut self) -> Result<Vec<Vec<Value>>, Error>
+	/// Optimize the plan, run the query (see `Query::find`), pull the entities of its pull positions, and shape the result
+	pub fn run(&mut self) -> Result<Found, Error>
 	{
-		self.query.find(&self.find, &self.with)
+		let rows = self.query.find(&self.find, &self.with)?;
+		let db = self.query.db.clone();
+		let mut out = Vec::with_capacity(rows.len());
+		for row in rows
+		{
+			let mut cells: Vec<Cell> = row.into_iter().map(Cell::Val).collect();
+			for (i, pattern) in &self.pulls
+			{
+				cells[*i] = match &cells[*i]
+				{
+					Cell::Val(Value::Ref(e)) => Cell::Pull(db.pull(pattern, *e)?),
+					Cell::Val(v) => return Err(Error::InvalidQuery(format!("pull of {v:?}, which is not an entity"))),
+					Cell::Pull(_) => unreachable!("each position is pulled once"),
+				};
+			}
+			out.push(cells);
+		}
+		Ok(match self.shape
+		{
+			Shape::Rel => Found::Rel(out),
+			Shape::Coll => Found::Coll(out.into_iter().map(|mut r| r.swap_remove(0)).collect()),
+			Shape::Tuple => Found::Tuple(out.into_iter().next()),
+			Shape::Scalar => Found::Scalar(out.into_iter().next().map(|mut r| r.swap_remove(0))),
+		})
 	}
 }
 
 impl Db
 {
-	/// Parse a text query (see the module documentation), with `inputs` bound to the scalar inputs of its `:in` section, in order
-	pub fn parse_query(&self, text: &str, inputs: &[Value]) -> Result<TextQuery, Error>
+	/// Parse a text query (see the module documentation), with `inputs` bound to the bindings of its `:in` section after `$` and `%`, in order
+	pub fn parse_query(&self, text: &str, inputs: &[Input]) -> Result<TextQuery, Error>
 	{
 		self.parse(text, None, inputs)
 	}
 
 	/// Parse a text query that takes the rule set `rules` (as `%` in its `:in` section; see the module documentation)
-	pub fn parse_query_rules(&self, text: &str, rules: &str, inputs: &[Value]) -> Result<TextQuery, Error>
+	pub fn parse_query_rules(&self, text: &str, rules: &str, inputs: &[Input]) -> Result<TextQuery, Error>
 	{
 		self.parse(text, Some(rules), inputs)
 	}
 
-	fn parse(&self, text: &str, rules: Option<&str>, inputs: &[Value]) -> Result<TextQuery, Error>
+	fn parse(&self, text: &str, rules: Option<&str>, inputs: &[Input]) -> Result<TextQuery, Error>
 	{
 		let node = Reader { text, pos: 0 }.read_all()?;
 		Parser { text, q: self.query(), inputs: HashMap::new(), fresh: 0, rule_names: HashMap::new() }.query(node, rules, inputs)
 	}
 
 	/// Parse and run a text query
-	pub fn q(&self, text: &str, inputs: &[Value]) -> Result<Vec<Vec<Value>>, Error>
+	pub fn q(&self, text: &str, inputs: &[Input]) -> Result<Found, Error>
 	{
 		self.parse_query(text, inputs)?.run()
 	}
 
 	/// Parse and run a text query that takes the rule set `rules`
-	pub fn q_rules(&self, text: &str, rules: &str, inputs: &[Value]) -> Result<Vec<Vec<Value>>, Error>
+	pub fn q_rules(&self, text: &str, rules: &str, inputs: &[Input]) -> Result<Found, Error>
 	{
 		self.parse_query_rules(text, rules, inputs)?.run()
 	}
+
+	/// Pull entity `e` by a pull pattern in Datomic's EDN syntax (see `Db::pull`):
+	/// `[:person/name *  :person/_friend  [:person/aka :limit 2 :as "aliases"]  [:person/age :default 0]
+	///   {:person/friend [:person/name]}  {[:person/boss :as "chain"] ...}  {:person/friend 2}]`.
+	/// A keyword whose name starts with `_` is a reverse attribute; a map nests a pattern under each of its keys, or recurses
+	/// (`...`: until an entity repeats, or a depth)
+	pub fn pull_str(&self, pattern: &str, e: Eid) -> Result<Pulled, Error>
+	{
+		let node = Reader { text: pattern, pos: 0 }.read_all()?;
+		self.pull(&pull_pattern(pattern, &node)?, e)
+	}
+}
+
+/// A pull pattern of EDN (see `Db::pull_str`)
+fn pull_pattern(text: &str, node: &Node) -> Result<Vec<Pull>, Error>
+{
+	let Form::Vector(items) = &node.form
+	else
+	{
+		return Err(error_at(text, node.pos, "a pull pattern is a vector"));
+	};
+	let mut out = Vec::new();
+	for item in items
+	{
+		match &item.form
+		{
+			Form::Symbol(s) if s == "*" => out.push(Pull::Wildcard),
+			Form::Keyword(_) | Form::Vector(_) | Form::List(_) => out.push(pull_attr(text, item)?),
+			Form::Map(pairs) =>
+			{
+				for pair in pairs.chunks(2)
+				{
+					let attr = pull_attr(text, &pair[0])?;
+					out.push(match &pair[1].form
+					{
+						Form::Symbol(s) if s == "..." => attr.recurse(None),
+						Form::Int(n) if *n >= 0 => attr.recurse(Some(*n as usize)),
+						Form::Vector(_) => attr.nest(pull_pattern(text, &pair[1])?),
+						_ => return Err(error_at(text, pair[1].pos, "a map of a pull pattern takes a pattern, ... or a depth for each attribute")),
+					});
+				}
+			}
+			_ => return Err(error_at(text, item.pos, "expected an attribute, *, an attribute with options or a map")),
+		}
+	}
+	Ok(out)
+}
+
+/// An attribute of a pull pattern: `:ns/name` (`:ns/_name` for the reverse), or `[:ns/name option value ...]` with the options
+/// `:as` (a string or a keyword), `:limit` (a count) and `:default` (a constant)
+fn pull_attr(text: &str, node: &Node) -> Result<Pull, Error>
+{
+	let err = |n: &Node, msg: &str| error_at(text, n.pos, msg);
+	let named = |n: &Node| match &n.form
+	{
+		Form::Keyword(k) => Ok(match k.rsplit_once('/')
+		{
+			Some((ns, local)) if local.len() > 1 && local.starts_with('_') => Pull::reverse(&format!("{ns}/{}", &local[1..])),
+			None if k.len() > 1 && k.starts_with('_') => Pull::reverse(&k[1..]),
+			_ => Pull::attr(k),
+		}),
+		_ => Err(err(n, "expected an attribute keyword")),
+	};
+	let (Form::Vector(items) | Form::List(items)) = &node.form else { return named(node) };
+	let Some((first, opts)) = items.split_first() else { return Err(err(node, "an attribute with options needs the attribute")) };
+	if opts.len() % 2 == 1
+	{
+		return Err(err(node, "every option of a pull attribute needs a value"));
+	}
+	let mut attr = named(first)?;
+	for pair in opts.chunks(2)
+	{
+		let (k, v) = (&pair[0], &pair[1]);
+		attr = match (&k.form, &v.form)
+		{
+			(Form::Keyword(o), Form::Str(s) | Form::Keyword(s)) if o == "as" => attr.key(s),
+			(Form::Keyword(o), Form::Int(n)) if o == "limit" && *n >= 0 => attr.limit(*n as usize),
+			(Form::Keyword(o), _) if o == "default" => attr.default(match &v.form
+			{
+				Form::Str(s) => Value::from(s.as_str()),
+				Form::Int(i) => Value::Int(*i),
+				Form::Float(f) => Value::Float(*f),
+				Form::Bool(b) => Value::Bool(*b),
+				Form::Instant(i) => Value::Instant(*i),
+				_ => return Err(err(v, "a default is a constant")),
+			}),
+			(Form::Keyword(o), _) if ["as", "limit"].contains(&o.as_str()) => return Err(err(v, "invalid value of the option")),
+			_ => return Err(err(k, "unknown option of a pull attribute (the options are :as, :limit and :default)")),
+		};
+	}
+	Ok(attr)
 }
 
 /// The error at byte offset `pos` of `text`
@@ -109,11 +342,77 @@ enum Form
 {
 	Vector(Vec<Node>),
 	List(Vec<Node>),
+	/// The keys and values, alternating (only pull patterns take maps)
+	Map(Vec<Node>),
 	Keyword(String),
 	Symbol(String),
 	Str(String),
 	Int(i64),
+	Float(f64),
+	/// `#inst "..."`, in milliseconds since the Unix epoch
+	Instant(i64),
 	Bool(bool),
+}
+
+/// The instant of an RFC 3339 timestamp (`2024-02-29T13:45:00Z`, `...:00.25+02:00`; also a date alone, at midnight UTC),
+/// in milliseconds since the Unix epoch (fractions beyond milliseconds are truncated); None if it isn't one
+pub(crate) fn parse_instant(s: &str) -> Option<i64>
+{
+	let num = |s: &str| -> Option<i64> { (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok()).flatten() };
+	let (date, time) = s.split_once(['T', 't']).unwrap_or((s, "00:00:00Z"));
+	let mut d = date.split('-');
+	let (y, m, day) = (d.next().filter(|x| x.len() == 4).and_then(num)?, d.next().filter(|x| x.len() == 2).and_then(num)?, d.next().filter(|x| x.len() == 2).and_then(num)?);
+	if d.next().is_some() || !(1..=12).contains(&m)
+	{
+		return None;
+	}
+	let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+	let days_in_month = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m as usize - 1];
+	if !(1..=days_in_month).contains(&day)
+	{
+		return None;
+	}
+	// The offset: Z, or +hh:mm / -hh:mm
+	let (clock, offset) = if let Some(c) = time.strip_suffix(['Z', 'z'])
+	{
+		(c, 0)
+	}
+	else
+	{
+		let at = time.rfind(['+', '-'])?;
+		let (h, mi) = time[at + 1..].split_once(':')?;
+		let (h, mi) = (Some(h).filter(|x| x.len() == 2).and_then(num)?, Some(mi).filter(|x| x.len() == 2).and_then(num)?);
+		if h > 23 || mi > 59
+		{
+			return None;
+		}
+		let sign = if &time[at..at + 1] == "-" { -1 } else { 1 };
+		(&time[..at], sign * (h * 60 + mi))
+	};
+	let (hms, frac) = clock.split_once('.').map_or((clock, None), |(a, b)| (a, Some(b)));
+	let mut c = hms.split(':');
+	let (hh, mm, ss) = (c.next().filter(|x| x.len() == 2).and_then(num)?, c.next().filter(|x| x.len() == 2).and_then(num)?, c.next().filter(|x| x.len() == 2).and_then(num)?);
+	if c.next().is_some() || hh > 23 || mm > 59 || ss > 60
+	{
+		return None;
+	}
+	let millis = match frac
+	{
+		None => 0,
+		Some(f) =>
+		{
+			num(f)?;
+			format!("{:0<3}", &f[..f.len().min(3)]).parse::<i64>().ok()?
+		}
+	};
+	// Days since the epoch of the civil date (the proleptic Gregorian calendar)
+	let (yy, mm_) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+	let era = yy.div_euclid(400);
+	let yoe = yy - era * 400;
+	let doy = (153 * mm_ + 2) / 5 + day - 1;
+	let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	let days = era * 146_097 + doe - 719_468;
+	Some(((days * 24 + hh) * 60 + mm - offset) * 60_000 + ss * 1000 + millis)
 }
 
 /// A form and its byte offset in the text
@@ -185,10 +484,15 @@ impl<'a> Reader<'a>
 		};
 		let form = match c
 		{
-			'[' | '(' =>
+			'[' | '(' | '{' =>
 			{
 				self.pos += 1;
-				let close = if c == '[' { ']' } else { ')' };
+				let close = match c
+				{
+					'[' => ']',
+					'(' => ')',
+					_ => '}',
+				};
 				let mut items = Vec::new();
 				loop
 				{
@@ -201,15 +505,33 @@ impl<'a> Reader<'a>
 							self.pos += 1;
 							break;
 						}
-						Some(d @ (']' | ')')) => return Err(error_at(self.text, self.pos, format!("expected {close} (to close the {c} at {}), found {d}", self.place(pos)))),
+						Some(d @ (']' | ')' | '}')) => return Err(error_at(self.text, self.pos, format!("expected {close} (to close the {c} at {}), found {d}", self.place(pos)))),
 						Some(_) => items.push(self.read()?),
 					}
 				}
-				if c == '[' { Form::Vector(items) } else { Form::List(items) }
+				match c
+				{
+					'[' => Form::Vector(items),
+					'(' => Form::List(items),
+					_ if items.len() % 2 == 1 => return Err(error_at(self.text, pos, "a map needs a value for every key")),
+					_ => Form::Map(items),
+				}
 			}
-			']' | ')' => return Err(error_at(self.text, pos, format!("unexpected {c}"))),
+			']' | ')' | '}' => return Err(error_at(self.text, pos, format!("unexpected {c}"))),
 			'"' => Form::Str(self.string()?),
-			'{' | '}' | '#' | '\'' | '`' | '~' | '^' | '@' | '\\' => return Err(error_at(self.text, pos, format!("{c} is not supported in queries (no maps, sets, tags, quotes or characters)"))),
+			'#' if self.text[pos..].starts_with("#inst") && self.text[pos + 5..].starts_with(|c: char| c.is_whitespace() || c == '"') =>
+			{
+				self.pos += 5;
+				self.skip_space();
+				if self.peek() != Some('"')
+				{
+					return Err(error_at(self.text, self.pos, "#inst takes a string (an RFC 3339 timestamp)"));
+				}
+				let at = self.pos;
+				let s = self.string()?;
+				Form::Instant(parse_instant(&s).ok_or_else(|| error_at(self.text, at, format!("{s:?} is not an RFC 3339 timestamp (e.g. \"2024-02-29T13:45:00Z\")")))?)
+			}
+			'#' | '\'' | '`' | '~' | '^' | '@' | '\\' => return Err(error_at(self.text, pos, format!("{c} is not supported (no sets, tags other than #inst, quotes or characters)"))),
 			_ =>
 			{
 				let token = self.token();
@@ -223,11 +545,20 @@ impl<'a> Reader<'a>
 				}
 				else if token.strip_prefix(['+', '-']).unwrap_or(token).starts_with(|d: char| d.is_ascii_digit())
 				{
-					if !token.strip_prefix(['+', '-']).unwrap_or(token).chars().all(|d| d.is_ascii_digit())
+					let digits = token.strip_prefix(['+', '-']).unwrap_or(token);
+					if digits.chars().all(|d| d.is_ascii_digit())
 					{
-						return Err(error_at(self.text, pos, format!("invalid number {token} (only integers are supported)")));
+						Form::Int(token.parse().map_err(|_| error_at(self.text, pos, format!("the integer {token} is out of range")))?)
 					}
-					Form::Int(token.parse().map_err(|_| error_at(self.text, pos, format!("the integer {token} is out of range")))?)
+					// A float: digits with a fraction and/or an exponent (Rust's syntax for f64 is a superset of EDN's, so check the characters first)
+					else if digits.chars().all(|d| d.is_ascii_digit() || ".eE+-".contains(d)) && digits.contains(['.', 'e', 'E'])
+					{
+						Form::Float(token.parse().map_err(|_| error_at(self.text, pos, format!("invalid number {token}")))?)
+					}
+					else
+					{
+						return Err(error_at(self.text, pos, format!("invalid number {token}")));
+					}
 				}
 				else
 				{
@@ -305,6 +636,28 @@ impl<'a> Reader<'a>
 }
 
 /// The reader of a query's forms into the builder
+/// A binding of the `:in` section (None: `_`, a position that binds nothing)
+enum Binding
+{
+	Scalar(String),
+	Coll(Option<String>),
+	Tuple(Vec<Option<String>>),
+	Rel(Vec<Option<String>>),
+}
+
+impl Binding
+{
+	fn vars(&self) -> Box<dyn Iterator<Item = Option<&String>> + '_>
+	{
+		match self
+		{
+			Binding::Scalar(x) => Box::new(std::iter::once(Some(x))),
+			Binding::Coll(x) => Box::new(std::iter::once(x.as_ref())),
+			Binding::Tuple(xs) | Binding::Rel(xs) => Box::new(xs.iter().map(|x| x.as_ref())),
+		}
+	}
+}
+
 struct Parser<'a>
 {
 	text: &'a str,
@@ -324,7 +677,7 @@ impl<'a> Parser<'a>
 		error_at(self.text, node.pos, msg)
 	}
 
-	fn query(mut self, node: Node, rules: Option<&'a str>, inputs: &[Value]) -> Result<TextQuery, Error>
+	fn query(mut self, node: Node, rules: Option<&'a str>, inputs: &[Input]) -> Result<TextQuery, Error>
 	{
 		let Form::Vector(items) = node.form
 		else
@@ -368,15 +721,16 @@ impl<'a> Parser<'a>
 			return Err(self.err(&find_kw, ":find needs at least one variable or aggregate"));
 		}
 
-		// The inputs first, as constants of the clauses
-		let mut scalars = Vec::new();
+		// The inputs first: scalars and tuples become constants of the clauses, collections and relations base relations that the query joins
+		let mut bindings: Vec<Binding> = Vec::new();
 		let mut takes_rules = false;
 		if let Some((_, _, names)) = input
 		{
 			let mut sources = 0;
+			let mut seen: Vec<String> = Vec::new();
 			for n in &names
 			{
-				match &n.form
+				let binding = match &n.form
 				{
 					Form::Symbol(s) if s == "$" =>
 					{
@@ -385,14 +739,7 @@ impl<'a> Parser<'a>
 						{
 							return Err(self.err(n, "only one database input ($) is supported"));
 						}
-					}
-					Form::Symbol(s) if s.starts_with('?') =>
-					{
-						if scalars.contains(s)
-						{
-							return Err(self.err(n, format!("the input {s} is named twice")));
-						}
-						scalars.push(s.clone());
+						continue;
 					}
 					Form::Symbol(s) if s == "%" =>
 					{
@@ -405,15 +752,33 @@ impl<'a> Parser<'a>
 							return Err(self.err(n, "the query takes rules (%), but none were given (see Db::q_rules)"));
 						}
 						takes_rules = true;
+						continue;
 					}
-					Form::Vector(_) => return Err(self.err(n, "collection, tuple and relation inputs are not supported (only scalars ?x)")),
-					_ => return Err(self.err(n, "an input is $, % or a variable ?x")),
+					Form::Symbol(s) if s.starts_with('?') => Binding::Scalar(s.clone()),
+					Form::Vector(items) => match &items[..]
+					{
+						[x, Node { form: Form::Symbol(dots), .. }] if dots == "..." => Binding::Coll(self.binding_var(x)?),
+						[Node { form: Form::Vector(vars), .. }] if !vars.is_empty() => Binding::Rel(vars.iter().map(|v| self.binding_var(v)).collect::<Result<_, _>>()?),
+						[] => return Err(self.err(n, "an empty binding")),
+						_ if items.iter().any(|v| matches!(&v.form, Form::Symbol(s) if s == "...")) => return Err(self.err(n, "a collection binding is [?x ...]")),
+						vars => Binding::Tuple(vars.iter().map(|v| self.binding_var(v)).collect::<Result<_, _>>()?),
+					},
+					_ => return Err(self.err(n, "an input is $, %, a variable ?x, a collection [?x ...], a tuple [?a ?b] or a relation [[?a ?b]]")),
+				};
+				for v in binding.vars().flatten()
+				{
+					if seen.contains(v)
+					{
+						return Err(self.err(n, format!("the input {v} is named twice")));
+					}
+					seen.push(v.clone());
 				}
+				bindings.push(binding);
 			}
 		}
-		if scalars.len() != inputs.len()
+		if bindings.len() != inputs.len()
 		{
-			return Err(Error::InvalidQuery(match scalars.len()
+			return Err(Error::InvalidQuery(match bindings.len()
 			{
 				0 => format!("the query takes no inputs, got {}", inputs.len()),
 				n => format!("the query takes {n} inputs, got {}", inputs.len()),
@@ -426,7 +791,47 @@ impl<'a> Parser<'a>
 			Some(_) => return Err(Error::InvalidQuery("rules were given, but the query's :in has no %".into())),
 			None => {}
 		}
-		self.inputs = scalars.into_iter().zip(inputs.iter().cloned()).collect();
+		let mut calls = Vec::new();
+		for (k, (b, input)) in bindings.into_iter().zip(inputs).enumerate()
+		{
+			let mismatch = |want: &str| Error::InvalidQuery(format!("input {} is for {want}", k + 1));
+			let tuples = match (b, input)
+			{
+				(Binding::Scalar(x), Input::Scalar(v)) =>
+				{
+					self.inputs.insert(x, v.clone());
+					continue;
+				}
+				(Binding::Tuple(xs), Input::Tuple(vs)) if xs.len() == vs.len() =>
+				{
+					self.inputs.extend(xs.into_iter().zip(vs.iter().cloned()).filter_map(|(x, v)| Some((x?, v))));
+					continue;
+				}
+				(Binding::Coll(x), Input::Coll(vs)) => (vec![x], vs.iter().map(|v| vec![v.clone()]).collect()),
+				(Binding::Rel(xs), Input::Rel(ts)) => (xs, ts.clone()),
+				(Binding::Scalar(_), _) => return Err(mismatch("a scalar binding (Input::Scalar)")),
+				(Binding::Tuple(xs), _) => return Err(mismatch(&format!("a tuple binding of {} (Input::Tuple)", xs.len()))),
+				(Binding::Coll(_), _) => return Err(mismatch("a collection binding (Input::Coll)")),
+				(Binding::Rel(_), _) => return Err(mismatch("a relation binding (Input::Rel)")),
+			};
+			// A name that no query can write
+			let name = format!(":in {}", k + 1);
+			self.q.relation(&name, tuples.0.len(), tuples.1)?;
+			calls.push((name, tuples.0));
+		}
+		for (name, xs) in calls
+		{
+			let mut args = Vec::with_capacity(xs.len());
+			for x in xs
+			{
+				args.push(match x
+				{
+					Some(x) => self.q.var(&x),
+					None => self.blank(),
+				});
+			}
+			self.q.call(&name, &args)?;
+		}
 
 		for c in clauses.map(|s| s.2).unwrap_or_default()
 		{
@@ -434,18 +839,39 @@ impl<'a> Parser<'a>
 			self.q.add_clause(c)?;
 		}
 
+		// The shape: [?a ...] (a collection), [?a ?b] (a tuple), ?a . (a scalar), or the elements (a relation)
+		let dots = |n: &Node, d: &str| matches!(&n.form, Form::Symbol(s) if s == d);
+		let (shape, elems): (Shape, &[Node]) = match &find[..]
+		{
+			[Node { form: Form::Vector(items), .. }] if items.len() == 2 && dots(&items[1], "...") => (Shape::Coll, &items[..1]),
+			[Node { form: Form::Vector(items), .. }] if !items.is_empty() && !items.iter().any(|n| dots(n, "...")) => (Shape::Tuple, &items[..]),
+			[x, d] if dots(d, ".") && !matches!(x.form, Form::Vector(_)) => (Shape::Scalar, &find[..1]),
+			_ => (Shape::Rel, &find[..]),
+		};
 		let mut spec = Vec::new();
-		for f in &find
+		let mut pulls = Vec::new();
+		for f in elems
 		{
 			spec.push(match &f.form
 			{
-				Form::Symbol(s) if s == "." || s == "..." => return Err(self.err(f, "scalar and collection find specs are not supported")),
+				Form::Symbol(s) if s == "." || s == "..." => return Err(self.err(f, "a scalar find spec is :find ?x . and a collection one :find [?x ...]")),
 				Form::Symbol(s) if s.starts_with('?') => Find::Term(self.term(f)?),
+				Form::List(items) if matches!(items.first().map(|h| &h.form), Some(Form::Symbol(s)) if s == "pull") => match &items[1..]
+				{
+					[x, p] if matches!(&x.form, Form::Symbol(s) if s.starts_with('?')) =>
+					{
+						let pattern = pull_pattern(self.text, p)?;
+						self.q.db.check_pull(&pattern)?;
+						pulls.push((spec.len(), pattern));
+						Find::Term(self.term(x)?)
+					}
+					_ => return Err(self.err(f, "a pull is (pull ?e [pattern])")),
+				},
 				Form::List(items) =>
 				{
 					let agg = match items.first().map(|h| &h.form)
 					{
-						Some(Form::Symbol(name)) => Agg::from_name(name).ok_or_else(|| self.err(&items[0], format!("unknown aggregate {name} (the aggregates are count, count-distinct, sum, min, max and avg)")))?,
+						Some(Form::Symbol(name)) => Agg::from_name(name).ok_or_else(|| self.err(&items[0], format!("unknown aggregate {name} (the aggregates are count, count-distinct, sum, min, max and avg; or pull)")))?,
 						_ => return Err(self.err(f, "an aggregate is (name ?var)")),
 					};
 					match &items[1..]
@@ -454,7 +880,7 @@ impl<'a> Parser<'a>
 						_ => return Err(self.err(f, format!("({} ?var) takes one variable", agg.name()))),
 					}
 				}
-				_ => return Err(self.err(f, ":find takes variables and aggregates")),
+				_ => return Err(self.err(f, ":find takes variables, aggregates and pulls")),
 			});
 		}
 		let mut with = Vec::new();
@@ -466,7 +892,18 @@ impl<'a> Parser<'a>
 				_ => return Err(self.err(&w, ":with takes variables")),
 			}
 		}
-		Ok(TextQuery { query: self.q, find: spec, with })
+		Ok(TextQuery { query: self.q, find: spec, with, pulls, shape })
+	}
+
+	// A variable of an input binding, or `_`
+	fn binding_var(&self, node: &Node) -> Result<Option<String>, Error>
+	{
+		match &node.form
+		{
+			Form::Symbol(s) if s == "_" => Ok(None),
+			Form::Symbol(s) if s.starts_with('?') => Ok(Some(s.clone())),
+			_ => Err(self.err(node, "a binding takes variables ?x (or _)")),
+		}
 	}
 
 	// A variable (an input's value, for an input) or a constant
@@ -483,9 +920,11 @@ impl<'a> Parser<'a>
 			Form::Symbol(s) => Err(self.err(node, format!("expected a variable or a constant, found the symbol {s}"))),
 			Form::Str(s) => Ok(Term::Val(s.as_str().into())),
 			Form::Int(i) => Ok(Term::Val((*i).into())),
+			Form::Float(f) => Ok(Term::Val((*f).into())),
+			Form::Instant(i) => Ok(Term::Val(Value::Instant(*i))),
 			Form::Bool(b) => Ok(Term::Val((*b).into())),
 			Form::Keyword(k) => Err(self.err(node, format!("the keyword :{k} is not a value (keywords only name attributes)"))),
-			Form::Vector(_) | Form::List(_) => Err(self.err(node, "expected a variable or a constant")),
+			Form::Vector(_) | Form::List(_) | Form::Map(_) => Err(self.err(node, "expected a variable or a constant")),
 		}
 	}
 
@@ -820,7 +1259,7 @@ mod tests
 {
 	use super::*;
 	use crate::db::tests::{random_conn, replay};
-	use crate::db::{AttrId, Eid};
+	use crate::db::{AttrId, Cardinality, Conn, Eid, Tx, ValueType};
 	use std::collections::BTreeSet;
 
 	fn parse_error(db: &Db, text: &str) -> (usize, usize, String)
@@ -851,7 +1290,7 @@ mod tests
 			        [(>= ?v ?min)]
 			        (not [?e :tag "a"])
 			        (or-join [?e] [?e :ref ?f] (and [?e :best ?g] [?g :n 2]))]"#;
-		let mut tq = db.parse_query(text, &[Value::Int(1)]).unwrap();
+		let mut tq = db.parse_query(text, &[Value::Int(1).into()]).unwrap();
 		let mut q = db.query();
 		let (e, v, f, g) = (q.var("?e"), q.var("?v"), q.var("?f"), q.var("?g"));
 		q.pattern(e.clone(), "n", v.clone()).unwrap();
@@ -892,7 +1331,7 @@ mod tests
 		assert_eq!(db.q("[:find ?e :where [?e :tag _] [?e :ref _]]", &[]).unwrap(), want);
 		// A two-element pattern, commas, and the database input in any position
 		let target = facts.iter().find(|f| f.1 == id("ref") && has(f.0, "tag")).unwrap();
-		let got = db.q("[:find ?e, :in ?a $ :where [?e :tag], [?e :ref ?a]]", &[target.2.clone()]).unwrap();
+		let got = db.q("[:find ?e, :in ?a $ :where [?e :tag], [?e :ref ?a]]", &[target.2.clone().into()]).unwrap();
 		assert_eq!(got, refs(facts.iter().filter(|f| f.1 == id("ref") && f.2 == target.2 && has(f.0, "tag")).map(|f| f.0)));
 
 		// A lookup ref, in the entity position and as a value
@@ -998,11 +1437,11 @@ mod tests
 		assert_eq!(at("[:find ?e :where [?e :n 1] (or (and))]"), (1, 32));
 		assert_eq!(at("[:find (median ?e) :where [?e :n 1]]"), (1, 9));
 		assert_eq!(at("[:find (count ?e ?e) :where [?e :n 1]]"), (1, 8));
-		assert_eq!(at("[:find ?e . :where [?e :n 1]]"), (1, 11));
+		assert_eq!(at("[:find ?e . ?f :where [?e :n 1]]"), (1, 11));
 		assert_eq!(at("[:find 3 :where [?e :n 1]]"), (1, 8));
 		assert_eq!(at("[:find ?e :with 3 :where [?e :n 1]]"), (1, 17));
 		assert_eq!(at("[:find ?e :in $ $ :where [?e :n 1]]"), (1, 17));
-		assert_eq!(at("[:find ?e :in $ [?x ...] :where [?e :n ?x]]"), (1, 17));
+		assert_eq!(at("[:find ?e :in $ [?x ... ?y] :where [?e :n ?x]]"), (1, 17));
 		assert_eq!(at("[:find ?e :in % :where [?e :n 1]]"), (1, 15));
 		assert_eq!(at("[:find ?e :in ?x ?x :where [?e :n 1]]"), (1, 18));
 		assert_eq!(at("[:find ?e :where [?e :n ?v] [[:key ?v] :n 1]]"), (1, 36));
@@ -1011,14 +1450,14 @@ mod tests
 
 		// The inputs, and the errors of the builder, which have no position
 		assert_eq!(db.parse_query("[:find ?e :in $ ?x :where [?e :n ?x]]", &[]).err(), Some(Error::InvalidQuery("the query takes 1 inputs, got 0".into())));
-		assert!(matches!(db.parse_query("[:find ?e :where [?e :n ?x]]", &[Value::Int(1)]), Err(Error::InvalidQuery(_))));
+		assert!(matches!(db.parse_query("[:find ?e :where [?e :n ?x]]", &[Value::Int(1).into()]), Err(Error::InvalidQuery(_))));
 		assert_eq!(db.parse_query("[:find ?e :where [?e :nope 1]]", &[]).err(), Some(Error::UnknownAttr("nope".into())));
 		assert!(matches!(db.parse_query("[:find ?e :where [?e :n \"x\"]]", &[]), Err(Error::TypeMismatch { .. })));
 		assert!(matches!(db.parse_query("[:find ?e :where [?e :n 1] (or [?e :n 2] [?f :n 3])]", &[]), Err(Error::InvalidQuery(_))));
 		assert_eq!(db.q("[:find ?x :where [?e :n 1]]", &[]).err(), Some(Error::Unbound("?x".into())));
 		assert_eq!(db.q("[:find ?e :where (not [?e :n 1])]", &[]).err(), Some(Error::Unbound("?e".into())));
 		// An input in a join list is a constant, which drops out of the list
-		let tq = db.parse_query("[:find ?e :in ?x :where [?e :n ?x] (not-join [?x] [?e :tag \"a\"])]", &[Value::Int(1)]).unwrap();
+		let tq = db.parse_query("[:find ?e :in ?x :where [?e :n ?x] (not-join [?x] [?e :tag \"a\"])]", &[Value::Int(1).into()]).unwrap();
 		assert!(matches!(&tq.query.clauses()[1], Clause::Not { join, .. } if join.is_empty()));
 	}
 
@@ -1048,7 +1487,7 @@ mod tests
 		let db = conn.db();
 		// ?x is an input of the query and a variable of the rules, which are their own
 		let text = "[:find ?a ?b :in $ % ?x :where (reach ?a ?b) [?b :n ?x] (not (even ?a ?b))]";
-		let mut tq = db.parse_query_rules(text, RULES, &[Value::Int(2)]).unwrap();
+		let mut tq = db.parse_query_rules(text, RULES, &[Value::Int(2).into()]).unwrap();
 		let mut q = db.query();
 		let (x, y, z) = (q.var("?x"), q.var("?y"), q.var("?z"));
 		let edge = |q: &Query, a: &Term, b: &Term| q.pattern_clause(a.clone(), "ref", b.clone()).unwrap();
@@ -1075,7 +1514,7 @@ mod tests
 		assert_eq!(tq.query.rule_stats(), q.rule_stats());
 		assert_eq!(q.rule_stats().strata, 2);
 		// A call with a lookup ref, and an aggregate over a rule
-		let rows = db.q_rules("[:find ?x ?b :in $ % :where (reach ?x ?b)]", RULES, &[]).unwrap();
+		let rows = db.q_rules("[:find ?x ?b :in $ % :where (reach ?x ?b)]", RULES, &[]).unwrap().values().unwrap();
 		let holders: Vec<(Eid, Value)> = db.attr_datoms(db.attr_id("key").unwrap()).map(|(e, v)| (e, v.clone())).collect();
 		let (holder, Value::Int(k)) = holders.iter().find(|(e, _)| rows.iter().any(|r| r[0] == Value::Ref(*e))).cloned().unwrap() else { unreachable!() };
 		let want: Vec<Vec<Value>> = rows.iter().filter(|r| r[0] == Value::Ref(holder)).map(|r| vec![r[1].clone()]).collect();
@@ -1140,5 +1579,244 @@ mod tests
 		assert!(matches!(run("[[(r ?x) [?x :n _] (not (r ?x))]]"), Some(Error::InvalidQuery(m)) if m.contains("stratification")));
 		// A rule's _ is a variable of its own, like the query's
 		assert!(run("[[(r ?x) [?x :n _] [_ :ref ?x]]]").is_none());
+	}
+
+	// RFC 3339 timestamps against a naive count of days, and the forms that aren't timestamps
+	#[test]
+	fn instants()
+	{
+		fn naive(y: i64, m: i64, d: i64) -> i64
+		{
+			let leap = |y: i64| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+			let mut days = 0;
+			for yy in 1970.min(y)..1970.max(y)
+			{
+				days += if leap(yy) { 366 } else { 365 };
+			}
+			if y < 1970
+			{
+				days = -days;
+			}
+			let months = [31, if leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+			days + months[..m as usize - 1].iter().sum::<i64>() + d - 1
+		}
+		for (y, m, d) in [(1970, 1, 1), (1969, 12, 31), (2000, 2, 29), (1900, 3, 1), (2024, 12, 31), (1600, 2, 29), (2100, 2, 28), (1, 1, 1)]
+		{
+			let s = format!("{y:04}-{m:02}-{d:02}");
+			assert_eq!(parse_instant(&s), Some(naive(y, m, d) * 86_400_000), "{s}");
+			assert_eq!(parse_instant(&format!("{s}T13:45:07.25Z")), Some(naive(y, m, d) * 86_400_000 + ((13 * 60 + 45) * 60 + 7) * 1000 + 250), "{s}");
+		}
+		assert_eq!(parse_instant("1970-01-01T02:00:00+02:00"), Some(0));
+		assert_eq!(parse_instant("1969-12-31T19:30:00-04:30"), Some(0));
+		assert_eq!(parse_instant("1970-01-01T00:00:00.123456789Z"), Some(123));
+		for bad in ["", "2024-02-30", "2023-02-29", "2024-13-01", "2024-1-01", "24-01-01", "2024-01-01T25:00:00Z", "2024-01-01T10:00:00", "2024-01-01T10:00Z", "2024-01-01T10:00:00+2:00", "2024-01-01T10:00:00.Z", "x"]
+		{
+			assert_eq!(parse_instant(bad), None, "{bad}");
+		}
+	}
+
+	// Collection, tuple and relation inputs, against scalar runs and the log
+	#[test]
+	fn collection_tuple_and_relation_inputs()
+	{
+		let (conn, reports) = random_conn(19, 40);
+		let db = conn.db();
+		let current = replay(reports.iter().flat_map(|r| &r.tx_data));
+		let n = db.attr_id("n").unwrap();
+		let ks: Vec<Value> = (0..6).map(Value::Int).collect();
+		// A collection is the union of the scalar runs
+		let coll = db.q("[:find ?e ?k :in $ [?k ...] :where [?e :n ?k]]", &[Input::Coll(ks.clone())]).unwrap();
+		let mut union = BTreeSet::new();
+		for k in &ks
+		{
+			for row in db.q("[:find ?e ?k :in $ ?k :where [?e :n ?k]]", &[k.clone().into()]).unwrap().values().unwrap()
+			{
+				union.insert(row);
+			}
+		}
+		assert_eq!(coll, union.into_iter().collect::<Vec<_>>());
+		let want: Vec<Vec<Value>> = current.keys().filter(|(_, a, v)| *a == n && ks.contains(v)).map(|(e, _, v)| vec![Value::Ref(*e), v.clone()]).collect::<BTreeSet<_>>().into_iter().collect();
+		assert!(!want.is_empty());
+		assert_eq!(coll, want);
+		// Aggregates run over the whole input, not per value
+		assert_eq!(db.q("[:find (count ?e) :in $ [?k ...] :where [?e :n ?k]]", &[Input::Coll(ks.clone())]).unwrap(), vec![vec![Value::Int(want.len() as i64)]]);
+		// A relation: the tuples of (entity, value) given, filtered by the data; a blank ignores a position
+		let m = want.len().min(3);
+		let rel: Vec<Vec<Value>> = want.iter().take(m).cloned().chain([vec![Value::Ref(9999), Value::Int(0)]]).collect();
+		assert_eq!(db.q("[:find ?e ?k :in [[?e ?k]] $ :where [?e :n ?k]]", &[Input::Rel(rel.clone())]).unwrap(), want[..m].to_vec());
+		assert_eq!(db.q("[:find ?e :in $ [[?e _]] :where [?e :n _]]", &[Input::Rel(rel.clone())]).unwrap(), want[..m].iter().map(|r| vec![r[0].clone()]).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>());
+		// A tuple binds constants; with a blank, one of them
+		let (e0, k0) = (want[0][0].clone(), want[0][1].clone());
+		assert_eq!(db.q("[:find ?e :in $ [?e ?k] :where [?e :n ?k]]", &[Input::Tuple(vec![e0.clone(), k0.clone()])]).unwrap(), vec![vec![e0.clone()]]);
+		assert_eq!(db.q("[:find ?k :in $ [?e _] :where [?e :n ?k]]", &[Input::Tuple(vec![e0.clone(), Value::Int(-1)])]).unwrap(), vec![vec![k0]]);
+		// Several inputs, and an empty collection
+		assert_eq!(db.q("[:find ?e :in $ [?k ...] ?e :where [?e :n ?k]]", &[Input::Coll(ks.clone()), e0.clone().into()]).unwrap(), vec![vec![e0]]);
+		assert!(db.q("[:find ?e :in $ [?k ...] :where [?e :n ?k]]", &[Input::Coll(vec![])]).unwrap().is_empty());
+		// Mismatches and malformed bindings
+		assert!(matches!(db.q("[:find ?e :in $ [?k ...] :where [?e :n ?k]]", &[Value::Int(1).into()]), Err(Error::InvalidQuery(_))));
+		assert!(matches!(db.q("[:find ?e :in $ [?e ?k] :where [?e :n ?k]]", &[Input::Tuple(vec![Value::Int(1)])]), Err(Error::InvalidQuery(_))));
+		assert!(matches!(db.q("[:find ?e :in $ [[?e ?k]] :where [?e :n ?k]]", &[Input::Rel(vec![vec![Value::Int(1)]])]), Err(Error::InvalidQuery(_))));
+		for bad in ["[:find ?e :in $ [] :where [?e :n _]]", "[:find ?e :in $ [[]] :where [?e :n _]]", "[:find ?e :in $ [?e 1] :where [?e :n _]]", "[:find ?e :in $ [?e ?e] :where [?e :n _]]", "[:find ?e :in $ [... ?e] :where [?e :n _]]"]
+		{
+			assert!(matches!(db.q(bad, &[Input::Tuple(vec![Value::Int(1), Value::Int(1)])]), Err(Error::Parse { .. })), "{bad}");
+		}
+	}
+
+	// Pull patterns in EDN: the same as the builder's, and the options and recursion they express
+	#[test]
+	fn pull_patterns_in_text()
+	{
+		use crate::db::Entity;
+		use crate::query::PullValue;
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		tx.define("person/name", ValueType::Str, Cardinality::One)
+			.define("person/aka", ValueType::Str, Cardinality::Many)
+			.define("person/age", ValueType::Int, Cardinality::One)
+			.define("person/friend", ValueType::Ref, Cardinality::Many)
+			.define("person/boss", ValueType::Ref, Cardinality::One);
+		// A chain of bosses a -> b -> c -> d, and a friendship cycle a <-> b
+		let ps: Vec<Entity> = (0..4).map(|_| tx.temp()).collect();
+		for (i, p) in ps.iter().enumerate()
+		{
+			tx.add(*p, "person/name", ["a", "b", "c", "d"][i]);
+			if i + 1 < ps.len()
+			{
+				tx.add(*p, "person/boss", ps[i + 1]);
+			}
+		}
+		tx.add(ps[0], "person/aka", "x").add(ps[0], "person/aka", "y").add(ps[0], "person/aka", "z").add(ps[0], "person/age", 30);
+		tx.add(ps[0], "person/friend", ps[1]).add(ps[1], "person/friend", ps[0]);
+		let r = conn.transact(&tx).unwrap();
+		let db = conn.db();
+		let e: Vec<Eid> = ps.iter().map(|p| r.eid(*p)).collect();
+		let name = || Pull::attr("person/name");
+		// Text and builder agree
+		let cases: Vec<(&str, Vec<Pull>)> = vec![
+			("[:person/name *]", vec![name(), Pull::Wildcard]),
+			("[:person/_friend :person/_boss]", vec![Pull::reverse("person/friend"), Pull::reverse("person/boss")]),
+			("[[:person/aka :limit 2 :as \"aliases\"] (:person/age :default 0)]", vec![Pull::attr("person/aka").limit(2).key("aliases"), Pull::attr("person/age").default(0)]),
+			("[{:person/friend [:person/name]}]", vec![Pull::attr("person/friend").nest(vec![name()])]),
+			("[:person/name {[:person/boss :as :chain] ...}]", vec![name(), Pull::attr("person/boss").key("chain").recurse(None)]),
+			("[:person/name {:person/boss 2 :person/friend [:person/name]}]", vec![name(), Pull::attr("person/boss").recurse(Some(2)), Pull::attr("person/friend").nest(vec![name()])]),
+		];
+		for (text, pattern) in &cases
+		{
+			for &x in &e
+			{
+				assert_eq!(db.pull_str(text, x).unwrap(), db.pull(pattern, x).unwrap(), "{text}");
+			}
+		}
+		// What the options do
+		let p = db.pull_str("[[:person/aka :limit 2 :as \"aliases\"] [:person/age :default 0] [:person/name :default \"?\"]]", e[1]).unwrap();
+		assert_eq!(p.get("person/age"), Some(&PullValue::Val(Value::Int(0))));
+		assert_eq!(p.get("aliases"), None);
+		let p = db.pull_str("[[:person/aka :limit 2 :as \"aliases\"] [:person/age :default 0]]", e[0]).unwrap();
+		assert_eq!(p.get("aliases"), Some(&PullValue::Many(vec![PullValue::Val("x".into()), PullValue::Val("y".into())])));
+		assert_eq!(p.get("person/age"), Some(&PullValue::Val(Value::Int(30))));
+		// Recursion: unbounded down the chain, two levels by a depth, and a cycle ends with a Ref
+		fn depth(p: &Pulled, key: &str) -> usize
+		{
+			match p.get(key)
+			{
+				Some(PullValue::Entity(q)) => 1 + depth(q, key),
+				_ => 0,
+			}
+		}
+		assert_eq!(depth(&db.pull_str("[:person/name {:person/boss ...}]", e[0]).unwrap(), "person/boss"), 3);
+		assert_eq!(depth(&db.pull_str("[:person/name {:person/boss 2}]", e[0]).unwrap(), "person/boss"), 2);
+		assert!(matches!(db.pull_str("[:person/name {:person/boss 2}]", e[0]).unwrap().get("person/boss"), Some(PullValue::Entity(q)) if matches!(q.get("person/boss"), Some(PullValue::Entity(r)) if r.get("person/boss") == Some(&PullValue::Val(Value::Ref(e[3]))))));
+		let p = db.pull_str("[:person/name {:person/friend ...}]", e[0]).unwrap();
+		let PullValue::Many(fs) = p.get("person/friend").unwrap() else { panic!() };
+		let PullValue::Entity(b) = &fs[0] else { panic!() };
+		assert_eq!(b.get("person/friend"), Some(&PullValue::Many(vec![PullValue::Val(Value::Ref(e[0]))])));
+		// Errors: syntax with positions, then the pattern's own (an unknown attribute, a default of the wrong type, recursion through a non-Ref)
+		for bad in ["[:person/name", "{:person/name}", "[1]", "[[:person/aka :limit]]", "[[:person/aka :color 2]]", "[[:person/aka :limit -1]]", "[{:person/boss :x}]", "[[]]", ":person/name"]
+		{
+			assert!(matches!(db.pull_str(bad, e[0]), Err(Error::Parse { .. })), "{bad}");
+		}
+		assert!(matches!(db.pull_str("[:nope]", e[0]), Err(Error::UnknownAttr(_))));
+		assert!(matches!(db.pull_str("[[:person/age :default \"old\"]]", e[0]), Err(Error::TypeMismatch { .. })));
+		assert!(matches!(db.pull_str("[{:person/name ...}]", e[0]), Err(Error::TypeMismatch { .. })));
+		assert!(matches!(db.pull_str("[[:person/_friend :default 1]]", e[0]), Err(Error::InvalidQuery(_))));
+		// A map in a query is a syntax error there
+		assert!(matches!(db.q("[:find ?e :where {:a 1}]", &[]), Err(Error::Parse { .. })));
+	}
+
+	// Find specs: relation, collection, tuple and scalar shapes, and pulls in any position
+	#[test]
+	fn find_shapes_and_pulls()
+	{
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		tx.define("person/name", ValueType::Str, Cardinality::One).define("person/age", ValueType::Int, Cardinality::One).define("person/boss", ValueType::Ref, Cardinality::One);
+		let ps: Vec<crate::db::Entity> = (0..3).map(|_| tx.temp()).collect();
+		for (i, p) in ps.iter().enumerate()
+		{
+			tx.add(*p, "person/name", ["a", "b", "c"][i]).add(*p, "person/age", 30 + i as i64);
+		}
+		tx.add(ps[0], "person/boss", ps[1]).add(ps[1], "person/boss", ps[2]);
+		let r = conn.transact(&tx).unwrap();
+		let db = conn.db();
+		let e: Vec<Eid> = ps.iter().map(|p| r.eid(*p)).collect();
+		let q = |text: &str| db.q(text, &[]).unwrap();
+		let s = |x: &str| Cell::Val(Value::from(x));
+		// A pull next to a plain column: each pulled cell is Db::pull_str of the entity
+		let pattern = "[:person/name {:person/boss [:person/name]}]";
+		let got = q(&format!("[:find ?n (pull ?e {pattern}) :where [?e :person/name ?n]]"));
+		let want: Vec<Vec<Cell>> = e.iter().zip(["a", "b", "c"]).map(|(x, n)| vec![s(n), Cell::Pull(db.pull_str(pattern, *x).unwrap())]).collect();
+		assert_eq!(got, Found::Rel(want));
+		assert!(got.values().is_none());
+		// The shapes
+		assert_eq!(q("[:find [?n ...] :where [_ :person/name ?n]]"), Found::Coll(vec![s("a"), s("b"), s("c")]));
+		assert_eq!(q("[:find [?n ?a] :where [?e :person/name ?n] [?e :person/age ?a]]"), Found::Tuple(Some(vec![s("a"), Cell::Val(Value::Int(30))])));
+		assert_eq!(q("[:find ?n . :where [?e :person/age 31] [?e :person/name ?n]]"), Found::Scalar(Some(s("b"))));
+		assert_eq!(q("[:find ?n . :where [?e :person/age 99] [?e :person/name ?n]]"), Found::Scalar(None));
+		assert_eq!(q("[:find [?n ?a] :where [?e :person/name ?n] [?e :person/age ?a] [(> ?a 99)]]"), Found::Tuple(None));
+		assert_eq!(q("[:find (count ?e) . :where [?e :person/name _]]"), Found::Scalar(Some(Cell::Val(Value::Int(3)))));
+		assert_eq!(q("[:find [(pull ?e [:person/name]) ...] :where [?e :person/age ?a] [(< ?a 32)]]").len(), 2);
+		// A relation of values compares with its values
+		assert_eq!(q("[:find ?n :where [_ :person/name ?n]]"), vec![vec![Value::from("a")], vec![Value::from("b")], vec![Value::from("c")]]);
+		// Errors: the pattern's at parse time (even when nothing matches), a pull of a non-entity, malformed specs
+		assert!(matches!(db.q("[:find (pull ?e [:nope]) :where [?e :person/age 99]]", &[]), Err(Error::UnknownAttr(_))));
+		assert!(matches!(db.q("[:find (pull ?n [:person/name]) :where [_ :person/name ?n]]", &[]), Err(Error::InvalidQuery(_))));
+		for bad in ["[:find (pull ?e) :where [?e :person/name _]]", "[:find (pull [:person/name] ?e) :where [?e :person/name _]]", "[:find [?e ... ?f] :where [?e :person/name ?f]]", "[:find [?e] . :where [?e :person/name _]]"]
+		{
+			assert!(matches!(db.q(bad, &[]), Err(Error::Parse { .. })), "{bad}");
+		}
+	}
+
+	// Floats and instants in text queries: literals, numeric comparison of Ints and Floats, and aggregates
+	#[test]
+	fn floats_and_instants_in_text()
+	{
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		tx.define("item/price", ValueType::Float, Cardinality::One).define("item/n", ValueType::Int, Cardinality::One).define("item/at", ValueType::Instant, Cardinality::One);
+		let jan = parse_instant("2024-01-15T00:00:00Z").unwrap();
+		let mar = parse_instant("2024-03-01T12:00:00Z").unwrap();
+		for (i, (price, at)) in [(1.5, jan), (2.25, jan), (-0.5, mar), (10.0, mar)].into_iter().enumerate()
+		{
+			let e = tx.temp();
+			tx.add(e, "item/price", price).add(e, "item/n", i as i64).add(e, "item/at", Value::Instant(at));
+		}
+		conn.transact(&tx).unwrap();
+		let db = conn.db();
+		let q = |text: &str| db.q(text, &[]).unwrap();
+		assert_eq!(q("[:find ?p :where [?e :item/price 2.25] [?e :item/price ?p]]"), vec![vec![Value::Float(2.25)]]);
+		// An Int compares with a Float numerically (and the Float attribute refuses an Int constant in a pattern)
+		assert_eq!(q("[:find ?p :where [?e :item/price ?p] [(> ?p 2)]]"), vec![vec![Value::Float(2.25)], vec![Value::Float(10.0)]]);
+		assert_eq!(q("[:find ?n :where [?e :item/price ?p] [?e :item/n ?n] [(= ?p ?n)]]"), Vec::<Vec<Value>>::new());
+		assert!(matches!(db.q("[:find ?e :where [?e :item/price 2]]", &[]), Err(Error::TypeMismatch { .. })));
+		assert_eq!(q("[:find (sum ?p) (avg ?p) (min ?p) (max ?p) :where [?e :item/price ?p]]"), vec![vec![Value::Float(13.25), Value::Float(3.3125), Value::Float(-0.5), Value::Float(10.0)]]);
+		assert_eq!(q("[:find (avg ?n) :where [_ :item/n ?n]]"), vec![vec![Value::Float(1.5)]]);
+		// Instants: literals, comparisons, and grouping
+		assert_eq!(q("[:find (count ?e) :where [?e :item/at #inst \"2024-01-15\"]]"), vec![vec![Value::Int(2)]]);
+		assert_eq!(q("[:find ?n :where [?e :item/at ?t] [(>= ?t #inst \"2024-02-01T00:00:00+01:00\")] [?e :item/n ?n]]"), vec![vec![Value::Int(2)], vec![Value::Int(3)]]);
+		assert_eq!(q("[:find ?t (count ?e) :where [?e :item/at ?t]]"), vec![vec![Value::Instant(jan), Value::Int(2)], vec![Value::Instant(mar), Value::Int(2)]]);
+		for bad in ["[:find ?e :where [?e :item/at #inst 5]]", "[:find ?e :where [?e :item/at #inst \"tomorrow\"]]", "[:find ?e :where [?e :item/price 1.5.5]]", "[:find ?e :where [?e :item/price 1e]]", "[:find ?e :where #{}]"]
+		{
+			assert!(matches!(db.q(bad, &[]), Err(Error::Parse { .. })), "{bad}");
+		}
 	}
 }
