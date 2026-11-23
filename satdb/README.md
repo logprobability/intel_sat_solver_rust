@@ -31,7 +31,7 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     schema, and the durable log records alterations like definitions.
 * **History and time** (`src/db.rs`). The current indexes map each datom to the transaction that asserted it, and five append-only
   history indexes (EAVT/AEVT/AVET/VAET order with keys ending in `(tx, added)`, and the log in transaction order) keep every assertion and
-  retraction, all persistent; a schema history keeps every definition and alteration. Three views, each a cheap clone with a marker, filter the reads:
+  retraction, all persistent (compressed segments, see History indexes); a schema history keeps every definition and alteration. Three views, each a cheap clone with a marker, filter the reads:
   * `Db::history()`: every change, with its `added` flag (and history statistics for the planner);
   * `Db::since(t)`: only the datoms of transactions after basis `t`, for every read, pull included;
   * `Db::as_of(t)`: the value as of basis `t`, with the schema of the time: every read derives that time's datoms from the history indexes
@@ -64,18 +64,19 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     be derived (counters, schema history, transactions, and the history in log order). It is written to a temporary file, synced and renamed.
     On open, an intact checkpoint (both checksums) whose covered log prefix ends at a record boundary, has the CRC-32 the checkpoint records
     (so it is *this* log's), and whose basis is the number of records it covers is used: `Db::from_snapshot` sorts the history into each index's
-    order and builds every map in linear time (`PMap::from_sorted`), deriving the current indexes and the statistics, and only the later
+    order and builds every index in linear time (`PMap::from_sorted`, `HIndex::from_sorted`), deriving the current indexes and the statistics, and only the later
     records are replayed. Any other checkpoint is silently ignored and the log replayed in full: the log holds the data, the checkpoint is a cache.
     The rebuild is a second implementation of the indexes, which the tests compare with `transact`'s at every basis of random workloads.
 
     Timings (release, transactions of 20 assertions, `cargo test --release open_timings -- --ignored --nocapture`; opening by replay costs
-    the path-copying inserts into every index, about 25 µs per datom at 50k transactions, which the bulk build avoids):
+    mostly the path-copying inserts into the four current indexes, which the bulk build avoids). The machine was busy, so the times are
+    the minimum of 3 runs, interleaved with the same test on the history indexes' previous representation (treaps), in brackets:
 
-    | transactions | log      | open by replay | checkpoint written | open from the checkpoint |
-    |--------------|----------|----------------|--------------------|--------------------------|
-    | 1,000        | 0.5 MB   | 139 ms         | 16 ms (0.7 MB)     | 16 ms                    |
-    | 10,000       | 5.0 MB   | 3.96 s         | 62 ms (6.9 MB)     | 252 ms                   |
-    | 50,000       | 25.1 MB  | 25.8 s         | 441 ms (34.5 MB)   | 1.20 s                   |
+    | transactions | log      | open by replay  | checkpoint written       | open from the checkpoint |
+    |--------------|----------|-----------------|--------------------------|--------------------------|
+    | 1,000        | 0.5 MB   | 185 ms (230 ms) | 12 ms (13 ms; 0.7 MB)    | 21 ms (20 ms)            |
+    | 10,000       | 5.0 MB   | 3.31 s (3.63 s) | 49 ms (80 ms; 6.9 MB)    | 267 ms (237 ms)          |
+    | 50,000       | 25.1 MB  | 26.3 s (37.9 s) | 284 ms (392 ms; 34.5 MB) | 1.50 s (1.35 s)          |
 * **Pull** (`src/query.rs`). `Db::pull(pattern, eid)` reads an entity as a tree (`Pulled`): attribute lists, the wildcard (which pulls
   components recursively, stopping at cycles), nested patterns for Ref attributes, and reverse refs through VAET (`Pull::reverse`, key `ns/_name`).
   Cardinality-one attributes and reverse components give one value, the others a list; absent attributes are left out. The pattern is
@@ -84,7 +85,32 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   path, where it stays a Ref (Datomic's `{:attr ...}` and `{:attr 3}`). `Db::pull_str` reads a pattern in Datomic's EDN syntax
   (`[:person/name * :person/_friend [:person/aka :limit 2 :as "aliases"] {:person/friend [:person/name]} {:person/boss ...}]`).
 * **Persistent indexes** (`src/pmap.rs`). A treap with `Arc`-shared nodes and hash-of-key priorities: an update copies one root-to-leaf path,
-  and the tree's shape depends on its key set only.
+  and the tree's shape depends on its key set only. It holds the current indexes, the schema and the statistics.
+* **History indexes** (`src/hist.rs`, `src/succinct.rs`). The history only grows, so its five indexes are static compressed structures rather
+  than trees: each is a few immutable sorted *segments* and a small sorted tail of the latest entries (a full tail becomes a segment, merged
+  with the segments that aren't at least 4 times its size, on their integers), all behind `Arc`s, so a clone is two reference counts.
+  * In a segment a value is its rank in the segment's sorted dictionary, each column is as wide as its largest integer, and the leading
+    columns of an entry (as many as fit in 64 bits) are one integer. Those integers are non-decreasing and stored as an Elias-Fano
+    sequence, so the entries of a key prefix are found by two successor searches (a few cache lines, whatever the segment's length);
+    the other columns are packed row by row.
+  * `succinct` has the building blocks, written from the published designs (the ones sdsl-lite implements as `int_vector`, `bit_vector_il`
+    and `sd_vector`): bit-packed fields, a bit vector with select whose counters are interleaved with its bits, and Elias-Fano.
+  * An entry takes 8 to 9 bytes (a treap node was about 90). A read merges the ranges of the segments, so it is fastest on a value
+    opened from a checkpoint (one segment); opening from a checkpoint itself is about 10% slower than with treaps, and a long scan of
+    one segment is no faster (it decodes about as fast as the bulk-built treap was walked).
+
+    Timings of the reads the history serves, in ns (release, `cargo test --release history_read_timings -- --ignored --nocapture`:
+    20,000 transactions, about 460,000 history entries, random entities; the minimum of 5 runs interleaved with the treap version, in brackets):
+
+    | read                                 | after a replay | opened from a checkpoint |
+    |--------------------------------------|----------------|--------------------------|
+    | as-of `entity_datoms(e)`             | 306 (734)      | 120 (296)                |
+    | as-of `values(e, a)`                 | 237 (430)      | 90 (215)                 |
+    | as-of `entities(a, v)`, ~50 entities | 4534 (12417)   | 2418 (4825)              |
+    | as-of `referrers(e)`                 | 221 (264)      | 99 (125)                 |
+    | history `datoms(e, a)`               | 271 (509)      | 97 (216)                 |
+    | as-of `attr_datoms(a)`, per datom    | 32 (53)        | 16 (15)                  |
+    | `tx_range`, per datom                | 45 (80)        | 29 (28)                  |
 * **Queries** (`src/query.rs`). Datalog-style queries over any view: patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`),
   comparison predicates, `not`/`not-join` and `or`/`or-join` (nested to any depth) and rule calls (see Rules), run as nested loops, each pattern using the index selected by its bound positions.
   * `not` keeps the rows for which its body has no solution; its join variables (all of its body's, or the `not-join` list) must be bound when it runs,

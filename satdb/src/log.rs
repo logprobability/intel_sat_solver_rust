@@ -1195,4 +1195,44 @@ mod tests
 			println!("{txs} transactions, {} bytes: open by replay {replayed:?}; checkpoint ({ckpt} bytes) written in {written:?}; open from it {from_ckpt:?}", file_len(&path));
 		}
 	}
+
+	// The time of the reads served by the history indexes, on a replayed value and on one opened from a checkpoint
+	// (release: cargo test --release history_read_timings -- --ignored --nocapture)
+	#[test]
+	#[ignore]
+	fn history_read_timings()
+	{
+		let scratch = Scratch::new("history_read_timings");
+		let path = scratch.path("reads.log");
+		big_log(&path, 20_000);
+		let mut conn = Conn::open(&path).unwrap();
+		let replayed = conn.db();
+		conn.checkpoint().unwrap();
+		drop(conn);
+		let reopened = Conn::open(&path).unwrap().db();
+		for (what, db) in [("replayed", replayed), ("from the checkpoint", reopened)]
+		{
+			let (n, tag, rf) = (db.attr_id("n").unwrap(), db.attr_id("tag").unwrap(), db.attr_id("ref").unwrap());
+			let (entries, bytes) = db.history_size();
+			println!("{what}: the history indexes hold {entries} entries in {bytes} bytes: {:.1} bytes per entry", bytes as f64 / entries as f64);
+			let past = db.as_of(db.basis_t() * 3 / 4).unwrap();
+			let hist = db.history();
+			let mut rng = Rng::new(11);
+			let eids: Vec<Eid> = (0..100_000).map(|_| 1 + rng.next() % 300_000).collect();
+			let time = |name: &str, per: usize, f: &mut dyn FnMut() -> usize| {
+				let t = std::time::Instant::now();
+				let sum = f();
+				println!("{what}: {name}: {:.0} ns each (checksum {sum})", t.elapsed().as_nanos() as f64 / per as f64);
+			};
+			time("as-of entity_datoms", eids.len(), &mut || eids.iter().map(|e| past.entity_datoms(*e).count()).sum());
+			time("as-of values(e, a)", eids.len(), &mut || eids.iter().map(|e| past.values(*e, tag).count()).sum());
+			time("as-of entities(a, v)", 1000, &mut || (0..1000).map(|i| past.entities(n, &Value::Int(i)).count()).sum());
+			time("as-of referrers", eids.len(), &mut || eids.iter().map(|e| past.referrers(*e).count()).sum());
+			time("history datoms(e, a)", eids.len(), &mut || eids.iter().map(|e| hist.datoms(Some(*e), n, None).len()).sum());
+			let scanned = past.attr_datoms(rf).count();
+			time("as-of attr_datoms, per datom", scanned.max(1), &mut || past.attr_datoms(rf).count());
+			let logged: usize = db.tx_range(1, db.basis_t() + 1).iter().map(|t| t.data.len()).sum();
+			time("tx_range, per datom", logged, &mut || db.tx_range(1, db.basis_t() + 1).iter().map(|t| t.data.len()).sum());
+		}
+	}
 }
