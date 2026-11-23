@@ -723,22 +723,24 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		while bcIt != self.m_BC.end()
 		{
 			let bcHashInd = TBCHashId::from_val(bcIt as u16);
-			let ba = unsafe { &mut *self.m_BC.at(bcIt as u16) };
+			// A raw pointer, dereferenced at each use: ClsEnd and Notify access the same bit-array through the solver in-between
+			// SAFETY: the bit-array is boxed, so the pointer stays valid until it is erased below, after its last use
+			let ba: *mut CBitArray = self.m_BC.at(bcIt as u16);
 
 			let mut fromInd: u64 = 0;
 			let mut toInd: u64 = 0;
 
-			while fromInd < ba.bit_get_next_bit()
+			while fromInd < unsafe { (*ba).bit_get_next_bit() }
 			{
 				// Update fromInd to the next remaining clause (or to beyond the buffer capacity)
 				let mut bcInd = TBCInd::<Ind>::new(bcHashInd, fromInd);
-				while fromInd < ba.bit_get_next_bit() && ((bcHashInd.m_BitsForClsSize() != 0 && ba.bit_get(fromInd, bcHashInd.m_BitsForClsSize()) == 0) || ba.bit_get(bcInd.BitFirstLit(), bcHashInd.m_BitsForLit()) == 0)
+				while fromInd < unsafe { (*ba).bit_get_next_bit() } && ((bcHashInd.m_BitsForClsSize() != 0 && unsafe { &*ba }.bit_get(fromInd, bcHashInd.m_BitsForClsSize()) == 0) || unsafe { &*ba }.bit_get(bcInd.BitFirstLit(), bcHashInd.m_BitsForLit()) == 0)
 				{
 					fromInd = self.ClsEnd(bcInd.ind()).as_u64();
 					bcInd = TBCInd::<Ind>::new(bcHashInd, fromInd);
 				}
 
-				if fromInd >= ba.bit_get_next_bit()
+				if fromInd >= unsafe { (*ba).bit_get_next_bit() }
 				{
 					// Nothing useful to move --> we're done!
 					break;
@@ -758,14 +760,14 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 						Notify(self, bcInd.ind().as_u64(), bcToInd.ind().as_u64());
 					}
 
-					ba.copy_block(fromInd, toInd, bits2Copy);
+					unsafe { &mut *ba }.copy_block(fromInd, toInd, bits2Copy);
 				}
 
 				toInd += bits2Copy;
 				fromInd += bits2Copy;
 			}
 
-			ba.bit_resize_and_compress(toInd);
+			unsafe { &mut *ba }.bit_resize_and_compress(toInd);
 
 			let bcItNext = self.m_BC.next(bcIt);
 			if toInd == 0
@@ -777,14 +779,16 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	}
 
 	#[inline(always)]
-	pub(crate) fn BCGetBitArray(&self, i: u16) -> &mut CBitArray
+	pub(crate) fn BCGetBitArray(&mut self, i: u16) -> &mut CBitArray
 	{
+		// SAFETY: at(i) points at the boxed bit-array of the existing hash-id i, which m_BC owns; the borrow is tied to self
 		unsafe { &mut *self.m_BC.at(i) }
 	}
 
 	#[inline(always)]
 	pub(crate) fn BCGetBitArrayConst(&self, i: u16) -> &CBitArray
 	{
+		// SAFETY: as in BCGetBitArray
 		unsafe { &*self.m_BC.at(i) }
 	}
 
@@ -950,7 +954,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		let bcInd = TBCInd::from_ind(clsInd);
 		debug_assert!(bcInd.m_BitsForClsSize() != 0);
 		let bcHashInd = bcInd.GetHashId();
-		let ba = self.BCGetBitArray(bcHashInd.val());
+		let ba = self.BCGetBitArrayConst(bcHashInd.val());
 		ba.bit_get(bcInd.m_BitStart(), bcInd.m_BitsForClsSize()) as TUV
 	}
 
@@ -1035,7 +1039,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		{
 			let bcInd = TBCInd::from_ind(clsInd);
 			let bcHashInd = bcInd.GetHashId();
-			let ba = self.BCGetBitArray(bcHashInd.val());
+			let ba = self.BCGetBitArrayConst(bcHashInd.val());
 			ba.bit_get(bcInd.m_BitStart() + bcInd.m_BitsForClsSize() as u64, bcHashInd.GetBitsGlue()) as TUV
 		}
 	}
@@ -1057,7 +1061,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		{
 			let bcInd = TBCInd::from_ind(clsInd);
 			let bcHashInd = bcInd.GetHashId();
-			let ba = self.BCGetBitArray(bcHashInd.val());
+			let ba = self.BCGetBitArrayConst(bcHashInd.val());
 			Ind::from_u64(ba.bit_get(bcInd.m_BitStart() + bcInd.m_BitsForClsSize() as u64 + bcHashInd.GetBitsGlue() as u64, TBCHashId::GetBitsActivityAndSkipDel()))
 		}
 	}
@@ -1092,7 +1096,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		{
 			let bcInd = TBCInd::from_ind(clsInd);
 			let bcHashInd = bcInd.GetHashId();
-			let ba = self.BCGetBitArray(bcHashInd.val());
+			let ba = self.BCGetBitArrayConst(bcHashInd.val());
 			ba.bit_get(bcInd.m_BitStart() + bcInd.m_BitsForClsSize() as u64 + bcHashInd.GetBitsGlue() as u64, TBCHashId::GetBitsSkipDel()) != 0
 		}
 	}
@@ -1130,7 +1134,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		{
 			let bcInd = TBCInd::from_ind(clsInd);
 			let bcHashInd = bcInd.GetHashId();
-			let ba = self.BCGetBitArray(bcHashInd.val());
+			let ba = self.BCGetBitArrayConst(bcHashInd.val());
 			let asd = ba.bit_get(bcInd.m_BitStart() + bcInd.m_BitsForClsSize() as u64 + bcHashInd.GetBitsGlue() as u64 + TBCHashId::GetBitsSkipDel() as u64, TBCHashId::GetBitsActivity());
 			f32::from_bits(asd as u32)
 		}
@@ -1215,8 +1219,13 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 			// The temporary clauses are only accessed here, and the returned span is a raw view, precisely as in C++
 			let tmpCls = unsafe { &mut (*tmpClss.get())[tmpClssCount.get() as usize] };
-			// The C++ version doesn't test this allocation (and would crash, had it failed)
+			// The C++ version doesn't test this allocation (and would crash, had it failed); the callers can't recover either,
+			// so a failure aborts, as for a standard container, rather than writing through the null buffer
 			tmpCls.reserve_exactly_unchecked_by_user(maxSpanElems as usize);
+			if maxSpanElems != 0 && tmpCls.uninitialized_or_erroneous()
+			{
+				std::alloc::handle_alloc_error(std::alloc::Layout::array::<TULit>(maxSpanElems as usize).unwrap_or(std::alloc::Layout::new::<TULit>()));
+			}
 			for i in 0..maxSpanElems as usize
 			{
 				tmpCls[i] = cc.get(i);
@@ -2036,7 +2045,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			else
 			{
 				let bcHashInd = bcInd.GetHashId();
-				let ba = self.BCGetBitArray(bcHashInd.val());
+				let ba = self.BCGetBitArrayConst(bcHashInd.val());
 				let bcClsSize = ba.bit_get(bcInd.m_BitStart(), bcInd.m_BitsForClsSize()) as u32;
 				Ind::from_u64(if bcClsSize == 0 { bcInd.m_BitStart() + bcInd.m_BitsForLit() as u64 } else { bcInd.BitFirstLit() + bcInd.m_BitsForLit() as u64 * BCEncodedClsSize2ClsSizeConst(bcClsSize, bcInd.m_BitsForClsSize() as u16) as u64 })
 			}
