@@ -1176,6 +1176,12 @@ fn shape(one: bool, items: Vec<PullValue>) -> PullValue
 
 impl Db
 {
+	/// Check a pull pattern against the schema, as `pull` does before pulling anything
+	pub(crate) fn check_pull(&self, pattern: &[Pull]) -> Result<(), Error>
+	{
+		PullSpec::compile(self, pattern).map(|_| ())
+	}
+
 	/// Pull entity `e` by `pattern` (see the module documentation); an entity without any of the attributes gives an empty map.
 	/// Reads the current-state accessors, so a `since` view filters the result; a history view is refused (`FilteredDb`)
 	pub fn pull(&self, pattern: &[Pull], e: Eid) -> Result<Pulled, Error>

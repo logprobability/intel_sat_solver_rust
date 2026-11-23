@@ -97,8 +97,9 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     and runs them in an environment of their own.
   * Find specs (`Query::find`) take plain terms and the aggregates `count`, `count-distinct`, `sum`, `min`, `max` and `avg`, grouped by the plain terms,
     over the distinct tuples of the find and `with` variables, as in Datomic. `sum` of Ints is an exact Int (an error on overflow), and a Float
-    once any value is a Float; `avg` is a Float; both take only numbers.
-* **Text queries** (`src/parse.rs`). `Db::q(text, inputs)` reads a subset of Datomic's Datalog in EDN into the builder, clause by clause (so it is planned
+    once any value is a Float; `avg` is a Float; both take only numbers. Text queries add `(pull ?e [pattern])` in any position and
+    Datomic's find shapes: `[?a ...]` (a collection), `[?a ?b]` (the first row) and `?a .` (the first value).
+* **Text queries** (`src/parse.rs`). `Db::q(text, inputs)` (returning a `Found`: rows, or a collection, tuple or scalar, of `Cell`s, each a value or a pulled entity) reads a subset of Datomic's Datalog in EDN into the builder, clause by clause (so it is planned
   as it is read): `[:find ?a (count ?b) :with ?c :in $ ?x :where [?e :attr ?v] [(> ?v ?x)] (not ...) (or-join [?e] ... (and ...))]`, with `_`
   (a variable of its own at each occurrence, as is each missing position of a short pattern, and never a join variable of an implicit `not` or `or`,
   so `(not [?p :person/friend _])` keeps the people without friends, as in Datomic), 2- to 5-element patterns, lookup refs `[:attr value]`, string, integer, float (`1.5`, `-2e3`), boolean and instant (`#inst "2024-02-29T13:45:00Z"`, RFC 3339, or a date alone) constants, and inputs (`Input`): scalars `?x` and tuples `[?a ?b]`, which become constants of the query, and collections `[?x ...]` and relations `[[?a ?b]]`, which become base relations (`Query::relation`, rules given by their tuples) that the query joins.
@@ -192,13 +193,12 @@ This is a start. What is missing, roughly in order of value:
 * Query language: `or-join` with required variables (`[[?a] ?b]`: a clause that both needs and binds, which the planner's
   encoding would have to support: a binder's boundness justified only when its own requirements hold, pending computed as a fixpoint, and the
   brute-force test extended to such clauses); attribute variables in patterns; function and binding expressions (`[(f ?x) ?y]`);
-  scalar/collection find specs (`.`, `...`) and pull in the find spec;
   the aggregates `median`, `variance` and `stddev`. The cost model doesn't see inside `not` and `or`
   (a `not` has a fixed selectivity, a binding `or` the cost of its branches with nothing bound).
 * Time: the planner's estimates for `since` and `as_of` views
   (they use the latest value's statistics). An as-of view derives each read from the history, so it costs more than a read of the current value.
   In a history view, the current-state accessors (`values`, `lookup`, ...) still read the current datoms; only scans and queries see the history.
-* Pull: pulling from a query's find spec (a find result would need to hold a tree as well as values), and `:limit nil`.
+* Pull: `:limit nil`.
 * Schema: renaming attributes, altering the value type, and attribute retirement; user-defined transaction functions
   (CAS is the only built-in); a keyword value type.
 * Planner scale beyond 16 clauses: the DP covers up to 16 clauses (20 would take up to 120 ms per refinement), and above that SAT

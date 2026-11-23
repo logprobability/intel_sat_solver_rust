@@ -60,7 +60,7 @@ pub mod query;
 pub mod rules;
 
 pub use db::{Attr, AttrId, AttrStats, Cardinality, Conn, Datom, Db, Eid, Entity, Error, Tx, TxLogEntry, TxReport, TxValue, Unique, Value, ValueType, T, TX_INSTANT};
-pub use parse::{Input, TextQuery};
+pub use parse::{Cell, Found, Input, TextQuery};
 pub use planner::{Plan, PlanSource};
 pub use query::{Agg, Clause, Cmp, Find, Nested, Pull, PullOpts, PullValue, Pulled, Query, Term};
 pub use rules::RuleStats;

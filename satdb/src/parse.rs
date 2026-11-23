@@ -19,8 +19,10 @@
 //!  [(follows* ?a ?b) [?a :person/follows ?c] (follows* ?c ?b)]]
 //! ```
 //! * The sections `:find`, `:with`, `:in` and `:where`, each at most once, in any order; `:find` is required.
-//! * `:find` takes variables and aggregates `(count ?x)`, `(count-distinct ?x)`, `(sum ?x)`, `(min ?x)`, `(max ?x)`, `(avg ?x)`
-//!   (see `Query::find`); `:with` takes variables.
+//! * `:find` takes variables, aggregates `(count ?x)`, `(count-distinct ?x)`, `(sum ?x)`, `(min ?x)`, `(max ?x)`, `(avg ?x)`
+//!   (see `Query::find`) and pulls `(pull ?e [pattern])` (see `Db::pull_str`), in one of Datomic's shapes, which the result
+//!   (`Found`) follows: `?a ?b` (a relation), `[?a ...]` (a collection), `[?a ?b]` (a tuple: the first row) and `?a .` (a scalar).
+//!   Rows are distinct and sorted by their values (a pulled position by its entity), then pulled; `:with` takes variables.
 //! * `:in` takes `$` (the database; one at most, and it may be left out), `%` (the rules, given as a text of their own to
 //!   `Db::q_rules`) and bindings, each bound to the `Input` at its position among them: a scalar `?x` (`Input::Scalar`) and a tuple
 //!   `[?a ?b]` (`Input::Tuple`) become constants of the query (so the planner sees them as bound); a collection `[?x ...]`
@@ -40,7 +42,7 @@
 //! * Constants: strings (with the escapes `\"`, `\\`, `\n`, `\t` and `\r`), integers, floats (`1.5`, `-2e3`), booleans and instants
 //!   (`#inst "2024-02-29T13:45:00Z"`, RFC 3339 with `Z` or an offset, or a date alone). There is no keyword value type,
 //!   so a keyword can only name an attribute.
-//! * Pull patterns (`Db::pull_str`, not in queries' find specs) are EDN too, the only place where maps are allowed.
+//! * Pull patterns (`Db::pull_str`, and in `:find`) are EDN too, the only place where maps are allowed.
 //!
 //! Commas are whitespace and `;` starts a comment. Syntax errors are `Error::Parse`, with the line and column; the errors of the clauses
 //! themselves (an unknown attribute, a type mismatch, ...) are those of the builder.
@@ -71,20 +73,134 @@ impl From<Value> for Input
 	}
 }
 
+/// An element of a text query's result: a value, or an entity pulled by `(pull ?e pattern)`
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Cell
+{
+	Val(Value),
+	Pull(Pulled),
+}
+
+/// A text query's result, in the shape of its find spec (Datomic's): rows are distinct and sorted by their values, before any pull
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Found
+{
+	/// `:find ?a ?b`: the rows
+	Rel(Vec<Vec<Cell>>),
+	/// `:find [?a ...]`: the first element of each row
+	Coll(Vec<Cell>),
+	/// `:find [?a ?b]`: the first row, if any
+	Tuple(Option<Vec<Cell>>),
+	/// `:find ?a .`: the first element of the first row, if any
+	Scalar(Option<Cell>),
+}
+
+impl Found
+{
+	/// The rows, whatever the shape (a collection's elements as rows of one, a tuple as one row, a scalar as one row of one)
+	pub fn rows(&self) -> Vec<Vec<Cell>>
+	{
+		match self
+		{
+			Found::Rel(rows) => rows.clone(),
+			Found::Coll(cells) => cells.iter().map(|c| vec![c.clone()]).collect(),
+			Found::Tuple(row) => row.iter().cloned().collect(),
+			Found::Scalar(cell) => cell.iter().map(|c| vec![c.clone()]).collect(),
+		}
+	}
+
+	/// The rows as values (see `rows`), if no cell is a pull
+	pub fn values(&self) -> Option<Vec<Vec<Value>>>
+	{
+		self.rows()
+			.into_iter()
+			.map(|r| {
+				r.into_iter()
+					.map(|c| match c
+					{
+						Cell::Val(v) => Some(v),
+						Cell::Pull(_) => None,
+					})
+					.collect()
+			})
+			.collect()
+	}
+
+	pub fn len(&self) -> usize
+	{
+		self.rows().len()
+	}
+
+	pub fn is_empty(&self) -> bool
+	{
+		self.len() == 0
+	}
+}
+
+/// A relation of values: equal to the rows of a `Found::Rel` without pulls (so that a plain result compares with its values)
+impl PartialEq<Vec<Vec<Value>>> for Found
+{
+	fn eq(&self, other: &Vec<Vec<Value>>) -> bool
+	{
+		match self
+		{
+			Found::Rel(rows) => rows.len() == other.len() && rows.iter().zip(other).all(|(r, o)| r.len() == o.len() && r.iter().zip(o).all(|(c, v)| *c == Cell::Val(v.clone()))),
+			_ => false,
+		}
+	}
+}
+
+/// The shape of a find spec (see `Found`)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Shape
+{
+	Rel,
+	Coll,
+	Tuple,
+	Scalar,
+}
+
 /// A parsed text query: the query (planned as its clauses were read), its find spec and its `with` terms
 pub struct TextQuery
 {
 	pub query: Query,
+	/// The find spec as the builder runs it: a pulled position as its variable
 	pub find: Vec<Find>,
 	pub with: Vec<Term>,
+	/// The pull patterns, by position in `find`
+	pulls: Vec<(usize, Vec<Pull>)>,
+	shape: Shape,
 }
 
 impl TextQuery
 {
-	/// Optimize the plan and run the query (see `Query::find`)
-	pub fn run(&mut self) -> Result<Vec<Vec<Value>>, Error>
+	/// Optimize the plan, run the query (see `Query::find`), pull the entities of its pull positions, and shape the result
+	pub fn run(&mut self) -> Result<Found, Error>
 	{
-		self.query.find(&self.find, &self.with)
+		let rows = self.query.find(&self.find, &self.with)?;
+		let db = self.query.db.clone();
+		let mut out = Vec::with_capacity(rows.len());
+		for row in rows
+		{
+			let mut cells: Vec<Cell> = row.into_iter().map(Cell::Val).collect();
+			for (i, pattern) in &self.pulls
+			{
+				cells[*i] = match &cells[*i]
+				{
+					Cell::Val(Value::Ref(e)) => Cell::Pull(db.pull(pattern, *e)?),
+					Cell::Val(v) => return Err(Error::InvalidQuery(format!("pull of {v:?}, which is not an entity"))),
+					Cell::Pull(_) => unreachable!("each position is pulled once"),
+				};
+			}
+			out.push(cells);
+		}
+		Ok(match self.shape
+		{
+			Shape::Rel => Found::Rel(out),
+			Shape::Coll => Found::Coll(out.into_iter().map(|mut r| r.swap_remove(0)).collect()),
+			Shape::Tuple => Found::Tuple(out.into_iter().next()),
+			Shape::Scalar => Found::Scalar(out.into_iter().next().map(|mut r| r.swap_remove(0))),
+		})
 	}
 }
 
@@ -109,13 +225,13 @@ impl Db
 	}
 
 	/// Parse and run a text query
-	pub fn q(&self, text: &str, inputs: &[Input]) -> Result<Vec<Vec<Value>>, Error>
+	pub fn q(&self, text: &str, inputs: &[Input]) -> Result<Found, Error>
 	{
 		self.parse_query(text, inputs)?.run()
 	}
 
 	/// Parse and run a text query that takes the rule set `rules`
-	pub fn q_rules(&self, text: &str, rules: &str, inputs: &[Input]) -> Result<Vec<Vec<Value>>, Error>
+	pub fn q_rules(&self, text: &str, rules: &str, inputs: &[Input]) -> Result<Found, Error>
 	{
 		self.parse_query_rules(text, rules, inputs)?.run()
 	}
@@ -723,18 +839,39 @@ impl<'a> Parser<'a>
 			self.q.add_clause(c)?;
 		}
 
+		// The shape: [?a ...] (a collection), [?a ?b] (a tuple), ?a . (a scalar), or the elements (a relation)
+		let dots = |n: &Node, d: &str| matches!(&n.form, Form::Symbol(s) if s == d);
+		let (shape, elems): (Shape, &[Node]) = match &find[..]
+		{
+			[Node { form: Form::Vector(items), .. }] if items.len() == 2 && dots(&items[1], "...") => (Shape::Coll, &items[..1]),
+			[Node { form: Form::Vector(items), .. }] if !items.is_empty() && !items.iter().any(|n| dots(n, "...")) => (Shape::Tuple, &items[..]),
+			[x, d] if dots(d, ".") && !matches!(x.form, Form::Vector(_)) => (Shape::Scalar, &find[..1]),
+			_ => (Shape::Rel, &find[..]),
+		};
 		let mut spec = Vec::new();
-		for f in &find
+		let mut pulls = Vec::new();
+		for f in elems
 		{
 			spec.push(match &f.form
 			{
-				Form::Symbol(s) if s == "." || s == "..." => return Err(self.err(f, "scalar and collection find specs are not supported")),
+				Form::Symbol(s) if s == "." || s == "..." => return Err(self.err(f, "a scalar find spec is :find ?x . and a collection one :find [?x ...]")),
 				Form::Symbol(s) if s.starts_with('?') => Find::Term(self.term(f)?),
+				Form::List(items) if matches!(items.first().map(|h| &h.form), Some(Form::Symbol(s)) if s == "pull") => match &items[1..]
+				{
+					[x, p] if matches!(&x.form, Form::Symbol(s) if s.starts_with('?')) =>
+					{
+						let pattern = pull_pattern(self.text, p)?;
+						self.q.db.check_pull(&pattern)?;
+						pulls.push((spec.len(), pattern));
+						Find::Term(self.term(x)?)
+					}
+					_ => return Err(self.err(f, "a pull is (pull ?e [pattern])")),
+				},
 				Form::List(items) =>
 				{
 					let agg = match items.first().map(|h| &h.form)
 					{
-						Some(Form::Symbol(name)) => Agg::from_name(name).ok_or_else(|| self.err(&items[0], format!("unknown aggregate {name} (the aggregates are count, count-distinct, sum, min, max and avg)")))?,
+						Some(Form::Symbol(name)) => Agg::from_name(name).ok_or_else(|| self.err(&items[0], format!("unknown aggregate {name} (the aggregates are count, count-distinct, sum, min, max and avg; or pull)")))?,
 						_ => return Err(self.err(f, "an aggregate is (name ?var)")),
 					};
 					match &items[1..]
@@ -743,7 +880,7 @@ impl<'a> Parser<'a>
 						_ => return Err(self.err(f, format!("({} ?var) takes one variable", agg.name()))),
 					}
 				}
-				_ => return Err(self.err(f, ":find takes variables and aggregates")),
+				_ => return Err(self.err(f, ":find takes variables, aggregates and pulls")),
 			});
 		}
 		let mut with = Vec::new();
@@ -755,7 +892,7 @@ impl<'a> Parser<'a>
 				_ => return Err(self.err(&w, ":with takes variables")),
 			}
 		}
-		Ok(TextQuery { query: self.q, find: spec, with })
+		Ok(TextQuery { query: self.q, find: spec, with, pulls, shape })
 	}
 
 	// A variable of an input binding, or `_`
@@ -1300,7 +1437,7 @@ mod tests
 		assert_eq!(at("[:find ?e :where [?e :n 1] (or (and))]"), (1, 32));
 		assert_eq!(at("[:find (median ?e) :where [?e :n 1]]"), (1, 9));
 		assert_eq!(at("[:find (count ?e ?e) :where [?e :n 1]]"), (1, 8));
-		assert_eq!(at("[:find ?e . :where [?e :n 1]]"), (1, 11));
+		assert_eq!(at("[:find ?e . ?f :where [?e :n 1]]"), (1, 11));
 		assert_eq!(at("[:find 3 :where [?e :n 1]]"), (1, 8));
 		assert_eq!(at("[:find ?e :with 3 :where [?e :n 1]]"), (1, 17));
 		assert_eq!(at("[:find ?e :in $ $ :where [?e :n 1]]"), (1, 17));
@@ -1377,7 +1514,7 @@ mod tests
 		assert_eq!(tq.query.rule_stats(), q.rule_stats());
 		assert_eq!(q.rule_stats().strata, 2);
 		// A call with a lookup ref, and an aggregate over a rule
-		let rows = db.q_rules("[:find ?x ?b :in $ % :where (reach ?x ?b)]", RULES, &[]).unwrap();
+		let rows = db.q_rules("[:find ?x ?b :in $ % :where (reach ?x ?b)]", RULES, &[]).unwrap().values().unwrap();
 		let holders: Vec<(Eid, Value)> = db.attr_datoms(db.attr_id("key").unwrap()).map(|(e, v)| (e, v.clone())).collect();
 		let (holder, Value::Int(k)) = holders.iter().find(|(e, _)| rows.iter().any(|r| r[0] == Value::Ref(*e))).cloned().unwrap() else { unreachable!() };
 		let want: Vec<Vec<Value>> = rows.iter().filter(|r| r[0] == Value::Ref(holder)).map(|r| vec![r[1].clone()]).collect();
@@ -1492,7 +1629,7 @@ mod tests
 		let mut union = BTreeSet::new();
 		for k in &ks
 		{
-			for row in db.q("[:find ?e ?k :in $ ?k :where [?e :n ?k]]", &[k.clone().into()]).unwrap()
+			for row in db.q("[:find ?e ?k :in $ ?k :where [?e :n ?k]]", &[k.clone().into()]).unwrap().values().unwrap()
 			{
 				union.insert(row);
 			}
@@ -1604,6 +1741,49 @@ mod tests
 		assert!(matches!(db.pull_str("[[:person/_friend :default 1]]", e[0]), Err(Error::InvalidQuery(_))));
 		// A map in a query is a syntax error there
 		assert!(matches!(db.q("[:find ?e :where {:a 1}]", &[]), Err(Error::Parse { .. })));
+	}
+
+	// Find specs: relation, collection, tuple and scalar shapes, and pulls in any position
+	#[test]
+	fn find_shapes_and_pulls()
+	{
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		tx.define("person/name", ValueType::Str, Cardinality::One).define("person/age", ValueType::Int, Cardinality::One).define("person/boss", ValueType::Ref, Cardinality::One);
+		let ps: Vec<crate::db::Entity> = (0..3).map(|_| tx.temp()).collect();
+		for (i, p) in ps.iter().enumerate()
+		{
+			tx.add(*p, "person/name", ["a", "b", "c"][i]).add(*p, "person/age", 30 + i as i64);
+		}
+		tx.add(ps[0], "person/boss", ps[1]).add(ps[1], "person/boss", ps[2]);
+		let r = conn.transact(&tx).unwrap();
+		let db = conn.db();
+		let e: Vec<Eid> = ps.iter().map(|p| r.eid(*p)).collect();
+		let q = |text: &str| db.q(text, &[]).unwrap();
+		let s = |x: &str| Cell::Val(Value::from(x));
+		// A pull next to a plain column: each pulled cell is Db::pull_str of the entity
+		let pattern = "[:person/name {:person/boss [:person/name]}]";
+		let got = q(&format!("[:find ?n (pull ?e {pattern}) :where [?e :person/name ?n]]"));
+		let want: Vec<Vec<Cell>> = e.iter().zip(["a", "b", "c"]).map(|(x, n)| vec![s(n), Cell::Pull(db.pull_str(pattern, *x).unwrap())]).collect();
+		assert_eq!(got, Found::Rel(want));
+		assert!(got.values().is_none());
+		// The shapes
+		assert_eq!(q("[:find [?n ...] :where [_ :person/name ?n]]"), Found::Coll(vec![s("a"), s("b"), s("c")]));
+		assert_eq!(q("[:find [?n ?a] :where [?e :person/name ?n] [?e :person/age ?a]]"), Found::Tuple(Some(vec![s("a"), Cell::Val(Value::Int(30))])));
+		assert_eq!(q("[:find ?n . :where [?e :person/age 31] [?e :person/name ?n]]"), Found::Scalar(Some(s("b"))));
+		assert_eq!(q("[:find ?n . :where [?e :person/age 99] [?e :person/name ?n]]"), Found::Scalar(None));
+		assert_eq!(q("[:find [?n ?a] :where [?e :person/name ?n] [?e :person/age ?a] [(> ?a 99)]]"), Found::Tuple(None));
+		assert_eq!(q("[:find (count ?e) . :where [?e :person/name _]]"), Found::Scalar(Some(Cell::Val(Value::Int(3)))));
+		assert_eq!(q("[:find [(pull ?e [:person/name]) ...] :where [?e :person/age ?a] [(< ?a 32)]]").len(), 2);
+		// A relation of values compares with its values
+		assert_eq!(q("[:find ?n :where [_ :person/name ?n]]"), vec![vec![Value::from("a")], vec![Value::from("b")], vec![Value::from("c")]]);
+		// Errors: the pattern's at parse time (even when nothing matches), a pull of a non-entity, malformed specs
+		assert!(matches!(db.q("[:find (pull ?e [:nope]) :where [?e :person/age 99]]", &[]), Err(Error::UnknownAttr(_))));
+		assert!(matches!(db.q("[:find (pull ?n [:person/name]) :where [_ :person/name ?n]]", &[]), Err(Error::InvalidQuery(_))));
+		for bad in ["[:find (pull ?e) :where [?e :person/name _]]", "[:find (pull [:person/name] ?e) :where [?e :person/name _]]", "[:find [?e ... ?f] :where [?e :person/name ?f]]", "[:find [?e] . :where [?e :person/name _]]"]
+		{
+			assert!(matches!(db.q(bad, &[]), Err(Error::Parse { .. })), "{bad}");
+		}
 	}
 
 	// Floats and instants in text queries: literals, numeric comparison of Ints and Floats, and aggregates
