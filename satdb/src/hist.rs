@@ -16,7 +16,7 @@
 //!
 //! A read locates the range of a key prefix in each segment and in the tail, and merges the ranges (there is one range in the common case).
 //!
-//! Against the persistent treap (`pmap`) that held these indexes before: an entry takes 8 to 9 bytes rather than a node of about 90,
+//! Against the persistent treap (the first `pmap`) that held these indexes before: an entry takes 8 to 9 bytes rather than a node of about 90,
 //! and reads by a key prefix take about half the time (the README has the timings). A long scan of one segment is no faster than
 //! walking a bulk-built treap, and building the segments from a checkpoint is about 10% slower than building the treaps.
 
