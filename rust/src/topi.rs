@@ -175,6 +175,8 @@ pub struct CTopi<Ind: TUInd, const Compress: bool>
 	pub(crate) m_PolarityInfo: CDynArray<TPolarityInfo>,
 	pub(crate) m_UpdateParamsWhenVarFixedDone: bool,
 	pub(crate) m_NonForcedPolaritySelectionForFlip: u32,
+	// Rust-only extension (topi_ext_hints.rs): the phase and score hints, which haven't been applied yet
+	pub(crate) m_ExtHints: crate::topi_ext_hints::CExtHints,
 
 	// Literal currently propagated by BCP
 	pub(crate) m_CurrentlyPropagatedLit: TULit,
@@ -443,6 +445,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			m_PolarityInfo: CDynArray::new(0),
 			m_UpdateParamsWhenVarFixedDone: false,
 			m_NonForcedPolaritySelectionForFlip: 0,
+			m_ExtHints: Default::default(),
 			m_CurrentlyPropagatedLit: BadULit,
 			m_Cis: CVector::new(0, 0),
 			m_Dis: CVector::new(0, 0),

@@ -70,7 +70,7 @@ The changes are confined to how the same statements are compiled; none changes a
 ## Coverage
 
 `scripts/coverage.sh` runs all the tests under LLVM source-based coverage and fails if any line is neither executed nor explicitly marked in the sources.
-Of the 9597 lines, the tests execute 9590. The rarest solver paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
+Of the 9779 lines, the tests execute 9772. The rarest solver paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
 while another assumption is falsified) are driven by tests on crafted solver states, which the fuzzer never produces. The other 7 lines carry the mark
 `COVERAGE-NOT-REACHED` with its reason: they run only if the system allocator fails, which the test-only allocation-fault injection doesn't simulate,
 or if a decompressor is on the PATH but can't be run. (The script also supports a `COVERAGE-UNREACHABLE` mark; no line carries it.)
@@ -116,6 +116,36 @@ The control flow is the same statement by statement. The differences are confine
   functions and classes of `ToporBitArrayBuffer.hpp` and the `tableByBit`/`tableByEntry` tables of `ToporTableBitInfo.hpp`, with all their static asserts).
 * **The zlib input of `Main.cc` isn't ported:** the Makefile builds the C++ tool with `-DSKIP_ZLIB`, and the port implements that configuration (compressed inputs are read
   through the shell's decompressors, as the C++ tool does then).
+
+## Rust-only extensions
+
+Features without a C++ counterpart live in their own modules (`src/topi_ext_*.rs`) with small, marked hooks in the mirrored files. Each one is gated by a parameter,
+which is off by default, and with the parameters off the solver's behavior, output and proofs are those of the C++ solver (`scripts/diff_vs_cpp.sh`).
+A new parameter must also be listed in `IsParamExcluded` of `src/tests/fuzzing.rs`: the fuzz scenarios draw parameters by index, so a longer list changes all of them, including the ones
+`scripts/coverage.sh` relies on to reach the rare paths. The extension gets its own tests instead (`src/tests/ext_hints.rs`).
+
+**Phase and score hints** (`src/topi_ext_hints.rs`): advice for the search, which is never binding, so a wrong hint can only cost time.
+
+* `CTopor::HintPhase(l)` seeds the saved polarity of the variable of `l` *without fixing it* (unlike `FixPolarity`): the solver decides the variable to `l` the next time,
+  but stays free to flip it, and phase saving overwrites the hint as usual. A polarity fixed by `FixPolarity` wins for as long as it is in force. Requires `/phase/hints/on 1`.
+* `CTopor::HintScore(v, score)` boosts the decision score of `v` by `/decision/score_hints/mult` times `score` at the next query, through the machinery of `BoostScore`.
+  Ignored, if the parameter is 0 (the default).
+* The hints are applied by the next `Solve` right before its search loop (a hint for a variable, which doesn't exist yet, waits for it; if a hinted variable is still assigned
+  above the assumptions by the previous query, the solver backtracks to the assumptions first, as a restart does).
+  In a sequence of queries a hint lasts only until phase saving overwrites it, so it is given again before the query it is meant for
+  (`docs/search_quality/ceiling.md` measures what the hints can and cannot buy).
+  `CTopor::GetSavedPhase(v)` and `CTopor::GetVarScore(v)` read the state to carry over; `CTopor::WriteHints()` / `ReadHints(text)` do it in the hints-file format.
+* The executable: `/topor_tool/hints_file <file>` reads a hints file before the first query, `/topor_tool/write_hints_file <file>` writes one after every query
+  (the saved phases, which are the model after a satisfiable query, and the ranks of the decision scores), and the commands `lh <Lit>` and `ls <Var> <Score>` give hints inside an instance
+  (they are also what `TOPOR_DUMP_NAME` records). A hints file holds `v <Lit> ... 0` lines (phases, as in the model a SAT solver prints; the `v` is optional), `b <Var> <Score>` lines (scores) and comments.
+
+**Search-quality measurements** (`scripts/search_quality_bench.py`, `scripts/phase_oracle_ceiling.py`, `docs/search_quality/`):
+
+    scripts/search_quality_bench.py --config base= --config hinted="/phase/hints/on 1 /topor_tool/hints_file hints/{inst}.hints" [--out PREFIX] <instance.cnf>...
+    scripts/phase_oracle_ceiling.py          # the oracle-ceiling experiment; writes docs/search_quality/ceiling_tables.md (the reading is in ceiling.md)
+
+`search_quality_bench.py` runs the release executable under named configurations (sets of parameters, the first one being the baseline) and tabulates the status, the conflicts,
+the decisions, the restarts and the CPU time per instance and configuration, with the geometric means of the ratios to the baseline; it fails, if two configurations give contradicting answers.
 
 ## Upstream issues found while testing the fork
 

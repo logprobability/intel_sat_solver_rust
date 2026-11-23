@@ -107,7 +107,11 @@ fn IsParamExcluded(name: &str) -> bool
 	// (e.g.: r /mode/value 6; r /__s/restarts/lbd/blocking/enable 1; r /restarts/strategy_s 0; s 0; oc 54; s -4 5 3 -7 0).
 	// So the restart strategies are changed only through the mode, which sets all of them to the same value
 	name.starts_with("/restarts/strategy_") ||
-	name.starts_with("/verbosity/") || name.starts_with("/timeout/") || name == "/debugging/print_debug_model_invocation" || name == "/debugging/verify_debug_model_invocation"
+	name.starts_with("/verbosity/") || name.starts_with("/timeout/") || name == "/debugging/print_debug_model_invocation" || name == "/debugging/verify_debug_model_invocation" ||
+	// The parameters of the Rust-only extensions: the scenarios are functions of the list of the parameters (a parameter is drawn by its index), and the ones
+	// which were found by a search over the seeds (cov_core.rs) reach their rarely visited code only with the list they were found with.
+	// (The hints have no effect without HintPhase/HintScore, which the scenarios don't invoke; tests/ext_hints.rs fuzzes them.)
+	name == "/phase/hints/on" || name == "/decision/score_hints/mult"
 }
 
 // Parses the description of the parameters, which is provided by the solver, into the list of the parameters with a few interesting legal values for each

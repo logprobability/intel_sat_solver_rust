@@ -115,6 +115,11 @@ trait TToporInst
 	fn ToporGetSolveInvs(&self) -> u64;
 	fn ToporIsAssumptionRequired(&mut self, assumpInd: usize) -> bool;
 	fn ToporGetMaxUserVar(&self) -> TLit;
+	// Rust-only extension (topi_ext_hints.rs): phase and score hints
+	fn ToporHintPhase(&mut self, l: TLit);
+	fn ToporHintScore(&mut self, v: TLit, score: f64);
+	fn ToporReadHints(&mut self, text: &str) -> Result<(usize, usize), String>;
+	fn ToporWriteHints(&self) -> String;
 }
 
 impl<Ind: TUInd, const Compress: bool> TToporInst for CTopor<Ind, Compress>
@@ -186,6 +191,22 @@ impl<Ind: TUInd, const Compress: bool> TToporInst for CTopor<Ind, Compress>
 	fn ToporGetMaxUserVar(&self) -> TLit
 	{
 		self.GetMaxUserVar()
+	}
+	fn ToporHintPhase(&mut self, l: TLit)
+	{
+		self.HintPhase(l);
+	}
+	fn ToporHintScore(&mut self, v: TLit, score: f64)
+	{
+		self.HintScore(v, score);
+	}
+	fn ToporReadHints(&mut self, text: &str) -> Result<(usize, usize), String>
+	{
+		self.ReadHints(text)
+	}
+	fn ToporWriteHints(&self) -> String
+	{
+		self.WriteHints()
 	}
 }
 
@@ -589,6 +610,9 @@ struct CToporTool<'a>
 	allsatBlockingFromInstanceAlg: u64,
 	// 0: 32-bit clause buffer index; 1: 64-bit clause buffer index; 2: 64-bit clause buffer index & bit-array-compression
 	type_indexing_and_compression: u8,
+	// Rust-only extension (topi_ext_hints.rs): the hints file to read before the first query, and the one to write after every query (none, if empty)
+	hintsFile: String,
+	writeHintsFile: String,
 
 	// The one existing instance out of topor32, topor64 and toporc (if any)
 	topor: Option<Box<dyn TToporInst>>,
@@ -627,6 +651,8 @@ impl<'a> CToporTool<'a>
 			blockingVars: Vec::new(),
 			allsatBlockingFromInstanceAlg: 3,
 			type_indexing_and_compression: 0,
+			hintsFile: String::new(),
+			writeHintsFile: String::new(),
 			topor: None,
 			ret: TToporReturnVal::RET_EXOTIC_ERROR,
 			lineNum: 1,
@@ -756,6 +782,9 @@ impl<'a> CToporTool<'a>
 					"allsat_models_number" => ReadParam!(self.allsatModels, Self::ReadULongParam(paramValStr)),
 					"allsat_blocking_variables" => ReadParam!(self.blockingVars, ReadCommaSeparatedVarList(paramValStr.as_bytes())),
 					"allsat_blocking_variables_file_alg" => ReadParam!(self.allsatBlockingFromInstanceAlg, Self::ReadULongParam(paramValStr)),
+					// Rust-only extension (topi_ext_hints.rs)
+					"hints_file" => ReadParam!(self.hintsFile, Ok::<String, String>(paramValStr.to_string())),
+					"write_hints_file" => ReadParam!(self.writeHintsFile, Ok::<String, String>(paramValStr.to_string())),
 					_ =>
 					{
 						coutln!(self.out, "c ERROR: unrecognized /topor_tool/ parameter: {}", paramNameStr);
@@ -819,7 +848,35 @@ impl<'a> CToporTool<'a>
 			self.Topor().ToporDumpDrat(dratFile, isDratBinary, dratSortEveryClause);
 		}
 
+		// Rust-only extension (topi_ext_hints.rs): the solver records the hints of the file and applies them at the first query
+		if !self.hintsFile.is_empty()
+		{
+			let hintsFile = self.hintsFile.clone();
+			match std::fs::read_to_string(&hintsFile).map_err(|e| e.to_string()).and_then(|text| self.Topor().ToporReadHints(&text))
+			{
+				Ok((phases, scores)) => coutln!(self.out, "c topor_tool: accepted {} phase hints and {} score hints of {} (the hints are ignored, unless /phase/hints/on and /decision/score_hints/mult, respectively, are non-0)", phases, scores, hintsFile),
+				Err(errMsg) =>
+				{
+					coutln!(self.out, "c topor_tool ERROR: couldn't read the hints file {}: {}", hintsFile, errMsg);
+					return BadRetVal;
+				}
+			}
+		}
+
 		0
+	}
+
+	// Rust-only extension (topi_ext_hints.rs): write the saved phases (the model, if the latest query is satisfiable) and the decision scores to the file of /topor_tool/write_hints_file, if any
+	fn WriteHintsFileIfRequired(&mut self)
+	{
+		if !self.writeHintsFile.is_empty()
+		{
+			let text = self.Topor().ToporWriteHints();
+			if let Err(e) = std::fs::write(&self.writeHintsFile, text)
+			{
+				coutln!(self.out, "c topor_tool ERROR: couldn't write the hints file {}: {}", self.writeHintsFile, e);
+			}
+		}
 	}
 
 	// Returns 10 upon success and BadRetVal upon failure
@@ -894,6 +951,7 @@ impl<'a> CToporTool<'a>
 		self.nextSolveConfThr = u64::MAX;
 
 		self.retValBasedOnLatestSolve = self.ToporOnFinishedSolving(assumps, None);
+		self.WriteHintsFileIfRequired();
 
 		if self.verifyModel && self.retValBasedOnLatestSolve == 10
 		{
@@ -1089,7 +1147,8 @@ impl<'a> CToporTool<'a>
 			// cout << "\tc lf <FixPolarityLit> <OnlyOnce>" << endl;
 			// cout << "\tc lc <ClearUserPolarityInfoLit>" << endl;
 			// cout << "\tc ll <LitToCreateInternalLit>" << endl;
-			if l.at(1) != b'b' && l.at(1) != b'f' && l.at(1) != b'c' && l.at(1) != b'l'
+			// Rust-only extension (topi_ext_hints.rs): lh <PhaseHintLit> and ls <ScoreHintVar> <Score>
+			if l.at(1) != b'b' && l.at(1) != b'f' && l.at(1) != b'c' && l.at(1) != b'l' && l.at(1) != b'h' && l.at(1) != b's'
 			{
 				return Err("c topor_tool ERROR: The 2nd character must be either b or f or c at line number ".to_string() + &lineNum.to_string());
 			}
@@ -1125,6 +1184,19 @@ impl<'a> CToporTool<'a>
 			else if l.at(1) == b'l'
 			{
 				self.Topor().ToporCreateInternalLit(lit);
+			}
+			else if l.at(1) == b'h'
+			{
+				self.Topor().ToporHintPhase(lit);
+			}
+			else if l.at(1) == b's'
+			{
+				let score = l.substr(l.currLineI + 1).and_then(|scoreStr| stod(&scoreStr));
+				match score
+				{
+					Some(score) => self.Topor().ToporHintScore(lit, score),
+					None => return Err("c topor_tool ERROR: couldn't convert the <Score> value to double at line number ".to_string() + &lineNum.to_string()),
+				}
 			}
 			else
 			{
@@ -1338,6 +1410,7 @@ impl<'a> CToporTool<'a>
 					}
 					currModelNum += 1;
 				}
+				self.WriteHintsFileIfRequired();
 			}
 			else if self.Solve(None) == BadRetVal
 			{
@@ -1367,6 +1440,8 @@ fn PrintUsage(out: &mut dyn Write)
 	coutln!(out, "\tc lf <FixPolarityLit> <OnlyOnce>");
 	coutln!(out, "\tc ll <LitToCreateInternalLit>");
 	coutln!(out, "\tc lc <ClearUserPolarityInfoLit>");
+	coutln!(out, "\tc lh <PhaseHintLit> (Rust-only; requires /phase/hints/on 1)");
+	coutln!(out, "\tc ls <ScoreHintVar> <Score> (Rust-only; requires a non-0 /decision/score_hints/mult)");
 	coutln!(out, "\tc b <BacktrackLevel>");
 	coutln!(out, "\tc n <ConfigNumber>");
 	coutln!(out, "\tc s <Lit1 <Lit2> ... <Litn>: solve under the assumptions {{<Lit1 <Lit2> ... <Litn>}}");
@@ -1384,6 +1459,8 @@ fn PrintUsage(out: &mut dyn Write)
 	cout!(out, "\tc {} : unsigned long integer; default = 1{} : the maximal number of models for AllSAT. AllSAT with blocking clauses over /topor_tool/allsat_blocking_variables's variables is invoked if: (1) this parameter is greater than 1; (2) the CNF format is DIMACS without Topor-specific commands; (3) /topor_tool/allsat_blocking_variables is non-empty\n", cyan("/topor_tool/allsat_models_number"), green("1"));
 	cout!(out, "\tc {} : string; default = {} : if /topor_tool/allsat_models_number > 1, specifies the variables which will be used for blocking clauses, sperated by a comma, e.g., 1,4,5,6,7,15.\n", cyan("/topor_tool/allsat_blocking_variables"), green("\"\""));
 	cout!(out, "\tc {} : string; default = {} : if /topor_tool/allsat_models_number > 1 and our parameter > 0, read the blocking variables from the first comment line in the file (format: c 1,4,5,6,7,15), where the value means: 1 -- assign lowest internal SAT variables to blocking; 2 -- assign highest internal SAT variables to blocking; >=3 -- assign their own internal SAT variables to blocking \n", cyan("/topor_tool/allsat_blocking_variables_file_alg"), green("3"));
+	cout!(out, "\tc {} : string; default = {} : Rust-only: path to a hints file to read before the first query: 'v <Lit> ... 0' lines (as in the model a SAT solver prints) hint the polarities of the variables without fixing them (requires /phase/hints/on 1), 'b <Var> <Score>' lines hint the initial decision scores (requires a non-0 /decision/score_hints/mult)\n", cyan("/topor_tool/hints_file"), green("\"\""));
+	cout!(out, "\tc {} : string; default = {} : Rust-only: path to a file to write the hints for a future run to after every query: the saved phases (the model, if the query is satisfiable) and the normalized decision scores\n", cyan("/topor_tool/write_hints_file"), green("\"\""));
 
 	let topor = CTopor::<u32, false>::new(0);
 	cout!(out, "{}", topor.GetParamsDescr());

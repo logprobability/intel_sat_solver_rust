@@ -1310,6 +1310,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			self.m_PrevAiCap = self.m_AssignmentInfo.cap();
 		}
 
+		// Rust-only extension (topi_ext_hints.rs): apply the phase and score hints, if any have been recorded (none can be, unless their parameters are on)
+		self.ExtHintsApplyPending();
+
 		// CDCL loop
 		while self.m_Status.get() == TToporStatus::STATUS_UNDECIDED
 		{

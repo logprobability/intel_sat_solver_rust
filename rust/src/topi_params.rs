@@ -568,6 +568,11 @@ topi_params!
 	m_ParamIngInvokeEveryQueryAfterInitPostpone: bool = single("/inprocessing/invoke_every_query_after_init_postpone", "Inprocessing: invoke right after every query after /inprocessing/postpone_first_inv_conflicts conflicts", true);
 	m_ParamIngPostponeFirstInvConflicts: u32 = single("/inprocessing/postpone_first_inv_conflicts", "Inprocessing: conflicts to postpone the very first inprocessing invocation", 0);
 	m_ParamIngConflictsBeforeNextInvocation: u32 = single("/inprocessing/conflicts_before_next", "Inprocessing: conflicts before the next invocation", u32::MAX);
+
+	// Parameters of the Rust-only extensions (no C++ counterpart; each one is off by default, which leaves the solver's behavior identical to that of the C++ solver)
+	// Phase and score hints (topi_ext_hints.rs)
+	m_ParamPhaseHintsOn: bool = single("/phase/hints/on", "Rust-only: phase hints: let HintPhase (the lh command, /topor_tool/hints_file) seed the saved polarity of a variable without fixing it", false);
+	m_ParamScoreHintsMult: f64 = single("/decision/score_hints/mult", "Rust-only: score hints: HintScore (the ls command, /topor_tool/hints_file) boosts the decision score of its variable by this value times the hinted score at the next query (0: score hints are ignored)", 0., 0.);
 }
 
 // The state of the C++ CTopiParams class proper (which, unlike here, doesn't hold the parameter values, since they are members of the solver class)

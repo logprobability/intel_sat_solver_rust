@@ -14,6 +14,9 @@ The Rust fork mirrors the C++ sources one-to-one. This file is the contract that
 | `Main.cc` | `src/main.rs` |
 | `ToporDynArray.hpp`, `ToporVector.hpp`, `ToporBitArray.hpp`, `ToporBitArrayBuffer.hpp`, `ToporTableBitInfo.hpp`, `ToporWinAverage.hpp`, `TopiVarScores.hpp`, `TopiParams.hpp`, `TopiStatistics.hpp`, `TimeMeasure.h`, `BasicMemoryUsage.h`, `ColorPrint.h`, `ToporExternalTypes.hpp` | the corresponding `snake_case.rs` |
 
+Rust-only features (no C++ counterpart) don't go into the mirrored modules: each one is a module `src/topi_ext_<name>.rs` (currently `topi_ext_hints.rs`: phase and score hints), whose hooks in the mirrored files are a few lines marked `Rust-only extension`,
+and it is gated by a new parameter, which is off by default and leaves the search identical to that of the C++ solver when off (see "Rust-only extensions" in `README.md`).
+
 Every `.cc` translation unit becomes one `impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress> { ... }` block in its module
 (start the file with `use crate::topi::*;`). Functions appear in the same order as in the C++ file, with the same comments.
 

@@ -500,6 +500,74 @@ fn allsat()
 		"c topor_tool ERROR: expected the first comment to contain blocking variables at line number 2. Error message: c ERROR: couldn't convert  to a variable list\n");
 }
 
+// Rust-only extension (topi_ext_hints.rs): the hints files and the lh and ls commands
+#[test]
+fn hints()
+{
+	// The variables 1..=4 are free (positive by default), and 5 is implied by the negation of any of them
+	let cnf = "p cnf 5 4\n1 5 0\n2 5 0\n3 5 0\n4 5 0\n";
+	let on = ["/phase/hints/on", "1", "/decision/score_hints/mult", "2"];
+	let hintsFile = TmpFile("hints_in.txt");
+	let writtenFile = TmpFile("hints_out.txt");
+	std::fs::write(&hintsFile, "c hints\nv -1 -2 0\nb 3 0.5\n").unwrap();
+
+	// The hints are ignored, unless their parameters are on
+	let (res, out) = RunCnf("hints_0.cnf", cnf.as_bytes(), &["/topor_tool/hints_file", &hintsFile]);
+	assert_eq!(res, Ok(10), "{}", out);
+	assert!(out.contains(&format!("c /topor_tool/hints_file {}\n", hintsFile)), "{}", out);
+	assert!(out.contains(&format!("c topor_tool: accepted 0 phase hints and 0 score hints of {} (", hintsFile)), "{}", out);
+	assert!(out.ends_with("s SATISFIABLE\nv 1 2 3 4 5 0\n"), "{}", out);
+
+	// The hinted polarities are followed, and the hints for the next run are written
+	for solverMode in ["0", "1", "2"]
+	{
+		let mut params = vec!["/topor_tool/solver_mode", solverMode, "/topor_tool/hints_file", &hintsFile, "/topor_tool/write_hints_file", &writtenFile, "/topor_tool/verify_model", "1"];
+		params.extend_from_slice(&on);
+		let (res, out) = RunCnf("hints_1.cnf", cnf.as_bytes(), &params);
+		assert_eq!(res, Ok(10), "{}", out);
+		assert!(out.contains(&format!("c topor_tool: accepted 2 phase hints and 1 score hints of {} (", hintsFile)), "{}", out);
+		assert!(out.contains("s SATISFIABLE\nv -1 -2 3 4 5 0\n"), "{}", out);
+		let written = std::fs::read_to_string(&writtenFile).unwrap();
+		assert!(written.contains("\nv -1 -2 3 4 5 0\n") && written.contains("\nb 3 "), "{}", written);
+		// The written file is a legal hints file
+		let mut params = vec!["/topor_tool/hints_file", &writtenFile[..]];
+		params.extend_from_slice(&on);
+		let (res, out) = RunCnf("hints_2.cnf", cnf.as_bytes(), &params);
+		assert_eq!(res, Ok(10), "{}", out);
+		assert!(out.ends_with("s SATISFIABLE\nv -1 -2 3 4 5 0\n"), "{}", out);
+	}
+
+	// The hints are written after every query, also in the AllSAT mode
+	let (res, out) = RunCnf("hints_3.cnf", (cnf.to_string() + "s -3 0\ns 0\n").as_bytes(), &["/topor_tool/write_hints_file", &writtenFile]);
+	assert_eq!(res, Ok(10), "{}", out);
+	assert!(std::fs::read_to_string(&writtenFile).unwrap().contains("\nv 1 2 -3 4 5 0\n"));
+	let (res, out) = RunCnf("hints_4.cnf", cnf.as_bytes(), &["/topor_tool/write_hints_file", &writtenFile, "/topor_tool/allsat_models_number", "2", "/topor_tool/allsat_blocking_variables", "1"]);
+	assert_eq!(res, Ok(10), "{}", out);
+	assert!(std::fs::read_to_string(&writtenFile).unwrap().contains("\nv -1 "));
+
+	// The commands
+	let (res, out) = RunCnf("hints_5.cnf", (cnf.to_string() + "r /phase/hints/on 1\nr /decision/score_hints/mult 1\nlh -4\nls 2 0.75\ns 0\nlh -3\ns 4 0\n").as_bytes(), &[]);
+	assert_eq!(res, Ok(10), "{}", out);
+	assert!(out.contains("s SATISFIABLE\nv 1 2 3 -4 5 0\n") && out.ends_with("s SATISFIABLE\nv 1 2 -3 4 5 0\n"), "{}", out);
+	ExpectErr("hints_6.cnf", &(P.to_string() + "ls 1 x\n"), &[], "c topor_tool ERROR: couldn't convert the <Score> value to double at line number 3");
+	ExpectErr("hints_7.cnf", &(P.to_string() + "ls 1"), &[], "c topor_tool ERROR: couldn't convert the <Score> value to double at line number 3");
+
+	// The files, which cannot be read, parsed or written
+	let missing = TmpFile("no_such_hints.txt");
+	ExpectRet("hints_8.cnf", cnf, &["/topor_tool/hints_file", &missing], BadRetVal, &format!("c topor_tool ERROR: couldn't read the hints file {}: ", missing));
+	std::fs::write(&hintsFile, "v 1 2\nb 1\n").unwrap();
+	ExpectRet("hints_9.cnf", cnf, &["/topor_tool/hints_file", &hintsFile], BadRetVal, &format!("c topor_tool ERROR: couldn't read the hints file {}: hints: cannot parse line 2: b 1\n", hintsFile));
+	let unwritable = TmpFile("no_such_dir") + "/hints.txt";
+	ExpectRet("hints_10.cnf", cnf, &["/topor_tool/write_hints_file", &unwritable], 10, &format!("c topor_tool ERROR: couldn't write the hints file {}: ", unwritable));
+
+	// The usage
+	let (_, out) = RunTool(&[]);
+	assert!(out.contains("/topor_tool/hints_file") && out.contains("/topor_tool/write_hints_file") && out.contains("\tc lh <PhaseHintLit>") && out.contains("\tc ls <ScoreHintVar> <Score>"));
+	assert!(out.contains("/phase/hints/on") && out.contains("/decision/score_hints/mult"));
+	let _ = std::fs::remove_file(&hintsFile);
+	let _ = std::fs::remove_file(&writtenFile);
+}
+
 /*
 * The free functions and the internals of the tool
 */
@@ -771,6 +839,16 @@ impl TToporInst for CMockTopor
 	fn ToporGetMaxUserVar(&self) -> TLit
 	{
 		1
+	}
+	fn ToporHintPhase(&mut self, _l: TLit) {}
+	fn ToporHintScore(&mut self, _v: TLit, _score: f64) {}
+	fn ToporReadHints(&mut self, _text: &str) -> Result<(usize, usize), String>
+	{
+		Ok((0, 0))
+	}
+	fn ToporWriteHints(&self) -> String
+	{
+		String::new()
 	}
 }
 

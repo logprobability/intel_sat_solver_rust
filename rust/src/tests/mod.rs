@@ -12,3 +12,5 @@ mod cov_search;
 mod cov_buffers;
 mod cov_core;
 mod cov_misc;
+// The Rust-only extensions
+mod ext_hints;
