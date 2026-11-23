@@ -274,10 +274,10 @@ impl Query
 		self.add_clause(c)
 	}
 
-	/// The name of rule number `rule` of this query (as in `Clause::Rule`)
-	pub fn rule_name(&self, rule: usize) -> &str
+	/// The name of rule number `rule` of this query (as in `Clause::Rule`), if it has one
+	pub fn rule_name(&self, rule: usize) -> Option<&str>
 	{
-		&self.rules[rule].name
+		self.rules.get(rule).map(|r| r.name.as_str())
 	}
 
 	/// What evaluating the rules took so far
@@ -794,7 +794,7 @@ mod tests
 		assert!(invalid(q.rule("r", &[x.clone()], vec![edge.clone()])));
 		assert!(matches!(q.add_clause(Clause::Rule { rule: 0, args: vec![x.clone()] }), Err(Error::InvalidQuery(_))));
 		assert!(matches!(q.add_clause(Clause::Rule { rule: 7, args: vec![x.clone()] }), Err(Error::InvalidQuery(_))));
-		assert_eq!(q.rule_name(0), "r");
+		assert_eq!((q.rule_name(0), q.rule_name(7)), (Some("r"), None));
 		// A call of a rule that is never defined fails when it is added, and the rule can still be defined then
 		let s = q.call_clause("s", &[x.clone()]).unwrap();
 		let t = q.call_clause("t", &[x.clone()]).unwrap();
