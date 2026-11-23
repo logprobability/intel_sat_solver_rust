@@ -12,6 +12,29 @@
 // The fork ports every member the C++ solver defines, including the ones the C++ solver never calls
 #![allow(dead_code)]
 
+// print!/println! for the library: the C++ version ignores a failure to write to stdout (e.g., a closed pipe), while print! panics on it
+// (the unit tests keep print!, which the test harness captures)
+#[cfg(not(test))]
+macro_rules! stdout_print
+{
+	($($arg:tt)*) => {{ use std::io::Write; let _ = write!(std::io::stdout(), $($arg)*); }};
+}
+#[cfg(not(test))]
+macro_rules! stdout_println
+{
+	($($arg:tt)*) => {{ use std::io::Write; let _ = writeln!(std::io::stdout(), $($arg)*); }};
+}
+#[cfg(test)]
+macro_rules! stdout_print
+{
+	($($arg:tt)*) => { print!($($arg)*) };
+}
+#[cfg(test)]
+macro_rules! stdout_println
+{
+	($($arg:tt)*) => { println!($($arg)*) };
+}
+
 // The public API: CTopor (and the types it uses), IPASIR, and the C++ library helpers the command-line tool uses
 pub mod color_print;
 pub mod std_string;

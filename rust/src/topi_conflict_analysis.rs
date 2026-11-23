@@ -591,7 +591,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 		if self.m_Params.m_ParamVerbosity.get() > 0 && self.m_Stat.m_Conflicts % self.m_Params.m_ParamStatPrintOutConfs.get() as u64 == 0
 		{
-			print!("{}", self.StatStrShort(false));
+			stdout_print!("{}", self.StatStrShort(false));
 		}
 
 		// Giving an alias to m_VisitedLits to reflect the current usage for readability

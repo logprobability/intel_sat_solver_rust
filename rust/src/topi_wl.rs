@@ -300,13 +300,13 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	{
 		if self.IsFalsified(cls[0]) && self.IsFalsified(cls[1])
 		{
-			println!("***ASSERTION-FAILURE FF-for-binary at {}\n{}", self.SLits(cls, false), self.STrail());
+			stdout_println!("***ASSERTION-FAILURE FF-for-binary at {}\n{}", self.SLits(cls, false), self.STrail());
 		}
 		debug_assert!(!(self.IsFalsified(cls[0]) && self.IsFalsified(cls[1])));
 
 		if !(self.IsSatisfied(cls[0]) || self.IsSatisfied(cls[1]))
 		{
-			println!("***ASSERTION-FAILURE one-falsified-no-satisfied-for-binary at {}\n{}", self.SLits(cls, false), self.STrail());
+			stdout_println!("***ASSERTION-FAILURE one-falsified-no-satisfied-for-binary at {}\n{}", self.SLits(cls, false), self.STrail());
 		}
 		debug_assert!(self.IsSatisfied(cls[0]) || self.IsSatisfied(cls[1]));
 
@@ -316,7 +316,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 		if !(self.GetAssignedDecLevel(satLit) <= self.GetAssignedDecLevel(falseLit))
 		{
-			println!("***ASSERTION-FAILURE one-falsified-satisfied-higherdl-for-binary at {}\n{}", self.SLits(cls, false), self.STrail());
+			stdout_println!("***ASSERTION-FAILURE one-falsified-satisfied-higherdl-for-binary at {}\n{}", self.SLits(cls, false), self.STrail());
 		}
 		debug_assert!(self.GetAssignedDecLevel(satLit) <= self.GetAssignedDecLevel(falseLit));
 	}
@@ -345,7 +345,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			let itFound = found(&|l: TULit| self.IsSatisfied(l) && self.GetAssignedDecLevel(l) <= falseLitDecLevel);
 			if !(otherLitDecLevel <= falseLitDecLevel || itFound)
 			{
-				println!("***ASSERTION-FAILURE FS at {}\n{}", self.SLits(cls, false), self.STrail());
+				stdout_println!("***ASSERTION-FAILURE FS at {}\n{}", self.SLits(cls, false), self.STrail());
 			}
 			debug_assert!(otherLitDecLevel <= falseLitDecLevel || itFound);
 		}
@@ -355,7 +355,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			let itFound = found(&|l: TULit| self.IsSatisfied(l) && self.GetAssignedDecLevel(l) <= falseLitDecLevel);
 			if !itFound
 			{
-				println!("***ASSERTION-FAILURE F- at {}\n{}", self.SLits(cls, false), self.STrail());
+				stdout_println!("***ASSERTION-FAILURE F- at {}\n{}", self.SLits(cls, false), self.STrail());
 			}
 			debug_assert!(itFound);
 		}
@@ -365,7 +365,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			let itFound = found(&|l: TULit| self.IsSatisfied(l) && self.GetAssignedDecLevel(l) <= falseLitDecLevel && self.GetAssignedDecLevel(l) <= otherLitDecLevel);
 			if !itFound
 			{
-				println!("***ASSERTION-FAILURE FF at {}\n{}", self.SLits(cls, false), self.STrail());
+				stdout_println!("***ASSERTION-FAILURE FF at {}\n{}", self.SLits(cls, false), self.STrail());
 			}
 			debug_assert!(itFound);
 		}
@@ -425,7 +425,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				{
 					if !(clsInd >= self.m_FirstLearntClsInd || !self.ClsGetIsLearnt(clsInd))
 					{
-						println!("***ASSERTION-FAILURE First-Learnt at {}\n{}", self.SLits(cls, false), self.STrail());
+						stdout_println!("***ASSERTION-FAILURE First-Learnt at {}\n{}", self.SLits(cls, false), self.STrail());
 					}
 					debug_assert!(clsInd >= self.m_FirstLearntClsInd || !self.ClsGetIsLearnt(clsInd));
 				}
@@ -433,7 +433,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				debug_assert!(cls[0] == l || cls[1] == l);
 				if cls.find(cachedLit) == cls.size()
 				{
-					println!("***ASSERTION-FAILURE CL- at cached {}; cls = {}\n{}", self.SLit(cachedLit), self.SLits(cls, false), self.STrail());
+					stdout_println!("***ASSERTION-FAILURE CL- at cached {}; cls = {}\n{}", self.SLit(cachedLit), self.SLits(cls, false), self.STrail());
 					debug_assert!(false);
 				}
 
@@ -516,7 +516,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				{
 					if !(clsInd >= self.m_FirstLearntClsInd || !self.ClsGetIsLearnt(clsInd))
 					{
-						println!("***ASSERTION-FAILURE First-Learnt at {}\n{}", self.SLits(cls, false), self.STrail());
+						stdout_println!("***ASSERTION-FAILURE First-Learnt at {}\n{}", self.SLits(cls, false), self.STrail());
 					}
 					debug_assert!(clsInd >= self.m_FirstLearntClsInd || !self.ClsGetIsLearnt(clsInd));
 				}
@@ -524,7 +524,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				debug_assert!(cls[0] == l || cls[1] == l);
 				if !(cls.find(cachedLit) != cls.size())
 				{
-					println!("***ASSERTION-FAILURE F- at {}\n{}", self.SLits(cls, false), self.STrail());
+					stdout_println!("***ASSERTION-FAILURE F- at {}\n{}", self.SLits(cls, false), self.STrail());
 				}
 				debug_assert!(cls.find(cachedLit) != cls.size());
 

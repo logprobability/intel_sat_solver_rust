@@ -130,7 +130,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 	pub(crate) fn P(&self, s: &str) -> bool
 	{
-		print!("{}", s);
+		stdout_print!("{}", s);
 		let _ = std::io::stdout().flush();
 		true
 	}
@@ -139,25 +139,25 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	{
 		if trv != TToporReturnVal::RET_SAT
 		{
-			println!("m_DebugModel = FAILED, since the return value is not SAT; it's {}", trv);
+			stdout_println!("m_DebugModel = FAILED, since the return value is not SAT; it's {}", trv);
 			return;
 		}
-		print!("m_DebugModel = {{false");
+		stdout_print!("m_DebugModel = {{false");
 
 		let mut v: TLit = 1;
 		while v <= self.m_Stat.m_MaxUserVar
 		{
 			let externalVal = self.GetValue(v);
 			debug_assert!(externalVal == TToporLitVal::VAL_SATISFIED || externalVal == TToporLitVal::VAL_UNSATISFIED);
-			print!(", {}", if externalVal == TToporLitVal::VAL_SATISFIED { "true" } else { "false" });
+			stdout_print!(", {}", if externalVal == TToporLitVal::VAL_SATISFIED { "true" } else { "false" });
 			if v % 100 == 0
 			{
-				print!("\n");
+				stdout_print!("\n");
 			}
 			v += 1;
 		}
 
-		print!("}};\n");
+		stdout_print!("}};\n");
 	}
 
 	// Assumed to be invoked when the trail and the clauses are expected to be consistent with debug-model, that is:
@@ -213,7 +213,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			debug_assert!(self.IsSatisfied(l) == (expectedVal != 0) || self.P(&("\t".to_string() + &self.SLit(GetLit(v, false)) + "\n")));
 			if self.IsSatisfied(l) != (expectedVal != 0)
 			{
-				print!("VerifyDebugModel ERROR in verifying the trail at literal {}. Exiting...\n", SInternalLitData(self, l));
+				stdout_print!("VerifyDebugModel ERROR in verifying the trail at literal {}. Exiting...\n", SInternalLitData(self, l));
 				std::process::exit(-1);
 			}
 			v = self.m_VarInfo[v as usize].m_TrailNext;
@@ -240,8 +240,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 					debug_assert!(expectedValSecondLit != 0 || self.P(&("\t".to_string() + &self.SLit(l) + " " + &self.SLit(secondLit) + "\n")));
 					if expectedValSecondLit == 0
 					{
-						println!("[l secondLit] = [{}, {}]", SInternalLitData(self, l), SInternalLitData(self, secondLit));
-						print!("VerifyDebugModel ERROR in verifying a binary clause! Exiting...\n");
+						stdout_println!("[l secondLit] = [{}, {}]", SInternalLitData(self, l), SInternalLitData(self, secondLit));
+						stdout_print!("VerifyDebugModel ERROR in verifying a binary clause! Exiting...\n");
 						std::process::exit(-1);
 					}
 				}
@@ -276,14 +276,14 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			{
 				for l in cls
 				{
-					print!("{}, ", SInternalLitData(self, l));
+					stdout_print!("{}, ", SInternalLitData(self, l));
 				}
-				print!("\nVerifyDebugModel ERROR in verifying a long clause! Exiting...\n");
+				stdout_print!("\nVerifyDebugModel ERROR in verifying a long clause! Exiting...\n");
 				std::process::exit(-1);
 			}
 			clsInd = self.ClsLoopNext();
 		}
 
-		print!("VerifyDebugModel VERIFIED!\n");
+		stdout_print!("VerifyDebugModel VERIFIED!\n");
 	}
 }
