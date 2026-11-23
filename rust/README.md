@@ -28,6 +28,9 @@ The library is used through `intel_sat_solver::topor::CTopor<Ind, Compress>`, wh
   injection and a delta-debugger: `cargo test fuzz_delta_debug -- --ignored --nocapture`) and the libFuzzer targets in `fuzz/` (`cargo +nightly fuzz run api`).
 * `scripts/diff_vs_cpp.sh` builds a reference copy of the C++ solver and compares the complete outputs and the text DRAT proofs (that is, every learnt clause, in order)
   of the two solvers on `../regression_instances` (and on any extra directory of instances) in all the three solver modes.
+  The `planner_*.cnf` instances there are solver calls of the satdb join planner, recorded with `TOPOR_DUMP_NAME`: they cover conflict thresholds (`oc`, short and normal
+  incremental queries, a threshold just below the maximal `uint64_t`), polarity hints (`lf`) and unsatisfiable cores, which the other instances don't use.
+  (The C++ scripts in `../scripts` only run the `ddtbug*` and `regr*` instances.)
 
 ## Coverage
 
