@@ -12,36 +12,39 @@
 // The fork ports every member the C++ solver defines, including the ones the C++ solver never calls
 #![allow(dead_code)]
 
-pub mod basic_memory_usage;
+// The public API: CTopor (and the types it uses), IPASIR, and the C++ library helpers the command-line tool uses
 pub mod color_print;
 pub mod std_string;
-pub mod time_measure;
-pub mod topi;
-pub mod topi_asg;
-pub mod topi_backtrack;
-pub mod topi_bcp;
-pub mod topi_bit_compression;
-pub mod topi_compression;
-pub mod topi_conflict_analysis;
-pub mod topi_debug_printing;
-pub mod topi_decision;
-pub mod topi_inprocess;
-pub mod topi_main;
-pub mod topi_params;
-pub mod topi_restart;
-pub mod topi_statistics;
-pub mod topi_types;
-pub mod topi_var_scores;
-pub mod topi_wl;
 pub mod topor;
-pub mod topor_bit_array;
-pub mod topor_bit_array_buffer;
-pub mod topor_dyn_array;
 pub mod topor_external_types;
 pub mod topor_ipasir;
-pub mod topor_table_bit_info;
-pub mod topor_vector;
-pub mod topor_win_average;
+
+// The solver internals: their raw views (Span, CCls, CBitArray, ...) are as unchecked as their C++ counterparts, so they are not exposed to safe code outside the crate
+pub(crate) mod basic_memory_usage;
+pub(crate) mod time_measure;
+pub(crate) mod topi;
+pub(crate) mod topi_asg;
+pub(crate) mod topi_backtrack;
+pub(crate) mod topi_bcp;
+pub(crate) mod topi_bit_compression;
+pub(crate) mod topi_compression;
+pub(crate) mod topi_conflict_analysis;
+pub(crate) mod topi_debug_printing;
+pub(crate) mod topi_decision;
+pub(crate) mod topi_inprocess;
+pub(crate) mod topi_main;
+pub(crate) mod topi_params;
+pub(crate) mod topi_restart;
+pub(crate) mod topi_statistics;
+pub(crate) mod topi_types;
+pub(crate) mod topi_var_scores;
+pub(crate) mod topi_wl;
+pub(crate) mod topor_bit_array;
+pub(crate) mod topor_bit_array_buffer;
+pub(crate) mod topor_dyn_array;
+pub(crate) mod topor_table_bit_info;
+pub(crate) mod topor_vector;
+pub(crate) mod topor_win_average;
 
 pub use topor::CTopor;
 pub use topor_external_types::*;
