@@ -15,6 +15,8 @@
 //! * `or` is the union of its branches' solutions, projected on its join variables (the variables of its branches, which must all use
 //!   the same ones, or the list of `or-join`); the branches' other variables are their own. An `or` whose every branch binds every join
 //!   variable by itself is a *binder*, like a pattern; any other `or` is a *filter*, which needs its join variables bound, like a `not`.
+//! * A rule call `(name arg ...)` matches the tuples of a rule (see the `rules` module) and binds its variables, like a pattern;
+//!   the planner estimates it from the rule's relation, which is evaluated when the call is added.
 //!
 //! The SAT planner doesn't look inside `not` and `or`: to it, a filter is a clause that needs its join variables (like a predicate,
 //! so it is pending until they have binders), and a binder is a clause that binds them, at a cost estimated from its branches.
@@ -38,6 +40,7 @@
 
 use crate::db::{AttrId, AttrStats, Cardinality, Db, Eid, Error, Value, ValueType};
 use crate::planner::{fanout_of_weight, greedy_order, monotone, weight_of_fanout, ClauseShape, Plan, Planner, VarId};
+use crate::rules::{Ctx, Rels, Rule};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The conflict budget of the refinement that follows every added clause
@@ -157,6 +160,11 @@ pub enum Clause
 	{
 		join: Vec<VarId>, branches: Vec<Vec<Clause>>
 	},
+	/// A call of the query's rule number `rule` (see `Query::rule`): the rule's derived tuples matching the arguments; built by `Query::call_clause`
+	Rule
+	{
+		rule: usize, args: Vec<Term>
+	},
 }
 
 impl Clause
@@ -174,6 +182,7 @@ impl Clause
 			Clause::Pattern { e, v, tx, added, .. } => out.extend([Some(e), Some(v), tx.as_ref(), added.as_ref()].into_iter().flatten().filter_map(var_of)),
 			Clause::Pred { l, r, .. } => out.extend([l, r].into_iter().filter_map(var_of)),
 			Clause::Not { join, .. } | Clause::Or { join, .. } => out.extend(join),
+			Clause::Rule { args, .. } => out.extend(args.iter().filter_map(var_of)),
 		}
 	}
 
@@ -194,7 +203,7 @@ impl Clause
 	{
 		match self
 		{
-			Clause::Pattern { .. } =>
+			Clause::Pattern { .. } | Clause::Rule { .. } =>
 			{
 				let mut vs = BTreeSet::new();
 				self.free_vars(&mut vs);
@@ -212,20 +221,20 @@ impl Clause
 }
 
 // The variables that the clauses of a body bind
-fn body_binds(body: &[Clause]) -> BTreeSet<VarId>
+pub(crate) fn body_binds(body: &[Clause]) -> BTreeSet<VarId>
 {
 	body.iter().flat_map(|c| c.needs_binds().1).collect()
 }
 
 // A variable that a clause of the body needs, but that neither `pre` nor the body binds
-fn unbound_need(body: &[Clause], pre: &BTreeSet<VarId>) -> Option<VarId>
+pub(crate) fn unbound_need(body: &[Clause], pre: &BTreeSet<VarId>) -> Option<VarId>
 {
 	let binds = body_binds(body);
 	body.iter().flat_map(|c| c.needs_binds().0).find(|x| !pre.contains(x) && !binds.contains(x))
 }
 
 /// The planner's weights of a pattern, from the attribute's statistics: the fanout is the number of datoms matching per input row
-fn pattern_weights(s: AttrStats) -> [u32; 4]
+pub(crate) fn pattern_weights(s: AttrStats) -> [u32; 4]
 {
 	let d = s.datoms as f64;
 	let (e, v) = (s.entities.max(1) as f64, s.values.max(1) as f64);
@@ -302,7 +311,7 @@ pub enum Find
 }
 
 /// A clause of a run, with the bodies of `not` and `or` ordered for the variables bound where they run
-enum Step<'a>
+pub(crate) enum Step<'a>
 {
 	/// A pattern or a predicate
 	Clause(&'a Clause),
@@ -314,21 +323,31 @@ enum Step<'a>
 	{
 		join: &'a [VarId], branches: Vec<Vec<Step<'a>>>
 	},
+	/// A rule call, reading the rule's relation, or its latest new tuples (`delta`, in a semi-naive round)
+	Rule
+	{
+		rule: usize, delta: bool, args: &'a [Term]
+	},
 }
 
 pub struct Query
 {
-	db: Db,
-	vars: Vec<String>,
+	pub(crate) db: Db,
+	pub(crate) vars: Vec<String>,
 	clauses: Vec<Clause>,
 	planner: Planner,
+	/// The rules (see the `rules` module), by id, and their relations once evaluated
+	pub(crate) rules: Vec<Rule>,
+	pub(crate) rels: Rels,
+	/// Whether a clause of the query calls a rule (the rules are fixed from then on)
+	pub(crate) rules_used: bool,
 }
 
 impl Db
 {
 	pub fn query(&self) -> Query
 	{
-		Query { db: self.clone(), vars: Vec::new(), clauses: Vec::new(), planner: Planner::new() }
+		Query { db: self.clone(), vars: Vec::new(), clauses: Vec::new(), planner: Planner::new(), rules: Vec::new(), rels: Rels::default(), rules_used: false }
 	}
 }
 
@@ -462,8 +481,8 @@ impl Query
 	}
 
 	// Validate a clause, its bodies included: its variables are this query's, its patterns are well-typed, its bodies aren't empty,
-	// and a body's needs are bound by its join variables or its own clauses
-	fn check(&self, c: &Clause) -> Result<(), Error>
+	// a body's needs are bound by its join variables or its own clauses, and its rule calls have their rules' arities
+	pub(crate) fn check(&self, c: &Clause) -> Result<(), Error>
 	{
 		let mut vs = BTreeSet::new();
 		c.all_vars(&mut vs);
@@ -495,6 +514,12 @@ impl Query
 				Ok(())
 			}
 			Clause::Pred { .. } => Ok(()),
+			Clause::Rule { rule, args } => match self.rules.get(*rule)
+			{
+				Some(r) if r.arity == args.len() => Ok(()),
+				Some(r) => Err(Error::InvalidQuery(format!("the rule {} takes {} arguments, got {}", r.name, r.arity, args.len()))),
+				None => Err(Error::InvalidQuery(format!("rule #{rule} belongs to another query"))),
+			},
 			Clause::Not { join, body } => self.check_body(body, join, "not"),
 			Clause::Or { branches, .. } =>
 			{
@@ -527,15 +552,21 @@ impl Query
 	pub fn add_clause(&mut self, c: Clause) -> Result<usize, Error>
 	{
 		self.check(&c)?;
-		let shape = self.shape(&c, &vec![false; self.vars.len()]);
+		// The rules it calls are evaluated now, so that the planner estimates the calls with their relations' sizes
+		let mut rels = std::mem::take(&mut self.rels);
+		let calls = self.materialize(&c, &mut rels);
+		self.rels = rels;
+		self.rules_used |= calls?;
+		let shape = self.shape(&c, &vec![false; self.vars.len()], &Ctx { rels: &self.rels, delta: None });
 		self.clauses.push(c);
 		self.planner.add_clause(shape, self.vars.len());
 		self.planner.refine(ONLINE_BUDGET);
 		Ok(self.clauses.len() - 1)
 	}
 
-	// The planner's view of a clause, with the variables of `pre` bound beforehand (they count as constants)
-	fn shape(&self, c: &Clause, pre: &[bool]) -> ClauseShape
+	// The planner's view of a clause, with the variables of `pre` bound beforehand (they count as constants);
+	// a rule call is estimated from the relation that `ctx` gives it
+	pub(crate) fn shape(&self, c: &Clause, pre: &[bool], ctx: &Ctx) -> ClauseShape
 	{
 		let free = |vs: Vec<VarId>| -> Vec<VarId> { vs.into_iter().filter(|&x| !pre[x]).collect() };
 		let (needs, binds) = c.needs_binds();
@@ -547,6 +578,12 @@ impl Query
 				// The tx and added positions bind their variables, but the cost model only distinguishes the entity and value positions
 				let slot = |t: &Term| var_of(t).filter(|&x| !pre[x]);
 				ClauseShape { slots: [slot(e), slot(v)], needs, binds, weights: pattern_weights(self.db.stats(*a)) }
+			}
+			Clause::Rule { args, .. } =>
+			{
+				// Like a pattern whose entity and value positions are the first two arguments
+				let slot = |i: usize| args.get(i).and_then(var_of).filter(|&x| !pre[x]);
+				ClauseShape { slots: [slot(0), slot(1)], needs, binds, weights: pattern_weights(ctx.relation(c).stats()) }
 			}
 			Clause::Pred { op, .. } => ClauseShape { slots: [None, None], needs, binds, weights: [weight_of_fanout(op.selectivity()); 4] },
 			Clause::Not { .. } => ClauseShape { slots: [None, None], needs, binds, weights: [weight_of_fanout(NOT_SELECTIVITY); 4] },
@@ -561,7 +598,7 @@ impl Query
 				let mut rows = 0.0;
 				for b in branches
 				{
-					let shapes: Vec<ClauseShape> = b.iter().map(|c| self.shape(c, &inner)).collect();
+					let shapes: Vec<ClauseShape> = b.iter().map(|c| self.shape(c, &inner, ctx)).collect();
 					let mut bound = vec![false; pre.len()];
 					let mut log2 = 0.0;
 					for k in greedy_order(&shapes, pre.len())
@@ -667,9 +704,9 @@ impl Query
 		{
 			return Err(Error::Unbound(self.vars[x].clone()));
 		}
-		let steps = self.compile(&self.clauses, order, &mut vec![false; n])?;
+		let steps = self.compile(&self.clauses, order, &mut vec![false; n], &Ctx { rels: &self.rels, delta: None })?;
 		let mut out = BTreeSet::new();
-		self.exec(&steps, &mut vec![None; n], &mut |env| {
+		self.exec(&steps, &mut vec![None; n], &self.rels, &mut |env| {
 			out.insert(find.iter().map(|t| Self::eval(t, env).expect("the find variables are bound by the clauses")).collect());
 			true
 		});
@@ -677,8 +714,8 @@ impl Query
 	}
 
 	// The steps of running `clauses` in `order`, from the variables of `bound` (which it updates); a clause whose needs aren't bound
-	// where it runs is an error
-	fn compile<'a>(&'a self, clauses: &'a [Clause], order: &[usize], bound: &mut [bool]) -> Result<Vec<Step<'a>>, Error>
+	// where it runs is an error. The rule call `ctx.delta` reads its rule's delta
+	pub(crate) fn compile<'a>(&'a self, clauses: &'a [Clause], order: &[usize], bound: &mut [bool], ctx: &Ctx) -> Result<Vec<Step<'a>>, Error>
 	{
 		let mut steps = Vec::with_capacity(order.len());
 		for &c in order
@@ -701,11 +738,12 @@ impl Query
 			steps.push(match clause
 			{
 				Clause::Pattern { .. } | Clause::Pred { .. } => Step::Clause(clause),
-				Clause::Not { join, body } => Step::Not { join, body: self.compile_body(body, inner(join))? },
+				Clause::Rule { rule, args } => Step::Rule { rule: *rule, delta: ctx.is_delta(clause), args },
+				Clause::Not { join, body } => Step::Not { join, body: self.compile_body(body, inner(join), ctx, BODY_BUDGET)? },
 				Clause::Or { join, branches } =>
 				{
 					let pre = inner(join);
-					Step::Or { join, branches: branches.iter().map(|b| self.compile_body(b, pre.clone())).collect::<Result<_, _>>()? }
+					Step::Or { join, branches: branches.iter().map(|b| self.compile_body(b, pre.clone(), ctx, BODY_BUDGET)).collect::<Result<_, _>>()? }
 				}
 			});
 			for x in binds
@@ -716,16 +754,16 @@ impl Query
 		Ok(steps)
 	}
 
-	// Plan a body with the variables of `bound` as constants (with the SAT planner, within a budget), and compile it
-	fn compile_body<'a>(&'a self, body: &'a [Clause], mut bound: Vec<bool>) -> Result<Vec<Step<'a>>, Error>
+	// Plan a body with the variables of `bound` as constants (with the SAT planner, within `budget` conflicts), and compile it
+	pub(crate) fn compile_body<'a>(&'a self, body: &'a [Clause], mut bound: Vec<bool>, ctx: &Ctx, budget: u64) -> Result<Vec<Step<'a>>, Error>
 	{
 		let mut planner = Planner::new();
 		for c in body
 		{
-			planner.add_clause(self.shape(c, &bound), bound.len());
+			planner.add_clause(self.shape(c, &bound, ctx), bound.len());
 		}
-		let order = planner.refine(BODY_BUDGET).order.clone();
-		self.compile(body, &order, &mut bound)
+		let order = planner.refine(budget).order.clone();
+		self.compile(body, &order, &mut bound, ctx)
 	}
 
 	fn eval(t: &Term, env: &[Option<Value>]) -> Option<Value>
@@ -767,8 +805,9 @@ impl Query
 		inner
 	}
 
-	// Run the steps from `env`, calling `emit` on every solution; stops as soon as `emit` returns false, and returns false then
-	fn exec(&self, steps: &[Step], env: &mut Vec<Option<Value>>, emit: &mut dyn FnMut(&[Option<Value>]) -> bool) -> bool
+	// Run the steps from `env`, calling `emit` on every solution; stops as soon as `emit` returns false, and returns false then.
+	// Rule calls read the relations of `rels`
+	pub(crate) fn exec(&self, steps: &[Step], env: &mut Vec<Option<Value>>, rels: &Rels, emit: &mut dyn FnMut(&[Option<Value>]) -> bool) -> bool
 	{
 		let Some((step, rest)) = steps.split_first()
 		else
@@ -795,7 +834,7 @@ impl Query
 						&& Self::unify(v, d.v, env, &mut newly)
 						&& tx.as_ref().map_or(true, |t| Self::unify(t, Value::Ref(d.tx), env, &mut newly))
 						&& added.as_ref().map_or(true, |t| Self::unify(t, Value::Bool(d.added), env, &mut newly));
-					let go = !ok || self.exec(rest, env, emit);
+					let go = !ok || self.exec(rest, env, rels, emit);
 					for x in newly
 					{
 						env[x] = None;
@@ -807,18 +846,34 @@ impl Query
 				}
 				true
 			}
+			Step::Rule { rule, delta, args } =>
+			{
+				// The relation's rows matching the bound arguments (through an index on their positions)
+				let rel = if *delta { &rels.delta[*rule] } else { &rels.full[*rule] };
+				let bound: Vec<Option<Value>> = args.iter().map(|t| Self::eval(t, env)).collect();
+				rel.scan(&bound, &mut |row| {
+					let mut newly = Vec::new();
+					let ok = args.iter().zip(row).all(|(t, v)| Self::unify(t, v.clone(), env, &mut newly));
+					let go = !ok || self.exec(rest, env, rels, emit);
+					for x in newly
+					{
+						env[x] = None;
+					}
+					go
+				})
+			}
 			Step::Clause(Clause::Pred { op, l, r }) =>
 			{
 				let lv = Self::eval(l, env).expect("compile checked that the predicate's variables are bound");
 				let rv = Self::eval(r, env).expect("compile checked that the predicate's variables are bound");
-				!op.holds(&lv, &rv) || self.exec(rest, env, emit)
+				!op.holds(&lv, &rv) || self.exec(rest, env, rels, emit)
 			}
 			Step::Clause(_) => unreachable!("compile turns not and or into their own steps"),
 			Step::Not { join, body } =>
 			{
 				// The body has a solution exactly when its run stops at the first one
-				let found = !self.exec(body, &mut Self::inner_env(env, join), &mut |_| false);
-				found || self.exec(rest, env, emit)
+				let found = !self.exec(body, &mut Self::inner_env(env, join), rels, &mut |_| false);
+				found || self.exec(rest, env, rels, emit)
 			}
 			Step::Or { join, branches } =>
 			{
@@ -827,7 +882,7 @@ impl Query
 				let mut tuples = BTreeSet::new();
 				for b in branches
 				{
-					self.exec(b, &mut Self::inner_env(env, join), &mut |inner| {
+					self.exec(b, &mut Self::inner_env(env, join), rels, &mut |inner| {
 						tuples.insert(join.iter().map(|&x| inner[x].clone().expect("every branch binds the join variables that aren't bound")).collect::<Vec<_>>());
 						!decided
 					});
@@ -844,7 +899,7 @@ impl Query
 						let ok = Self::unify(&Term::Var(x), val, env, &mut newly);
 						debug_assert!(ok, "a branch keeps the join variables' values");
 					}
-					let go = self.exec(rest, env, emit);
+					let go = self.exec(rest, env, rels, emit);
 					for x in newly
 					{
 						env[x] = None;
@@ -1053,7 +1108,7 @@ impl Db
 }
 
 #[cfg(test)]
-mod tests
+pub(crate) mod tests
 {
 	use super::*;
 	use crate::db::{Cardinality, Conn, Entity, Tx};
@@ -1204,7 +1259,7 @@ mod tests
 		got
 	}
 
-	fn sorted(rows: impl IntoIterator<Item = Vec<Value>>) -> Vec<Vec<Value>>
+	pub(crate) fn sorted(rows: impl IntoIterator<Item = Vec<Value>>) -> Vec<Vec<Value>>
 	{
 		rows.into_iter().collect::<BTreeSet<_>>().into_iter().collect()
 	}
@@ -1295,17 +1350,20 @@ mod tests
 		assert!(db.history().stats(tag_a).datoms > db.stats(tag_a).datoms);
 	}
 
-	type Row = BTreeMap<VarId, Value>;
+	pub(crate) type Row = BTreeMap<VarId, Value>;
 
-	// The reference semantics, bottom-up over a set of (e, a, v) facts: a body is the natural join of its binders' relations
-	// (patterns and binding ors) with the seed, then filtered by its predicates, nots and filtering ors
-	fn naive_body(facts: &BTreeSet<(Eid, AttrId, Value)>, body: &[Clause], seed: BTreeSet<Row>) -> BTreeSet<Row>
+	/// The tuples of each rule, by rule id (empty when the clauses call no rule)
+	pub(crate) type Derived = [BTreeSet<Vec<Value>>];
+
+	// The reference semantics, bottom-up over a set of (e, a, v) facts and the tuples of the rules: a body is the natural join of its binders'
+	// relations (patterns, rule calls and binding ors) with the seed, then filtered by its predicates, nots and filtering ors
+	pub(crate) fn naive_body(facts: &BTreeSet<(Eid, AttrId, Value)>, derived: &Derived, body: &[Clause], seed: BTreeSet<Row>) -> BTreeSet<Row>
 	{
 		let mut cur = seed;
-		let binder = |c: &&Clause| matches!(c, Clause::Pattern { .. } | Clause::Or { .. }) && c.needs_binds().0.is_empty();
+		let binder = |c: &&Clause| matches!(c, Clause::Pattern { .. } | Clause::Or { .. } | Clause::Rule { .. }) && c.needs_binds().0.is_empty();
 		for c in body.iter().filter(binder)
 		{
-			let rel = naive_rel(facts, c);
+			let rel = naive_rel(facts, derived, c);
 			let mut next = BTreeSet::new();
 			for a in &cur
 			{
@@ -1333,52 +1391,51 @@ mod tests
 					};
 					op.holds(&ev(l), &ev(r))
 				}
-				Clause::Not { join, body } => naive_body(facts, body, project(row, join)).is_empty(),
-				Clause::Or { join, branches } => branches.iter().any(|b| !naive_body(facts, b, project(row, join)).is_empty()),
-				Clause::Pattern { .. } => unreachable!(),
+				Clause::Not { join, body } => naive_body(facts, derived, body, project(row, join)).is_empty(),
+				Clause::Or { join, branches } => branches.iter().any(|b| !naive_body(facts, derived, b, project(row, join)).is_empty()),
+				Clause::Pattern { .. } | Clause::Rule { .. } => unreachable!(),
 			});
 		}
 		cur
 	}
 
+	// The row binding the terms to the values, if they match
+	fn naive_match<'t>(pairs: impl IntoIterator<Item = (&'t Term, Value)>) -> Option<Row>
+	{
+		let mut row = Row::new();
+		for (t, val) in pairs
+		{
+			let ok = match t
+			{
+				Term::Val(c) => *c == val,
+				Term::Var(x) => row.insert(*x, val.clone()).map_or(true, |old| old == val),
+			};
+			if !ok
+			{
+				return None;
+			}
+		}
+		Some(row)
+	}
+
 	// The relation of a binder over its variables
-	fn naive_rel(facts: &BTreeSet<(Eid, AttrId, Value)>, c: &Clause) -> BTreeSet<Row>
+	fn naive_rel(facts: &BTreeSet<(Eid, AttrId, Value)>, derived: &Derived, c: &Clause) -> BTreeSet<Row>
 	{
 		match c
 		{
-			Clause::Pattern { e, a, v, tx: None, added: None } =>
-			{
-				let mut out = BTreeSet::new();
-				for (fe, _, fv) in facts.iter().filter(|f| f.1 == *a)
-				{
-					let mut row = Row::new();
-					let mut ok = true;
-					for (t, val) in [(e, Value::Ref(*fe)), (v, fv.clone())]
-					{
-						match t
-						{
-							Term::Val(c) => ok &= *c == val,
-							Term::Var(x) => ok &= row.insert(*x, val.clone()).map_or(true, |old| old == val),
-						}
-					}
-					if ok
-					{
-						out.insert(row);
-					}
-				}
-				out
-			}
+			Clause::Pattern { e, a, v, tx: None, added: None } => facts.iter().filter(|f| f.1 == *a).filter_map(|(fe, _, fv)| naive_match([(e, Value::Ref(*fe)), (v, fv.clone())])).collect(),
+			Clause::Rule { rule, args } => derived[*rule].iter().filter_map(|t| naive_match(args.iter().zip(t.iter().cloned()))).collect(),
 			Clause::Or { join, branches } => branches
 				.iter()
-				.flat_map(|b| naive_body(facts, b, [Row::new()].into()))
+				.flat_map(|b| naive_body(facts, derived, b, [Row::new()].into()))
 				.map(|row| join.iter().map(|x| (*x, row[x].clone())).collect())
 				.collect(),
-			_ => unreachable!("a binder is a pattern (without tx and added) or a binding or"),
+			_ => unreachable!("a binder is a pattern (without tx and added), a rule call or a binding or"),
 		}
 	}
 
 	// A random clause over the attributes of `random_conn`, with entity variables ?a ?b ?c, Int variables ?x ?y and the tag variable ?t
-	fn random_clause(q: &mut Query, rng: &mut Rng, depth: u32, ids: &[Eid], pattern_only: bool) -> Option<Clause>
+	pub(crate) fn random_clause(q: &mut Query, rng: &mut Rng, depth: u32, ids: &[Eid], pattern_only: bool) -> Option<Clause>
 	{
 		let pick = |q: &mut Query, names: &[&str], rng: &mut Rng| q.var(names[(rng.next() % names.len() as u64) as usize]);
 		let kind = if pattern_only || depth == 0 && rng.next() % 4 != 0 { 0 } else { rng.next() % if depth == 0 { 2 } else { 6 } };
@@ -1480,7 +1537,7 @@ mod tests
 			{
 				continue;
 			};
-			let want = sorted(naive_body(&facts, &clauses, [Row::new()].into()).iter().map(|row| find.iter().map(|x| row[x].clone()).collect()));
+			let want = sorted(naive_body(&facts, &[], &clauses, [Row::new()].into()).iter().map(|row| find.iter().map(|x| row[x].clone()).collect()));
 			assert_eq!(got, want, "clauses {clauses:?}");
 			let mut valid = 0;
 			for order in permutations(clauses.len())

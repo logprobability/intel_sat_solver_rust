@@ -28,7 +28,7 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
 * **Persistent indexes** (`src/pmap.rs`). A treap with `Arc`-shared nodes and hash-of-key priorities: an update copies one root-to-leaf path,
   and the tree's shape depends on its key set only.
 * **Queries** (`src/query.rs`). Datalog-style queries over any view: patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`),
-  comparison predicates, `not`/`not-join` and `or`/`or-join` (nested to any depth), run as nested loops, each pattern using the index selected by its bound positions.
+  comparison predicates, `not`/`not-join` and `or`/`or-join` (nested to any depth) and rule calls (see Rules), run as nested loops, each pattern using the index selected by its bound positions.
   * `not` keeps the rows for which its body has no solution; its join variables (all of its body's, or the `not-join` list) must be bound when it runs,
     and the body's other variables are its own. `or` is the union of its branches on its join variables (the branches' variables, which must be
     the same in every branch, or the `or-join` list). An `or` whose every branch binds every join variable by itself *binds* them, like a pattern;
@@ -43,6 +43,19 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   as it is read): `[:find ?a (count ?b) :with ?c :in $ ?x :where [?e :attr ?v] [(> ?v ?x)] (not ...) (or-join [?e] ... (and ...))]`, with `_`,
   2- to 5-element patterns, lookup refs `[:attr value]`, string, integer and boolean constants, and scalar inputs, which become constants of the query.
   Syntax errors carry their line and column; keywords only name attributes (there is no keyword value type).
+  `Db::q_rules(text, rules, inputs)` takes a rule set as `%`, written as in Datomic: `[[(reach ?a ?b) [?a :edge ?b]] [(reach ?a ?b) [?a :edge ?c] (reach ?c ?b)]]`.
+* **Rules** (`src/rules.rs`). `Query::rule(name, head, body)` defines a rule (several definitions are a union) and `Query::call`/`call_clause`
+  calls one, from the query, a `not`, an `or` or another rule's body; recursion and mutual recursion are allowed. To the planner a call is a binder,
+  like a pattern. When a clause calling rules is added, the rules it depends on are evaluated bottom-up, so the online planner estimates
+  the call with the relation's real size (and the rules are fixed from then on):
+  * strata: mutually recursive rules (the call graph's strongly connected components) are evaluated together, after the rules they call;
+    a rule that depends on itself through `not` has no stratification and is an error;
+  * semi-naive evaluation to a fixpoint: round 0 runs every definition with the stratum's relations empty, then each positive occurrence of
+    a call into the stratum (in an `or` branch too) gives a variant that reads only the previous round's new tuples there, until a round finds nothing new;
+  * each body (and each variant) is planned by the SAT planner once per stratum, with the relations' sizes after round 0, and the plans are reused
+    in every round (`Query::rule_stats` counts strata, rounds and plans);
+  * the relations keep a hash index per combination of bound argument positions that a call uses, extended as tuples arrive.
+  A rule's variables are its own (its body runs in an environment of its own), and every head variable must be bound by the body.
 * **The planner** (`src/planner.rs`). It chooses the join order with one incremental SAT solver per query, *while the query is being assembled*:
   every added clause extends the encoding (nothing is retracted) and is followed by a short, conflict-bounded refinement, so a good plan exists
   before the query is complete, and `run` finishes the optimization. The module documentation has the details; in short:
@@ -64,17 +77,24 @@ The crate depends on the solver by path (`../rust`), with the solver's profiles 
                             # transactions and retract_entity against naive reference models, the history and since views of
                             # every past value against the transactions' logs, history queries and pull against brute force,
                             # random queries with (nested) not and or in every clause order against a bottom-up relational
-                            # evaluator, aggregates against a hand grouping, and text queries against the builder
+                            # evaluator, aggregates against a hand grouping, text queries against the builder, transitive closure
+                            # (four formulations, random graphs with cycles) against Floyd-Warshall, mutual recursion against a
+                            # parity search, stratified negation, random rule programs against a naive simultaneous fixpoint,
+                            # and the plan count of semi-naive evaluation on a long chain
     cargo test --release
 
 ## Status and next steps
 
 This is a start. What is missing, roughly in order of value:
 
-* Query language: rules and recursion; `or-join` with required variables (`[[?a] ?b]`: a clause that both needs and binds, which the planner's
+* Rules: demand-driven evaluation (magic sets, or rules with required variables `(name [?a] ?b)`): today a rule's whole relation is derived,
+  whatever constants its calls have; rule sets shared between queries, and relations kept up to date across transactions instead of rederived
+  per query; a better estimate of a call (only its first two argument positions are modeled, and the variants are planned with round 0's sizes,
+  when the delta is the whole relation); aggregates in rule bodies.
+* Query language: `or-join` with required variables (`[[?a] ?b]`: a clause that both needs and binds, which the planner's
   encoding would have to support: a binder's boundness justified only when its own requirements hold, pending computed as a fixpoint, and the
   brute-force test extended to such clauses); attribute variables in patterns; function and binding expressions (`[(f ?x) ?y]`);
-  collection, tuple and relation inputs and `%` rules in `:in`; scalar/collection find specs (`.`, `...`) and pull in the find spec;
+  collection, tuple and relation inputs; scalar/collection find specs (`.`, `...`) and pull in the find spec;
   a floating-point value type (for a true `avg`, and `median`/`variance`). The cost model doesn't see inside `not` and `or`
   (a `not` has a fixed selectivity, a binding `or` the cost of its branches with nothing bound).
 * Time: `as_of` on a `Db` (today `Conn` keeps every past value; the history indexes would allow a filter instead) and by transaction

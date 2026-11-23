@@ -3,7 +3,7 @@
 //! ```text
 //! [:find ?name (count ?f)
 //!  :with ?x
-//!  :in $ ?city
+//!  :in $ % ?city
 //!  :where [?p :person/city ?city]
 //!         [?p :person/name ?name]
 //!         [?p :person/follows ?f]
@@ -11,13 +11,23 @@
 //!         (not [?f :person/city ?city])
 //!         (not-join [?p] [?p :person/banned true])
 //!         (or [?f :person/age 40] (and [?f :person/vip true] [?f :person/age 41]))
-//!         (or-join [?p] [?p :person/admin true] [?x :person/boss ?p])]
+//!         (or-join [?p] [?p :person/admin true] [?x :person/boss ?p])
+//!         (follows* ?p ?f)]
+//!
+//! ; the rules (%)
+//! [[(follows* ?a ?b) [?a :person/follows ?b]]
+//!  [(follows* ?a ?b) [?a :person/follows ?c] (follows* ?c ?b)]]
 //! ```
 //! * The sections `:find`, `:with`, `:in` and `:where`, each at most once, in any order; `:find` is required.
 //! * `:find` takes variables and aggregates `(count ?x)`, `(count-distinct ?x)`, `(sum ?x)`, `(min ?x)`, `(max ?x)`, `(avg ?x)`
 //!   (see `Query::find`); `:with` takes variables.
-//! * `:in` takes `$` (the database; one at most, and it may be left out) and scalar inputs `?x`, which are bound to `inputs` in order
-//!   and become constants of the query (so the planner sees them as bound).
+//! * `:in` takes `$` (the database; one at most, and it may be left out), `%` (the rules, given as a text of their own to
+//!   `Db::q_rules`) and scalar inputs `?x`, which are bound to `inputs` in order and become constants of the query
+//!   (so the planner sees them as bound).
+//! * Rules are written as in Datomic, `[[(name ?a ?b) clause ...] ...]`: a head of distinct variables, then the body; definitions
+//!   with the same name are a union, and rules can call each other in any order. A call `(name arg ...)` is a clause, in the query
+//!   or in a rule, whose arguments are terms or lookup refs (see the `rules` module). Required variables (`(name [?a] ?b)`) are not supported.
+//!   The rules' variables are their own (an input named like one of them doesn't replace it), and their syntax errors say `in the rules`.
 //! * Patterns `[e :attr v tx added]` of 2 to 5 elements (missing positions are ignored); the attribute is a keyword constant.
 //!   `_` is a variable of its own at every occurrence. A lookup ref `[:attr value]` names an entity in the entity or value position.
 //! * Comparisons `[(op a b)]` with `=`, `!=` (or `not=`), `<`, `<=`, `>` and `>=`.
@@ -55,14 +65,31 @@ impl Db
 	/// Parse a text query (see the module documentation), with `inputs` bound to the scalar inputs of its `:in` section, in order
 	pub fn parse_query(&self, text: &str, inputs: &[Value]) -> Result<TextQuery, Error>
 	{
+		self.parse(text, None, inputs)
+	}
+
+	/// Parse a text query that takes the rule set `rules` (as `%` in its `:in` section; see the module documentation)
+	pub fn parse_query_rules(&self, text: &str, rules: &str, inputs: &[Value]) -> Result<TextQuery, Error>
+	{
+		self.parse(text, Some(rules), inputs)
+	}
+
+	fn parse(&self, text: &str, rules: Option<&str>, inputs: &[Value]) -> Result<TextQuery, Error>
+	{
 		let node = Reader { text, pos: 0 }.read_all()?;
-		Parser { text, q: self.query(), inputs: HashMap::new(), fresh: 0 }.query(node, inputs)
+		Parser { text, q: self.query(), inputs: HashMap::new(), fresh: 0, rule_names: HashMap::new() }.query(node, rules, inputs)
 	}
 
 	/// Parse and run a text query
 	pub fn q(&self, text: &str, inputs: &[Value]) -> Result<Vec<Vec<Value>>, Error>
 	{
 		self.parse_query(text, inputs)?.run()
+	}
+
+	/// Parse and run a text query that takes the rule set `rules`
+	pub fn q_rules(&self, text: &str, rules: &str, inputs: &[Value]) -> Result<Vec<Vec<Value>>, Error>
+	{
+		self.parse_query_rules(text, rules, inputs)?.run()
 	}
 }
 
@@ -284,16 +311,18 @@ struct Parser<'a>
 	inputs: HashMap<String, Value>,
 	/// The number of `_` read so far (each is a variable of its own)
 	fresh: usize,
+	/// The rules' names and arities
+	rule_names: HashMap<String, usize>,
 }
 
-impl Parser<'_>
+impl<'a> Parser<'a>
 {
 	fn err(&self, node: &Node, msg: impl Into<String>) -> Error
 	{
 		error_at(self.text, node.pos, msg)
 	}
 
-	fn query(mut self, node: Node, inputs: &[Value]) -> Result<TextQuery, Error>
+	fn query(mut self, node: Node, rules: Option<&'a str>, inputs: &[Value]) -> Result<TextQuery, Error>
 	{
 		let Form::Vector(items) = node.form
 		else
@@ -338,9 +367,10 @@ impl Parser<'_>
 		}
 
 		// The inputs first, as constants of the clauses
+		let mut scalars = Vec::new();
+		let mut takes_rules = false;
 		if let Some((_, _, names)) = input
 		{
-			let mut scalars = Vec::new();
 			let mut sources = 0;
 			for n in &names
 			{
@@ -362,21 +392,39 @@ impl Parser<'_>
 						}
 						scalars.push(s.clone());
 					}
-					Form::Symbol(s) if s == "%" => return Err(self.err(n, "rules are not supported")),
+					Form::Symbol(s) if s == "%" =>
+					{
+						if takes_rules
+						{
+							return Err(self.err(n, "only one rule set (%) is supported"));
+						}
+						if rules.is_none()
+						{
+							return Err(self.err(n, "the query takes rules (%), but none were given (see Db::q_rules)"));
+						}
+						takes_rules = true;
+					}
 					Form::Vector(_) => return Err(self.err(n, "collection, tuple and relation inputs are not supported (only scalars ?x)")),
-					_ => return Err(self.err(n, "an input is $ or a variable ?x")),
+					_ => return Err(self.err(n, "an input is $, % or a variable ?x")),
 				}
 			}
-			if scalars.len() != inputs.len()
-			{
-				return Err(Error::InvalidQuery(format!("the query takes {} inputs, got {}", scalars.len(), inputs.len())));
-			}
-			self.inputs = scalars.into_iter().zip(inputs.iter().cloned()).collect();
 		}
-		else if !inputs.is_empty()
+		if scalars.len() != inputs.len()
 		{
-			return Err(Error::InvalidQuery(format!("the query takes no inputs, got {}", inputs.len())));
+			return Err(Error::InvalidQuery(match scalars.len()
+			{
+				0 => format!("the query takes no inputs, got {}", inputs.len()),
+				n => format!("the query takes {n} inputs, got {}", inputs.len()),
+			}));
 		}
+		// The rules before the inputs are installed: a rule's variables are its own, even when an input has the same name
+		match rules
+		{
+			Some(r) if takes_rules => self.rules(r)?,
+			Some(_) => return Err(Error::InvalidQuery("rules were given, but the query's :in has no %".into())),
+			None => {}
+		}
+		self.inputs = scalars.into_iter().zip(inputs.iter().cloned()).collect();
 
 		for c in clauses.map(|s| s.2).unwrap_or_default()
 		{
@@ -498,7 +546,8 @@ impl Parser<'_>
 					}
 					"and" => Err(self.err(node, "and is only a branch of or")),
 					_ if self.op(head).is_some() => Err(self.err(node, format!("a predicate is written in a vector: [({head} ...)]"))),
-					_ => Err(self.err(&items[0], format!("unknown clause {head} (the clause lists are not, not-join, or and or-join)"))),
+					_ if self.rule_names.contains_key(head) => self.call(node, head, rest),
+					_ => Err(self.err(&items[0], format!("unknown clause {head} (the clause lists are not, not-join, or, or-join and calls of the rules given with %)"))),
 				}
 			}
 			_ => Err(self.err(node, "expected a clause: a pattern [...], a predicate [(...)], or a not or or list")),
@@ -605,6 +654,103 @@ impl Parser<'_>
 			}
 		}
 		Ok((join, &rest[1..]))
+	}
+
+	// A call (name arg ...) of a rule; the arguments are terms or lookup refs
+	fn call(&mut self, node: &Node, name: &str, args: &[Node]) -> Result<Clause, Error>
+	{
+		let arity = self.rule_names[name];
+		if args.len() != arity
+		{
+			return Err(self.err(node, format!("the rule {name} takes {arity} arguments, got {}", args.len())));
+		}
+		let args = args.iter().map(|a| self.entity_term(a)).collect::<Result<Vec<_>, _>>()?;
+		self.q.call_clause(name, &args)
+	}
+
+	// The rule set: [[(name ?a ...) clause ...] ...], read with its own positions (the messages say so)
+	fn rules(&mut self, rules: &'a str) -> Result<(), Error>
+	{
+		let text = std::mem::replace(&mut self.text, rules);
+		let r = self.read_rules();
+		self.text = text;
+		r.map_err(|e| match e
+		{
+			Error::Parse { line, col, msg } => Error::Parse { line, col, msg: format!("in the rules: {msg}") },
+			e => e,
+		})
+	}
+
+	fn read_rules(&mut self) -> Result<(), Error>
+	{
+		let node = Reader { text: self.text, pos: 0 }.read_all()?;
+		let Form::Vector(rules) = &node.form
+		else
+		{
+			return Err(self.err(&node, "the rules are a vector [[(name ?a ...) clause ...] ...]"));
+		};
+		// The heads first, so that the rules can call each other in any order
+		let mut defs: Vec<(String, Vec<String>, &[Node])> = Vec::new();
+		for r in rules
+		{
+			let (items, head) = match &r.form
+			{
+				Form::Vector(items) => match items.first()
+				{
+					Some(Node { form: Form::List(head), .. }) => (items, head),
+					_ => return Err(self.err(r, "a rule starts with its head (name ?a ...)")),
+				},
+				_ => return Err(self.err(r, "a rule is a vector [(name ?a ...) clause ...]")),
+			};
+			let name = match head.first()
+			{
+				Some(n @ Node { form: Form::Symbol(s), .. }) =>
+				{
+					let reserved = ["not", "not-join", "or", "or-join", "and", "_", "$", "%"].contains(&s.as_str()) || self.op(s).is_some() || s.starts_with('?');
+					if reserved
+					{
+						return Err(self.err(n, format!("{s} can't name a rule")));
+					}
+					s.clone()
+				}
+				Some(n) => return Err(self.err(n, "a rule's name is a symbol")),
+				None => return Err(self.err(&items[0], "a rule's head (name ?a ...) needs a name")),
+			};
+			let mut vars: Vec<String> = Vec::new();
+			for a in &head[1..]
+			{
+				match &a.form
+				{
+					Form::Symbol(s) if s.starts_with('?') =>
+					{
+						if vars.contains(s)
+						{
+							return Err(self.err(a, format!("the head of rule {name} has {s} twice")));
+						}
+						vars.push(s.clone());
+					}
+					Form::Vector(_) => return Err(self.err(a, "required variables ([?a] in a rule's head) are not supported")),
+					_ => return Err(self.err(a, "a rule's head has variables only")),
+				}
+			}
+			match self.rule_names.get(&name)
+			{
+				Some(&k) if k != vars.len() => return Err(self.err(&items[0], format!("the rule {name} takes {k} arguments in another definition, here {}", vars.len()))),
+				_ => self.rule_names.insert(name.clone(), vars.len()),
+			};
+			if items.len() == 1
+			{
+				return Err(self.err(r, format!("the rule {name} has no clauses")));
+			}
+			defs.push((name, vars, &items[1..]));
+		}
+		for (name, vars, body) in defs
+		{
+			let head: Vec<Term> = vars.iter().map(|v| self.q.var(v)).collect();
+			let body = self.body(body)?;
+			self.q.rule(&name, &head, body)?;
+		}
+		Ok(())
 	}
 
 	fn body(&mut self, forms: &[Node]) -> Result<Vec<Clause>, Error>
@@ -820,5 +966,125 @@ mod tests
 		// An input in a join list is a constant, which drops out of the list
 		let tq = db.parse_query("[:find ?e :in ?x :where [?e :n ?x] (not-join [?x] [?e :tag \"a\"])]", &[Value::Int(1)]).unwrap();
 		assert!(matches!(&tq.query.clauses()[1], Clause::Not { join, .. } if join.is_empty()));
+	}
+
+	const RULES: &str = r#"
+		; reachability over ref, and walks of odd and even length, which call each other
+		[[(reach ?x ?y) [?x :ref ?y]]
+		 [(reach ?x ?y) [?x :ref ?z] (reach ?z ?y)]
+		 [(odd ?x ?y) [?x :ref ?y]]
+		 [(even ?x ?y) [?x :ref ?z] (odd ?z ?y)]
+		 [(odd ?x ?y) [?x :ref ?z] (even ?z ?y)]]"#;
+
+	// Rules read into exactly the definitions and calls the builder makes, and give the same answers
+	#[test]
+	fn text_rules_match_the_builder()
+	{
+		// A ring of refs through the entities with an n, of even length (so the parity of a walk is that of the distance)
+		let (mut conn, _) = random_conn(71, 60);
+		let db = conn.db();
+		let ring: Vec<Eid> = db.attr_datoms(db.attr_id("n").unwrap()).map(|(e, _)| e).collect();
+		assert!(ring.len() % 2 == 0 && ring.len() >= 4);
+		let mut tx = crate::db::Tx::new();
+		for (i, &e) in ring.iter().enumerate()
+		{
+			tx.add(crate::db::Entity::Id(e), "ref", crate::db::Entity::Id(ring[(i + 1) % ring.len()]));
+		}
+		conn.transact(&tx).unwrap();
+		let db = conn.db();
+		// ?x is an input of the query and a variable of the rules, which are their own
+		let text = "[:find ?a ?b :in $ % ?x :where (reach ?a ?b) [?b :n ?x] (not (even ?a ?b))]";
+		let mut tq = db.parse_query_rules(text, RULES, &[Value::Int(2)]).unwrap();
+		let mut q = db.query();
+		let (x, y, z) = (q.var("?x"), q.var("?y"), q.var("?z"));
+		let edge = |q: &Query, a: &Term, b: &Term| q.pattern_clause(a.clone(), "ref", b.clone()).unwrap();
+		let defs = [("reach", None), ("reach", Some("reach")), ("odd", None), ("even", Some("odd")), ("odd", Some("even"))];
+		for (name, callee) in defs
+		{
+			let body = match callee
+			{
+				None => vec![edge(&q, &x, &y)],
+				Some(c) => vec![edge(&q, &x, &z), q.call_clause(c, &[z.clone(), y.clone()]).unwrap()],
+			};
+			q.rule(name, &[x.clone(), y.clone()], body).unwrap();
+		}
+		let (a, b) = (q.var("?a"), q.var("?b"));
+		q.call("reach", &[a.clone(), b.clone()]).unwrap();
+		q.pattern(b.clone(), "n", 2).unwrap();
+		let even = q.call_clause("even", &[a.clone(), b.clone()]).unwrap();
+		let not = q.not(None, vec![even]).unwrap();
+		q.add_clause(not).unwrap();
+		assert_eq!(tq.query.clauses(), q.clauses());
+		let got = tq.run().unwrap();
+		assert!(!got.is_empty());
+		assert_eq!(got, q.run(&[a.clone(), b.clone()]).unwrap());
+		assert_eq!(tq.query.rule_stats(), q.rule_stats());
+		assert_eq!(q.rule_stats().strata, 2);
+		// A call with a lookup ref, and an aggregate over a rule
+		let rows = db.q_rules("[:find ?x ?b :in $ % :where (reach ?x ?b)]", RULES, &[]).unwrap();
+		let holders: Vec<(Eid, Value)> = db.attr_datoms(db.attr_id("key").unwrap()).map(|(e, v)| (e, v.clone())).collect();
+		let (holder, Value::Int(k)) = holders.iter().find(|(e, _)| rows.iter().any(|r| r[0] == Value::Ref(*e))).cloned().unwrap() else { unreachable!() };
+		let want: Vec<Vec<Value>> = rows.iter().filter(|r| r[0] == Value::Ref(holder)).map(|r| vec![r[1].clone()]).collect();
+		assert_eq!(db.q_rules(&format!("[:find ?b :in $ % :where (reach [:key {k}] ?b)]"), RULES, &[]).unwrap(), want);
+		assert_eq!(db.q_rules("[:find (count ?b) :with ?a :in $ % :where (reach ?a ?b)]", RULES, &[]).unwrap(), vec![vec![Value::Int(rows.len() as i64)]]);
+	}
+
+	#[test]
+	fn rule_errors_have_positions()
+	{
+		let (conn, _) = random_conn(3, 5);
+		let db = conn.db();
+		// In the query
+		let query_error = |text: &str| match db.parse_query_rules(text, RULES, &[]).err()
+		{
+			Some(Error::Parse { line, col, .. }) => (line, col),
+			e => panic!("expected a parse error for {text}, got {e:?}"),
+		};
+		assert_eq!(query_error("[:find ?a :in $ % :where (nope ?a)]"), (1, 27));
+		assert_eq!(query_error("[:find ?a :in $ % :where\n (reach ?a)]"), (2, 2));
+		assert_eq!(query_error("[:find ?a :in $ % % :where (reach ?a ?a)]"), (1, 19));
+		assert_eq!(query_error("[:find ?a :in $ % :where (reach ?a [:key])]"), (1, 36));
+		// % without rules, and rules without %
+		let (line, col, msg) = parse_error(&db, "[:find ?a :in $ % :where (reach ?a ?a)]");
+		assert_eq!((line, col), (1, 17));
+		assert!(msg.contains("Db::q_rules"));
+		assert!(matches!(db.parse_query_rules("[:find ?a :where [?a :n 1]]", RULES, &[]), Err(Error::InvalidQuery(_))));
+		// Without % the rules' names are unknown clauses
+		assert_eq!(parse_error(&db, "[:find ?a :where (reach ?a ?a)]").1, 19);
+
+		// In the rules, with their own positions
+		let rule_error = |rules: &str| match db.parse_query_rules("[:find ?a :in $ % :where [?a :n 1]]", rules, &[]).err()
+		{
+			Some(Error::Parse { line, col, msg }) =>
+			{
+				assert!(msg.starts_with("in the rules: "), "{msg}");
+				(line, col)
+			}
+			e => panic!("expected a parse error for {rules}, got {e:?}"),
+		};
+		assert_eq!(rule_error("(foo)"), (1, 1));
+		assert_eq!(rule_error("[[(r ?x) [?x :n 1]]"), (1, 1));
+		assert_eq!(rule_error("[(r ?x) [?x :n 1]]"), (1, 2));
+		assert_eq!(rule_error("[[[?x :n 1]]]"), (1, 2));
+		assert_eq!(rule_error("[[() [?x :n 1]]]"), (1, 3));
+		assert_eq!(rule_error("[[(1 ?x) [?x :n 1]]]"), (1, 4));
+		assert_eq!(rule_error("[[(not ?x) [?x :n 1]]]"), (1, 4));
+		assert_eq!(rule_error("[[(< ?x) [?x :n 1]]]"), (1, 4));
+		assert_eq!(rule_error("[[(r [?x]) [?x :n 1]]]"), (1, 6));
+		assert_eq!(rule_error("[[(r ?x ?x) [?x :n 1]]]"), (1, 9));
+		assert_eq!(rule_error("[[(r 1) [?x :n 1]]]"), (1, 6));
+		assert_eq!(rule_error("[[(r ?x)]]"), (1, 2));
+		assert_eq!(rule_error("[[(r ?x) [?x :n 1]] [(r ?x ?y) [?x :ref ?y]]]"), (1, 22));
+		assert_eq!(rule_error("[[(r ?x) [?x :n 1]]\n [(s ?x) (r ?x ?x)]]"), (2, 10));
+		assert_eq!(rule_error("[[(r ?x) [?x :n 1]]\n [(s ?x) [?x :n :one]]]"), (2, 17));
+
+		// The builder's errors, without a position
+		let run = |rules: &str| db.q_rules("[:find ?a :in $ % :where (r ?a)]", rules, &[]).err();
+		assert_eq!(run("[[(r ?x) [?x :nope 1]]]"), Some(Error::UnknownAttr("nope".into())));
+		assert_eq!(run("[[(r ?x) [?x :n ?y] [(> ?z 1)]]]"), Some(Error::Unbound("?z".into())));
+		assert_eq!(run("[[(r ?x) [?y :n 1]]]"), Some(Error::Unbound("?x".into())));
+		assert!(matches!(run("[[(r ?x) [?x :n _] (not (r ?x))]]"), Some(Error::InvalidQuery(m)) if m.contains("stratification")));
+		// A rule's _ is a variable of its own, like the query's
+		assert!(run("[[(r ?x) [?x :n _] [_ :ref ?x]]]").is_none());
 	}
 }

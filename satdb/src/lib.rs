@@ -6,19 +6,21 @@
 //!   (every assertion and retraction, with its transaction), which the `history()` and `since(t)` views expose.
 //! * `query`: Datalog-style queries (patterns, comparison predicates, `not`/`not-join`, `or`/`or-join`, over any view), planned online while
 //!   they are assembled, with aggregates in the find spec; and `Db::pull`, which reads an entity as a tree.
-//! * `parse`: the text syntax of queries (a subset of Datomic's Datalog, in EDN), read into the query builder (`Db::q`).
+//! * `rules`: Datalog rules, recursive and mutually recursive ones included, evaluated bottom-up (stratified, semi-naive,
+//!   each body planned by the SAT planner once per stratum) when a query first calls them.
+//! * `parse`: the text syntax of queries (a subset of Datomic's Datalog, in EDN), read into the query builder (`Db::q`, `Db::q_rules`).
 //! * `planner`: the incremental SAT encoding of the join-order problem (see its documentation).
 //! * `pmap`: the persistent sorted map under the indexes.
 //!
 //! ```
-//! use satdb::{Cardinality, Cmp, Conn, Tx, Value, ValueType};
+//! use satdb::{Cardinality, Cmp, Conn, Entity, Tx, Value, ValueType};
 //!
 //! let mut conn = Conn::new();
 //! let mut tx = Tx::new();
 //! tx.define("person/name", ValueType::Str, Cardinality::One).define("person/age", ValueType::Int, Cardinality::One);
 //! let (alice, bob) = (tx.temp(), tx.temp());
 //! tx.add(alice, "person/name", "Alice").add(alice, "person/age", 30).add(bob, "person/name", "Bob").add(bob, "person/age", 50);
-//! conn.transact(&tx).unwrap();
+//! let first = conn.transact(&tx).unwrap();
 //!
 //! let mut q = conn.db().query();
 //! let (p, name, age) = (q.var("?p"), q.var("?name"), q.var("?age"));
@@ -31,6 +33,18 @@
 //! // The same query as text, with an input and an aggregate
 //! let text = "[:find (count ?p) :in $ ?min :where [?p :person/age ?age] [(> ?age ?min)] (not [?p :person/name \"Carol\"])]";
 //! assert_eq!(conn.db().q(text, &[Value::from(20)]).unwrap(), vec![vec![Value::from(2)]]);
+//!
+//! // A recursive rule: everyone above Alice in a chain of bosses
+//! let (alice, bob) = (Entity::Id(first.eid(alice)), Entity::Id(first.eid(bob)));
+//! let mut tx = Tx::new();
+//! let carol = tx.temp();
+//! tx.define("person/boss", ValueType::Ref, Cardinality::One);
+//! tx.add(carol, "person/name", "Carol").add(bob, "person/boss", carol).add(alice, "person/boss", bob);
+//! conn.transact(&tx).unwrap();
+//! let rules = "[[(above ?a ?b) [?a :person/boss ?b]]
+//!               [(above ?a ?b) [?a :person/boss ?c] (above ?c ?b)]]";
+//! let text = "[:find ?name :in $ % :where [?a :person/name \"Alice\"] (above ?a ?b) [?b :person/name ?name]]";
+//! assert_eq!(conn.db().q_rules(text, rules, &[]).unwrap(), vec![vec![Value::from("Bob")], vec![Value::from("Carol")]]);
 //! ```
 
 pub mod db;
@@ -38,11 +52,13 @@ pub mod parse;
 pub mod planner;
 pub mod pmap;
 pub mod query;
+pub mod rules;
 
 pub use db::{Attr, AttrId, AttrStats, Cardinality, Conn, Datom, Db, Eid, Entity, Error, Tx, TxReport, TxValue, Unique, Value, ValueType, T, TX_INSTANT};
 pub use parse::TextQuery;
 pub use planner::{Plan, PlanSource};
 pub use query::{Agg, Clause, Cmp, Find, Pull, PullValue, Pulled, Query, Term};
+pub use rules::RuleStats;
 
 #[cfg(test)]
 pub(crate) mod testutil
