@@ -321,6 +321,11 @@ fn incremental_command_errors()
 
 	// The commands, which don't require the solver, are legal before the header too
 	ExpectErr("incremental_err_first.cnf", "ot 1 1\noc 5\nox\n", &[], "c topor_tool ERROR: The 2nd character must be either t or c at line number 3");
+	// The commands, which require the solver, are not (the C++ version dereferences a null pointer)
+	for cmd in ["b 0", "n 1", "lc 1", "r /mode/value 1"]
+	{
+		ExpectErr("incremental_err_before_header.cnf", &(cmd.to_string() + "\np cnf 1 1\n1 0\n"), &[], "c topor_tool ERROR: a solver command appears before the p-line and the first clause at line number 1");
+	}
 }
 
 #[test]
@@ -931,7 +936,7 @@ fn identify_archive_file_type()
 {
 	// The compile-time test of the signatures
 	assert!(AllSigsDifferByFirstInt());
-	assert_eq!(commandStringBeforeAndAfter.len(), fileSig.len());
+	assert_eq!(archiveCommands.len(), fileSig.len());
 
 	let I = |bytes: &[u8]| -> (TArchiveFileType, usize)
 	{
@@ -1110,13 +1115,15 @@ fn main_in_child_process()
 	assert!(String::from_utf8_lossy(&output.stdout).contains("c topor_tool ERROR: could not convert --nocapture to double\n"));
 	let _ = std::fs::remove_file(&f);
 
-	// An archive, where the shell to run the decompression command cannot be found
+	// An archive, where the decompression program cannot be found: as with popen, the shell reports it and the input is empty
 	let f = TmpFile("main_child_archive.cnf.gz");
 	std::fs::write(&f, [0x1F, 0x8B, 0x08, 0x00]).unwrap();
 	let output = MainChildCommand(&f).env("PATH", TmpFile("no_such_dir")).args([MainChildTest, "--nocapture"]).output().unwrap();
 	let out = String::from_utf8_lossy(&output.stdout).into_owned();
 	assert_eq!(output.status.code(), Some(BadRetVal & 0xFF), "{}", out);
-	assert!(out.contains(&format!("The following command will be used to read it through a pipe : gzip -c -d {} \nc topor_tool ERROR: couldn't open the input file\n", f)), "{}", out);
+	assert!(out.contains(&format!("The following command will be used to read it through a pipe : gzip -c -d {} \n", f)), "{}", out);
+	assert!(!out.contains("couldn't open the input file"), "{}", out);
+	assert!(String::from_utf8_lossy(&output.stderr).contains("sh: gzip: command not found\n"));
 	let _ = std::fs::remove_file(&f);
 
 	// An error, which the C++ version reports by throwing an exception out of main: the process is aborted
