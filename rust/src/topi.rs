@@ -1257,10 +1257,13 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	{
 		if !Compress
 		{
-			let isLearnt = self.m_B[clsInd.as_usize()] & ClsIsLearntMask != 0;
-			let isOversized = self.m_AnyOversized && isLearnt && self.EClsGetStandardActivityAsInt(clsInd) == ClsOversizeActivity;
+			// The header is read once and its learnt bit is tested before m_AnyOversized (both tests are free of side effects, so the result is the same):
+			// the solver flag is then loaded for learnt clauses only, and the offset and the size mask are selected without duplicating the code
+			let hdr = self.m_B[clsInd.as_usize()];
+			let isLearnt = hdr & ClsIsLearntMask != 0;
+			let isOversized = isLearnt && self.m_AnyOversized && self.EClsGetStandardActivityAsInt(clsInd) == ClsOversizeActivity;
 			let litsStartOffset = 1 + ((isLearnt as TUV) << ClsActivityFieldsLshift) + ((isOversized as TUV) << ClsActivityFieldsLshift);
-			let clsSize = if !isLearnt || isOversized { self.m_B[clsInd.as_usize()] & !ClsIsLearntMask } else { self.m_B[clsInd.as_usize()] & !ClsIsLearntAndGlueMask };
+			let clsSize = hdr & if !isLearnt || isOversized { !ClsIsLearntMask } else { !ClsIsLearntAndGlueMask };
 			CCls::new_standard(clsInd, self.m_B.get_span_cap_sz(clsInd.as_usize() + litsStartOffset as usize, clsSize as usize))
 		}
 		else

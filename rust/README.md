@@ -7,9 +7,14 @@ of the C++ solver: every C++ header and translation unit has a corresponding mod
 ## Building
 
     cargo build --release          # target/release/intel_sat_solver (the executable) and libintel_sat_solver.{rlib,a} (the library, incl. the IPASIR C API)
+    scripts/build_pgo.sh           # optional: target/pgo/release/intel_sat_solver, the executable built with profile-guided optimization
 
 The executable has the same command line, input format, output and exit codes as the C++ one (as built by the Makefile, that is, with `-DSKIP_ZLIB`),
 so the scripts in `../scripts` work with it unchanged.
+
+`scripts/build_pgo.sh` trains on `../regression_instances` in the three solver modes (the whole script takes under a minute) and needs `llvm-profdata` of rustc's LLVM version.
+The profile changes only inlining and code layout, so the output and the proofs are the same as those of the default build. Its gain over the default build is small
+(see "Performance" below), and a profile isn't portable across toolchains, so the default build doesn't use it.
 
 The library is used through `intel_sat_solver::topor::CTopor<Ind, Compress>`, where the three instantiations of the C++ library are
 `CTopor<u32, false>`, `CTopor<u64, false>` and `CTopor<u64, true>` (the literal type is always `i32`, as in the C++ library).
@@ -32,10 +37,40 @@ The library is used through `intel_sat_solver::topor::CTopor<Ind, Compress>`, wh
   incremental queries, a threshold just below the maximal `uint64_t`), polarity hints (`lf`) and unsatisfiable cores, which the other instances don't use.
   (The C++ scripts in `../scripts` only run the `ddtbug*` and `regr*` instances.)
 
+## Performance
+
+    scripts/perf_instr.sh <executable> <instance.cnf>... [-- solver parameters]             # instructions retired and cycles per instance (macOS, /usr/bin/time -l)
+    scripts/bench_vs_cpp.py --exe cpp=<path> --exe rust=<path> [--repeats N] <instance.cnf>...   # interleaved CPU/wall times, verdicts and conflicts of several executables
+
+`perf_instr.sh` also prints the exit code and the md5 of the output, which must not change between builds. The instructions are reproducible to within about 0.5%;
+the cycles depend on the load of the machine, so take the minimum of several runs (`PERF_RUNS`) and interleave the executables which are compared.
+
+Totals over six instances (random 3-SAT, pigeonhole and an incremental one; 0.4 to 3.5 seconds each) in solver mode 0, on which the solvers do identical work
+(the same output). Apple M5, rustc 1.97, C++ built by the Makefile with clang `-O3`; the minimum of 5 interleaved runs per instance:
+
+| executable | instructions | cycles | instructions vs C++ | cycles vs C++ |
+|---|---|---|---|---|
+| C++ | 88.59G | 39.93G | 1.000 | 1.000 |
+| the fork before the performance work | 86.36G | 43.63G | 0.975 | 1.093 |
+| the fork, `cargo build --release` | 70.88G | 36.48G | 0.800 | 0.914 |
+| the fork, `scripts/build_pgo.sh` | 68.09G | 36.51G | 0.769 | 0.914 |
+
+That is 18% fewer instructions and 16% fewer cycles than before, and the fork is faster than the C++ on each of the six instances (0.90 to 0.94 of its cycles).
+Solver modes 1 and 2 gain too (about 14% and 6% of the cycles). The profile-guided build retires 4% fewer instructions than the default build, at the same number of cycles.
+
+The changes are confined to how the same statements are compiled; none changes a data layout, the statements executed or their order
+(`scripts/diff_vs_cpp.sh` still reports byte-identical outputs and proofs). `PORTING.md` ("Rust-side conventions") lists them, so that they are kept when the code around them is edited:
+
+* `SwapCurrWatch` is forced inline into `BCP`, as clang does for the C++: out of line, the index and the pointer of the current watch, which it takes by reference,
+  were kept in memory throughout BCP's long-watch loop (most of the gain).
+* `WLPrepareArena` is split into an inlined test for the common case (the arena exists and has room) and an out-of-line rest.
+* `Cls` reads the clause header once and tests its learnt bit before the solver's `m_AnyOversized` flag (two tests without side effects, in the other order in the C++).
+* `LearnAndUpdateHeuristicsVisitCls` and two heap functions of `CVarScores` are inlined into their callers, as a profile-guided build does on its own.
+
 ## Coverage
 
 `scripts/coverage.sh` runs all the tests under LLVM source-based coverage and fails if any line is neither executed nor explicitly marked in the sources.
-Of the 9587 lines, the tests execute 9580. The rarest solver paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
+Of the 9597 lines, the tests execute 9590. The rarest solver paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
 while another assumption is falsified) are driven by tests on crafted solver states, which the fuzzer never produces. The other 7 lines carry the mark
 `COVERAGE-NOT-REACHED` with its reason: they run only if the system allocator fails, which the test-only allocation-fault injection doesn't simulate,
 or if a decompressor is on the PATH but can't be run. (The script also supports a `COVERAGE-UNREACHABLE` mark; no line carries it.)
@@ -69,7 +104,7 @@ The control flow is the same statement by statement. The differences are confine
   the condition as a `debug_assert!`. The reachable control flow is unchanged (verified by the differential testing). The places: the `IsUnrecoverable` re-tests in
   `MinimizeClauseMinisat`; the parent membership tests of on-the-fly subsumption after its size test has passed; the binary-parent case of the subsumed parents in
   `ConflictAnalysisLoop`; the falsified-decision case of `HandleAssumptions`; the `m_Assumps.cap() == 0` case after backtracking beyond the assumptions; the glue clamp of `ClsSetGlueStd`; the skipping of just-moved compressed clauses in `SimplifyIfRequired` (the ascending
-  iteration over the direct-index table never revisits them); the `first != last` test in the `remove_if` helper; the missing-DRAT-file case of the text-DRAT comment.
+  iteration over the direct-index table never revisits them); the `first != last` test in the `remove_if` helper; the early return of `WLPrepareArena`'s out-of-line part (its inlined part has just carried out the same test); the missing-DRAT-file case of the text-DRAT comment.
   Release builds don't check these conditions at all. (The unassigned-earliest-falsified-assumption error of `Solve` is kept as in the C++: it is reachable, when a stop requested
   from the new-learnt-clause callback interrupts conflict analysis.)
 * **The C++ exceptions are panics.** The non-contagious bit-array class `CBitArraySingleElemWidth` (which the solver itself doesn't use) is the only C++ code that throws:

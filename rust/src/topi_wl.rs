@@ -239,7 +239,29 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		self.m_W.get_ptr((self.m_WNext - wi.m_AllocatedEntries).as_usize())
 	}
 
+	// Performance split of the C++ WLPrepareArena (no change of behavior): this inlined wrapper carries out the first two tests of the body
+	// (the arena exists and has enough room; by far the common case) and returns the same pointer;
+	// every other case goes to WLPrepareArenaSlow, the rest of the C++ body in the original order.
+	// The two tests must be kept in sync with the C++ ones (the assertions of WLPrepareArenaSlow check that).
+	#[inline(always)]
 	pub(crate) fn WLPrepareArena(&mut self, l: TULit, allowNewBinaryWatch: bool, allowNewLongWatch: bool) -> *mut TULit
+	{
+		let wi = self.m_Watches[l as usize];
+		if !wi.IsEmpty()
+		{
+			let currRequiredEntries = Ind::from_usize(allowNewBinaryWatch as usize + (allowNewLongWatch as usize * TWatchInfo::<Ind>::BinsInLong));
+			let usedEntries = Ind::from_usize(wi.GetUsedEntries());
+			if usedEntries + currRequiredEntries <= wi.m_AllocatedEntries
+			{
+				return self.m_W.get_ptr(wi.m_WBInd.as_usize());
+			}
+		}
+		self.WLPrepareArenaSlow(l, allowNewBinaryWatch, allowNewLongWatch)
+	}
+
+	// The body of the C++ WLPrepareArena, but for the early return of an arena with enough room, which the wrapper has already carried out (asserted below)
+	#[inline(never)]
+	fn WLPrepareArenaSlow(&mut self, l: TULit, allowNewBinaryWatch: bool, allowNewLongWatch: bool) -> *mut TULit
 	{
 		// The watch-info is only read here (the lambda re-reads and updates it), so a copy is used
 		let wi = self.m_Watches[l as usize];
@@ -256,10 +278,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		let usedEntries = Ind::from_usize(wi.GetUsedEntries());
 		let requiredEntries = usedEntries + currRequiredEntries;
 
-		if requiredEntries <= wi.m_AllocatedEntries
-		{
-			return self.m_W.get_ptr(wi.m_WBInd.as_usize());
-		}
+		// The C++ returns the arena here if requiredEntries <= wi.m_AllocatedEntries: the WLPrepareArena wrapper has carried out that very test (and returned), so it can't hold here
+		debug_assert!(requiredEntries > wi.m_AllocatedEntries);
 
 		if requiredEntries < usedEntries
 		{
