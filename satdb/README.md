@@ -98,22 +98,32 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
 
   Timings (release, `cargo test --release index_timings -- --ignored --nocapture`, transactions of 20 assertions, a quarter of them on new entities):
 
-  | | treap | B+-tree, copying updates | B+-tree, in-place updates |
-  |---|---|---|---|
-  | 10,000 transactions | 5.21 s | 2.44 s | 1.36 s |
-  | 50,000 transactions | 31.9 s | 21.6 s | 14.8 s |
-  | 7,085 point reads (10k) | 6.9 ms | 3.5 ms | 3.0 ms |
-  | scan of an attribute (10k) | 1.5 ms | 0.59 ms | 0.52 ms |
-  | opening a log of 50k by replay | 25.8 s | | 6.12 s |
-  | opening it from a checkpoint | 1.20 s | | 0.68 s |
+  | | treap | B+-tree, copying updates | B+-tree, in-place updates | + fat-node persistence in `Conn` | + statistics from neighbors |
+  |---|---|---|---|---|---|
+  | 10,000 transactions | 5.21 s | 2.44 s | 1.36 s | 0.67 s | 0.68-0.76 s |
+  | 50,000 transactions | 31.9 s | 21.6 s | 14.8 s | 5.76 s | 5.1-5.3 s |
+  | 7,085 point reads (10k) | 6.9 ms | 3.5 ms | 3.0 ms | 3.1 ms | 2.6-3.9 ms |
+  | scan of an attribute (10k) | 1.5 ms | 0.59 ms | 0.52 ms | 0.45 ms | 0.5 ms |
+  | opening a log of 50k by replay | 25.8 s | | 6.12 s | | |
+  | opening it from a checkpoint | 1.20 s | | 0.68 s | | |
 
-  What a transaction still pays is copying, once, every leaf it touches in each of the nine indexes (the value before it stays valid, as
-  `TxReport::db_before`): with wide leaves that copy is most of the remaining time. A write-buffered tree (a persistent Bε-tree, which
-  batches updates in its branches) would cut it further.
-  The history and `as_of` are the dictionary case of retroactive data structures (Demaine, Iacono and Langerman, 2004/2007): each datom
-  is stored with the times it was asserted and retracted, which answers queries about any past time (their Theorem 6 remark). Changing the
-  past (inserting a transaction at an earlier time) would need their rollback method here, since cardinality-one and uniqueness make the
-  operations non-commutative.
+  (The machine is noisy: the last column is the range of three runs.)
+
+  Persistence as Demaine teaches it (MIT 6.851, after Driscoll, Sarnak, Sleator and Tarjan) comes in two forms: *path copying* (copy what
+  an update touches, so every version keeps its own root) and *fat nodes* (one structure, every change stored with its version, a version
+  read by its time). The history indexes already are the fat-node form, which is also the dictionary case of retroactive data structures
+  (Demaine, Iacono and Langerman, 2004/2007): each datom is stored with the times it was asserted and retracted, which answers queries about
+  any past time (their Theorem 6 remark). So `Conn::transact` doesn't keep the value before the transaction by path copying as well:
+  `Db::transact` is split into `plan` (everything that can fail, uniqueness included, checked against the value before the transaction)
+  and an infallible apply, and the connection plans, logs, lets go of its value and applies the changes in place; the report's `db_before`
+  is an `as_of` view. A value that a caller still holds keeps `Arc::make_mut` copying, so sharing stays correct, and `Db::transact` on a
+  plain value still returns both values whole. Then the statistics (distinct entities and values per attribute) come from the neighbors
+  of the key an insertion or removal changes (`PMap::insert_mut_near`) instead of separate searches, four fewer descents per datom.
+
+  Changing the past (inserting a transaction at an earlier time) would need the paper's rollback method here, since cardinality-one and
+  uniqueness make the operations non-commutative. What a transaction pays now is the tree work itself (comparisons, shifting entries within
+  leaves, and about 11 descents per datom across the indexes); batching each transaction's insertions per index (one descent per touched
+  node, in key order) or a write-buffered tree (a persistent Bε-tree) would cut it further.
 * **Queries** (`src/query.rs`). Datalog-style queries over any view: patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`),
   comparison predicates, `not`/`not-join` and `or`/`or-join` (nested to any depth) and rule calls (see Rules), run as nested loops, each pattern using the index selected by its bound positions.
   * `not` keeps the rows for which its body has no solution; its join variables (all of its body's, or the `not-join` list) must be bound when it runs,

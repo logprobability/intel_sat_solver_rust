@@ -63,8 +63,21 @@ impl<K, V> Default for PMap<K, V>
 	}
 }
 
-// Insert into the subtree of `n`; returns the value replaced, and the separator and new right sibling if `n` split
-fn ins<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, k: K, v: V) -> (Option<V>, Option<(K, Arc<Node<K, V>>)>)
+/// What a leaf shows of the keys around a position: whether the key before it (at `prev`) or the one at `next` satisfies `same`;
+/// None when neither does and one of them is in another leaf (or doesn't exist), so the leaf can't tell
+fn adjacent<K>(keys: &[K], prev: Option<usize>, next: usize, same: &dyn Fn(&K) -> bool) -> Option<bool>
+{
+	match (prev.map(|j| same(&keys[j])), keys.get(next).map(same))
+	{
+		(Some(true), _) | (_, Some(true)) => Some(true),
+		(Some(false), Some(false)) => Some(false),
+		_ => None,
+	}
+}
+
+// Insert into the subtree of `n`; returns the value replaced, and the separator and new right sibling if `n` split.
+// With `near`, `found` gets what the leaf shows of the new key's neighbors (see `adjacent`)
+fn ins<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, k: K, v: V, near: Option<&dyn Fn(&K) -> bool>, found: &mut Option<bool>) -> (Option<V>, Option<(K, Arc<Node<K, V>>)>)
 {
 	match n
 	{
@@ -75,6 +88,10 @@ fn ins<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, k: K, v: V) -> (Option<V>, 
 			{
 				keys.insert(i, k);
 				vals.insert(i, v);
+				if let Some(same) = near
+				{
+					*found = adjacent(keys, i.checked_sub(1), i + 1, same);
+				}
 				if keys.len() <= B
 				{
 					return (None, None);
@@ -87,7 +104,7 @@ fn ins<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, k: K, v: V) -> (Option<V>, 
 		Node::Branch { keys, kids } =>
 		{
 			let i = keys.partition_point(|s| *s <= k);
-			let (old, split) = ins(Arc::make_mut(&mut kids[i]), k, v);
+			let (old, split) = ins(Arc::make_mut(&mut kids[i]), k, v, near, found);
 			if let Some((sep, right)) = split
 			{
 				keys.insert(i, sep);
@@ -107,8 +124,9 @@ fn ins<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, k: K, v: V) -> (Option<V>, 
 	}
 }
 
-// Remove a present key from the subtree of `n` (which may leave `n` below MIN, for its parent to fix)
-fn rem<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, k: &K) -> V
+// Remove a present key from the subtree of `n` (which may leave `n` below MIN, for its parent to fix).
+// With `near`, `found` gets what the leaf shows of the keys that were around it (see `adjacent`)
+fn rem<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, k: &K, near: Option<&dyn Fn(&K) -> bool>, found: &mut Option<bool>) -> V
 {
 	match n
 	{
@@ -116,12 +134,16 @@ fn rem<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, k: &K) -> V
 		{
 			let i = keys.binary_search(k).ok().expect("the key is present");
 			keys.remove(i);
+			if let Some(same) = near
+			{
+				*found = adjacent(keys, i.checked_sub(1), i, same);
+			}
 			vals.remove(i)
 		}
 		Node::Branch { keys, kids } =>
 		{
 			let i = keys.partition_point(|s| s <= k);
-			let old = rem(Arc::make_mut(&mut kids[i]), k);
+			let old = rem(Arc::make_mut(&mut kids[i]), k, near, found);
 			if kids[i].size() < MIN && kids.len() > 1
 			{
 				rebalance(keys, kids, i);
@@ -247,32 +269,61 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V>
 	/// Bind `key` to `val` in this map, in place where no other version shares the nodes; returns the value replaced
 	pub fn insert_mut(&mut self, key: K, val: V) -> Option<V>
 	{
+		self.ins_root(key, val, None).0
+	}
+
+	/// `insert_mut` of an absent key, which also tells whether one of its neighbors in key order satisfies `same` (a monotone-range
+	/// predicate, such as sharing the key's prefix, so that the answer is whether any other key does), when the leaf shows it:
+	/// None when the answer depends on a key in another leaf. It saves a separate search for "is there another key with this prefix?"
+	pub fn insert_mut_near(&mut self, key: K, val: V, same: impl Fn(&K) -> bool) -> Option<bool>
+	{
+		let (old, found) = self.ins_root(key, val, Some(&same));
+		debug_assert!(old.is_none(), "the key was absent");
+		found
+	}
+
+	fn ins_root(&mut self, key: K, val: V, near: Option<&dyn Fn(&K) -> bool>) -> (Option<V>, Option<bool>)
+	{
 		let Some(root) = &mut self.root
 		else
 		{
 			self.root = Some(Arc::new(Node::Leaf { keys: vec![key], vals: vec![val] }));
 			self.len = 1;
-			return None;
+			return (None, Some(false));
 		};
-		let (old, split) = ins(Arc::make_mut(root), key, val);
+		let mut found = None;
+		let (old, split) = ins(Arc::make_mut(root), key, val, near, &mut found);
 		if let Some((sep, right)) = split
 		{
 			let left = self.root.take().expect("the root just split");
 			self.root = Some(Arc::new(Node::Branch { keys: vec![sep], kids: vec![left, right] }));
 		}
 		self.len += old.is_none() as usize;
-		old
+		(old, found)
 	}
 
 	/// Remove `key` from this map, in place where no other version shares the nodes; returns its value (an absent key copies nothing)
 	pub fn remove_mut(&mut self, key: &K) -> Option<V>
+	{
+		self.rem_root(key, None).map(|r| r.0)
+	}
+
+	/// `remove_mut`, which also tells whether one of the keys that were around `key` satisfies `same` (see `insert_mut_near`);
+	/// None for an absent key
+	pub fn remove_mut_near(&mut self, key: &K, same: impl Fn(&K) -> bool) -> Option<(V, Option<bool>)>
+	{
+		self.rem_root(key, Some(&same))
+	}
+
+	fn rem_root(&mut self, key: &K, near: Option<&dyn Fn(&K) -> bool>) -> Option<(V, Option<bool>)>
 	{
 		if !self.contains_key(key)
 		{
 			return None;
 		}
 		let root = self.root.as_mut().expect("the key is present");
-		let old = rem(Arc::make_mut(root), key);
+		let mut found = None;
+		let old = rem(Arc::make_mut(root), key, near, &mut found);
 		self.len -= 1;
 		// A root branch with one child gives way to it, and an empty root leaf to the empty map
 		match self.root.as_deref()
@@ -281,7 +332,7 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V>
 			Some(Node::Branch { kids, .. }) if kids.len() == 1 => self.root = Some(kids[0].clone()),
 			_ => {}
 		}
-		Some(old)
+		Some((old, found))
 	}
 
 	/// The map of `entries`, whose keys must be strictly increasing, built in linear time with every node filled evenly
@@ -554,6 +605,33 @@ mod tests
 			}
 			assert!(m.iter().map(|(k, v)| (*k, *v)).eq(b.iter().map(|(k, v)| (*k, *v))));
 		}
+	}
+
+	// What insert_mut_near and remove_mut_near tell about other keys with the same prefix agrees with a scan whenever they tell
+	#[test]
+	fn near_answers_agree_with_a_scan()
+	{
+		let mut rng = Rng::new(21);
+		let mut map: PMap<(u64, u64), ()> = PMap::new();
+		let (mut told, mut untold) = (0, 0);
+		for _ in 0..20_000
+		{
+			let k = (rng.next() % 300, rng.next() % 8);
+			let same = |x: &(u64, u64)| x.0 == k.0;
+			let others = |m: &PMap<(u64, u64), ()>| m.iter().filter(|(x, _)| x.0 == k.0 && **x != k).count() > 0;
+			let answer = if map.contains_key(&k) { map.remove_mut_near(&k, same).unwrap().1 } else { map.insert_mut_near(k, (), same) };
+			match answer
+			{
+				Some(a) =>
+				{
+					assert_eq!(a, others(&map), "{k:?}");
+					told += 1;
+				}
+				None => untold += 1,
+			}
+		}
+		map.check();
+		assert!(told > 10 * untold, "the leaf should usually tell ({told} told, {untold} not)");
 	}
 
 	// An in-place update of a map copies the nodes it shares with another version, and only those

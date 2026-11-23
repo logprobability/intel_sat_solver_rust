@@ -1746,42 +1746,45 @@ impl Db
 		})
 	}
 
+	// The statistics count distinct entities and values: whether another key of an index shares the changed key's (attribute, entity) or
+	// (attribute, value) prefix is what the insertion or removal itself shows from the keys around it (`PMap::insert_mut_near`), and only
+	// when one of those is in another leaf does it take a search of its own
+
 	// Assert an absent datom in transaction tx (insert and remove only see unfiltered values, as transact refuses views)
 	fn insert(&mut self, e: Eid, a: AttrId, v: &Value, tx: Eid)
 	{
-		let mut s = self.stats(a);
-		s.datoms += 1;
-		s.entities += self.values(e, a).next().is_none() as u64;
-		s.values += self.entities(a, v).next().is_none() as u64;
-		self.stats.insert_mut(a, s);
 		self.eavt.insert_mut((e, a, v.clone()), tx);
-		self.aevt.insert_mut((a, e, v.clone()), tx);
-		self.avet.insert_mut((a, v.clone(), e), tx);
+		let other_e = self.aevt.insert_mut_near((a, e, v.clone()), tx, |k| (k.0, k.1) == (a, e)).unwrap_or_else(|| self.values(e, a).nth(1).is_some());
+		let other_v = self.avet.insert_mut_near((a, v.clone(), e), tx, |k| k.0 == a && k.1 == *v).unwrap_or_else(|| self.entities(a, v).nth(1).is_some());
 		if let Value::Ref(r) = v
 		{
 			self.vaet.insert_mut((*r, a, e), tx);
 		}
+		let mut s = self.stats(a);
+		s.datoms += 1;
+		s.entities += !other_e as u64;
+		s.values += !other_v as u64;
+		self.stats.insert_mut(a, s);
 		self.log(e, a, v, tx, true);
 	}
 
 	// Retract a datom in transaction tx; returns whether it was present
 	fn remove(&mut self, e: Eid, a: AttrId, v: &Value, tx: Eid) -> bool
 	{
-		if !self.eavt.contains_key(&(e, a, v.clone()))
+		if self.eavt.remove_mut(&(e, a, v.clone())).is_none()
 		{
 			return false;
 		}
-		self.eavt.remove_mut(&(e, a, v.clone()));
-		self.aevt.remove_mut(&(a, e, v.clone()));
-		self.avet.remove_mut(&(a, v.clone(), e));
+		let other_e = self.aevt.remove_mut_near(&(a, e, v.clone()), |k| (k.0, k.1) == (a, e)).expect("the indexes agree").1.unwrap_or_else(|| self.values(e, a).next().is_some());
+		let other_v = self.avet.remove_mut_near(&(a, v.clone(), e), |k| k.0 == a && k.1 == *v).expect("the indexes agree").1.unwrap_or_else(|| self.entities(a, v).next().is_some());
 		if let Value::Ref(r) = v
 		{
 			self.vaet.remove_mut(&(*r, a, e));
 		}
 		let mut s = self.stats(a);
 		s.datoms -= 1;
-		s.entities -= self.values(e, a).next().is_none() as u64;
-		s.values -= self.entities(a, v).next().is_none() as u64;
+		s.entities -= !other_e as u64;
+		s.values -= !other_v as u64;
 		self.stats.insert_mut(a, s);
 		self.log(e, a, v, tx, false);
 		true
@@ -1790,14 +1793,18 @@ impl Db
 	// Append a change to the history indexes (a transaction changes a datom once at most, so the keys are new)
 	fn log(&mut self, e: Eid, a: AttrId, v: &Value, tx: Eid, added: bool)
 	{
+		self.heavt.insert_mut((e, a, v.clone(), tx, added), ());
+		let other_e = self.haevt.insert_mut_near((a, e, v.clone(), tx, added), (), |k| (k.0, k.1) == (a, e)).unwrap_or_else(|| {
+			self.haevt.seek(|k| (k.0, k.1) < (a, e)).take_while(|(k, _)| (k.0, k.1) == (a, e)).nth(1).is_some()
+		});
+		let other_v = self.havet.insert_mut_near((a, v.clone(), e, tx, added), (), |k| k.0 == a && k.1 == *v).unwrap_or_else(|| {
+			self.havet.seek(|k| (k.0, &k.1) < (a, v)).take_while(|(k, _)| k.0 == a && k.1 == *v).nth(1).is_some()
+		});
 		let mut s = self.hstats.get(&a).copied().unwrap_or_default();
 		s.datoms += 1;
-		s.entities += self.haevt.seek(|k| (k.0, k.1) < (a, e)).next().map_or(true, |(k, _)| (k.0, k.1) != (a, e)) as u64;
-		s.values += self.havet.seek(|k| (k.0, &k.1) < (a, v)).next().map_or(true, |(k, _)| (k.0, &k.1) != (a, v)) as u64;
+		s.entities += !other_e as u64;
+		s.values += !other_v as u64;
 		self.hstats.insert_mut(a, s);
-		self.heavt.insert_mut((e, a, v.clone(), tx, added), ());
-		self.haevt.insert_mut((a, e, v.clone(), tx, added), ());
-		self.havet.insert_mut((a, v.clone(), e, tx, added), ());
 		if let Value::Ref(r) = v
 		{
 			self.hvaet.insert_mut((*r, a, e, tx, added), ());
