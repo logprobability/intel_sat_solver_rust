@@ -1067,24 +1067,27 @@ fn constructor_dump_file()
 	let prefix = dir.join("dump");
 	std::env::set_var("TOPOR_DUMP_NAME", &prefix);
 	let mut topi = CTopi::<u32, false>::new(7);
+	// A second solver, created in the same second at the same address (that of the solver inside new, before it's moved out), gets a file of its own
+	let other = CTopi::<u32, false>::new(5);
 	std::env::remove_var("TOPOR_DUMP_NAME");
-	assert!(topi.m_DumpFile.is_some());
+	assert!(topi.m_DumpFile.is_some() && other.m_DumpFile.is_some());
 	topi.AddUserClause(&[1, -2]);
 	topi.AddUserClause(&[2, 3, 4]);
 	assert_eq!(topi.Solve(&[-1], (f64::MAX, true), u64::MAX), TToporReturnVal::RET_SAT);
-	let ptr = format!("{:p}", &topi as *const CTopi<u32, false>);
 	drop(topi);
+	drop(other);
 
-	// The name of the file contains the address of the solver at the time of its construction (which we cannot know) and the process id
+	// The name of the file contains the address of the solver at the time of its construction, the process id and the number of the dump in the process
 	let mut dumps: Vec<String> = vec![];
 	for entry in std::fs::read_dir(&dir).unwrap()
 	{
 		let path = entry.unwrap().path();
 		let name = path.file_name().unwrap().to_str().unwrap().to_string();
-		assert!(name.starts_with("dump_0x") && name.ends_with(".cnf") && name.contains(&format!("_{}_", std::process::id())), "{} {}", name, ptr);
+		assert!(name.starts_with("dump_0x") && name.ends_with(".cnf") && name.contains(&format!("_{}_", std::process::id())), "{}", name);
 		dumps.push(std::fs::read_to_string(&path).unwrap());
 	}
 	assert!(dumps.iter().any(|d| d.starts_with("p cnf 7 0\n") && d.contains("1 -2 0\n") && d.contains("2 3 4 0\n")), "{:?}", dumps);
+	assert!(dumps.iter().any(|d| d == "p cnf 5 0\n"), "{:?}", dumps);
 	// The directory itself is left in place for the solvers of the other tests, which might have read the variable, but haven't created their files yet
 	std::thread::sleep(std::time::Duration::from_millis(100));
 	for entry in std::fs::read_dir(&dir).unwrap()

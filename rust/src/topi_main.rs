@@ -86,6 +86,10 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		ss += "_";
 
 		ss += &format!("{:p}_{}_", self as *const Self, std::process::id());
+		// Not in the C++ version: the number of the dump in the process, since the address (here, of the solver before it's boxed) and the time in seconds
+		// don't tell apart the solvers created in the same second, whose dumps would overwrite each other
+		static DumpsNum: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+		ss += &format!("{}_", DumpsNum.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
 
 		#[cfg(unix)]
 		// SAFETY: tmBuf is larger than struct tm (56 bytes on the supported platforms) and as aligned; localtime_r only writes into it

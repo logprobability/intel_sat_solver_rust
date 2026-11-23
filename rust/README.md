@@ -35,10 +35,10 @@ The library is used through `intel_sat_solver::topor::CTopor<Ind, Compress>`, wh
 ## Coverage
 
 `scripts/coverage.sh` runs all the tests under LLVM source-based coverage and fails if any line is neither executed nor explicitly marked in the sources.
-Of the 9586 lines, the tests execute 9579. The rarest solver paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
+Of the 9587 lines, the tests execute 9580. The rarest solver paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
 while another assumption is falsified) are driven by tests on crafted solver states, which the fuzzer never produces. The other 7 lines carry the mark
-`COVERAGE-NOT-REACHED` with its reason: they run only if the system allocator fails or the OS fails to spawn `sh`, which the test-only allocation-fault injection
-doesn't simulate. (The script also supports a `COVERAGE-UNREACHABLE` mark; no line carries it.)
+`COVERAGE-NOT-REACHED` with its reason: they run only if the system allocator fails, which the test-only allocation-fault injection doesn't simulate,
+or if a decompressor is on the PATH but can't be run. (The script also supports a `COVERAGE-UNREACHABLE` mark; no line carries it.)
 
 The script fails on a stale mark too (a marked line which is executed). It has a second pass, which builds with the debug assertions off and runs only the `nda_*` tests:
 the statement following a failing assertion (the C++ `assert(0); return false;` idiom) can execute only in such a build.
@@ -61,6 +61,9 @@ The control flow is the same statement by statement. The differences are confine
 * **Statistics callbacks and the heap's reference to the activity increment** are replaced by explicit parameters (`GetStatBufferInfo`, `increase_score(.., &mut inc)`),
   scope-exit lambdas by explicit exit code, and `std::function`/`ofstream*` by boxed closures/`Box<dyn Write>`.
 * **Out-of-range `/mode/value`**: the C++ indexes the per-mode default arrays out of bounds; the fork reports the parameter error and leaves the other parameters intact.
+* **The names of the dump files** (`TOPOR_DUMP_NAME`) also have the number of the dump in the process, after the process id. The address in the name doesn't tell
+  apart the solvers created in the same second: in the fork it is that of the solver inside `CTopi::new`, before it's moved out, so every solver has the same one,
+  and in the C++ a solver may reuse a freed one; their dumps would overwrite each other.
 * **Code that is unreachable by construction is replaced by assertions.** Where the C++ re-tests a condition that nothing since its previous test can change, handles
   a case that an assertion right above it excludes, or tests something that always holds (e.g., `expectedVal != -1` for a `uint8_t`), the fork drops the branch and keeps
   the condition as a `debug_assert!`. The reachable control flow is unchanged (verified by the differential testing). The places: the `IsUnrecoverable` re-tests in

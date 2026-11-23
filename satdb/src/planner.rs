@@ -277,6 +277,9 @@ pub enum PlanSource
 	Dp,
 	/// The greedy heuristic: before the first solve, or after a solver error disabled the SAT planner
 	Greedy,
+	/// The previous plan, carried over a change of the query: with an added clause at its cheapest valid position, or as it was after
+	/// an accepted constraint that it respects (whichever is cheaper than the greedy plan)
+	Carried,
 }
 
 #[derive(Clone, Debug)]
@@ -392,14 +395,16 @@ impl Planner
 	}
 
 	/// Add a clause (to be numbered `self.shapes.len()`); `nvars` is the number of query variables so far.
-	/// The plan becomes the greedy one until the next `refine`.
+	/// Until the next `refine`, the plan is the cheaper of the greedy one and the previous plan with the clause inserted at its cheapest valid position
+	/// (a new binder may have to run before predicates that were pending), so what earlier refinements found carries over.
 	pub(crate) fn add_clause(&mut self, shape: ClauseShape, nvars: usize)
 	{
 		let w = shape.weights;
 		assert!(w[1] <= w[0] && w[2] <= w[0] && w[3] <= w[1] && w[3] <= w[2], "the weights must not increase when a slot becomes bound");
 		self.shapes.push(shape);
 		self.nvars = nvars;
-		self.set_greedy();
+		let (prev, c) = (std::mem::take(&mut self.plan.order), self.shapes.len() - 1);
+		self.set_carried((0..=prev.len()).map(|p| [&prev[..p], &[c], &prev[p..]].concat()));
 	}
 
 	/// Require clause `a` to run before clause `b`; returns the constraint's index. A constraint under which no order is valid
@@ -412,7 +417,8 @@ impl Planner
 		if greedy_order(&self.shapes, self.nvars, &all).is_some()
 		{
 			self.before.push((a, b));
-			self.set_greedy();
+			let prev = std::mem::take(&mut self.plan.order);
+			self.set_carried(std::iter::once(prev));
 			return Ok(self.before.len() - 1);
 		}
 		let core = self.sat_core(a, b);
@@ -826,6 +832,20 @@ impl Planner
 		self.plan = Plan { order, cost, optimal: false, pending: unbindable(&self.shapes), source: PlanSource::Greedy };
 	}
 
+	// The greedy plan, unless one of the valid orders among `carried` (adaptations of the previous plan to a changed query) is cheaper
+	fn set_carried(&mut self, carried: impl Iterator<Item = Vec<usize>>)
+	{
+		let best = carried
+			.filter(|o| respects(&self.shapes, self.nvars, &self.before, o))
+			.map(|o| (cost_of_order(&self.shapes, &o, self.nvars), o))
+			.min_by_key(|e| e.0);
+		self.set_greedy();
+		if let Some((cost, order)) = best.filter(|e| e.0 < self.plan.cost)
+		{
+			(self.plan.order, self.plan.cost, self.plan.source) = (order, cost, PlanSource::Carried);
+		}
+	}
+
 	/// Improve the plan within `budget` conflicts (u64::MAX: until optimal)
 	pub(crate) fn refine(&mut self, mut budget: u64) -> &Plan
 	{
@@ -852,7 +872,7 @@ impl Planner
 		// Which predicates are pending is known in closed form (`unbindable`, which the plan has), so every solve goes to the minimization
 		self.sync();
 		let base: Vec<TLit> = self.requirements().into_iter().chain(self.before_lits.iter().copied()).collect();
-		// Minimize, starting from the best plan so far (the greedy one, or the result of an earlier refine, which ran out of budget)
+		// Minimize, starting from the best plan so far (the greedy one, one carried over a change of the query, or the result of an earlier refine, which ran out of budget)
 		while self.plan.cost > 0
 		{
 			let act = self.at_most(self.plan.cost - 1);
@@ -1238,6 +1258,50 @@ mod tests
 		}
 	}
 
+	// A change of the query carries the previous plan over: after every added clause and accepted constraint, the plan is valid,
+	// its cost is its order's, and it is never worse than the greedy plan; past DP_MAX, the DP's optimum is carried into the larger query
+	#[test]
+	fn plans_carry_over_changes()
+	{
+		let mut rng = Rng::new(17);
+		let mut carried = 0;
+		for _ in 0..4
+		{
+			let (n, nvars) = (22, 8);
+			let shapes = random_query(&mut rng, n, nvars);
+			let mut p = Planner::new();
+			let mut before = Vec::new();
+			let check = |p: &Planner, c: usize, before: &[(usize, usize)]|
+			{
+				let plan = p.plan();
+				assert!(respects(&shapes[..=c], nvars, before, &plan.order), "clause {c}: {:?}", plan.order);
+				assert_eq!(plan.cost, cost_of_order(&shapes[..=c], &plan.order, nvars));
+				assert!(plan.cost <= cost_of_order(&shapes[..=c], &greedy_order(&shapes[..=c], nvars, before).unwrap(), nvars));
+				assert_eq!(plan.pending, unbindable(&shapes[..=c]));
+			};
+			for (c, s) in shapes.iter().enumerate()
+			{
+				p.add_clause(s.clone(), nvars);
+				check(&p, c, &before);
+				carried += (c >= DP_MAX && p.plan().source == PlanSource::Carried) as usize;
+				if c % 5 == 4
+				{
+					for (a, b) in random_constraints(&mut rng, &shapes[..=c], nvars, 2)
+					{
+						if !before.contains(&(a, b)) && p.require_before(a, b).is_ok()
+						{
+							before.push((a, b));
+							check(&p, c, &before);
+						}
+					}
+				}
+				p.refine(if c < DP_MAX { u64::MAX } else { 20 });
+				check(&p, c, &before);
+			}
+		}
+		assert!(carried > 0, "no plan past DP_MAX was carried over");
+	}
+
 	// Refinements in small budgets add up: every solve goes to the minimization (what is pending is known in closed form),
 	// and what the solver learns stays, so repeated refine(1) reaches the optimum
 	#[test]
@@ -1277,15 +1341,15 @@ mod tests
 		assert!(p.solver.GetConflictsNumber() >= 50, "{} conflicts in 100 refinements", p.solver.GetConflictsNumber());
 	}
 
-	// How often a refinement after each added clause beats the greedy plan past DP_MAX, by budget
-	// (release: cargo test --release online_refinement_budgets -- --ignored --nocapture)
+	// The plans of an online refinement after each added clause past DP_MAX, by budget: their mean cost relative to the greedy plan's,
+	// and how often SAT improved the plan (release: cargo test --release online_refinement_budgets -- --ignored --nocapture)
 	#[test]
 	#[ignore]
 	fn online_refinement_budgets()
 	{
 		for budget in [1000, 10_000, 100_000]
 		{
-			let (mut improved, mut total, t) = (0, 0, std::time::Instant::now());
+			let (mut improved, mut total, mut ratio, t) = (0, 0, 0.0, std::time::Instant::now());
 			for seed in 0..5
 			{
 				let mut rng = Rng::new(50 + seed);
@@ -1298,12 +1362,14 @@ mod tests
 					let plan = p.refine(budget).clone();
 					if c >= DP_MAX
 					{
+						let greedy = cost_of_order(&shapes[..=c], &greedy_order(&shapes[..=c], nvars, &[]).unwrap(), nvars);
 						total += 1;
 						improved += (plan.source == PlanSource::Sat) as usize;
+						ratio += plan.cost as f64 / greedy as f64;
 					}
 				}
 			}
-			println!("budget {budget}: {improved} of {total} refinements beat the greedy plan, {:?}", t.elapsed());
+			println!("budget {budget}: mean cost {:.3} of the greedy plan's; SAT improved {improved} of {total} plans; {:?}", ratio / total as f64, t.elapsed());
 		}
 	}
 
