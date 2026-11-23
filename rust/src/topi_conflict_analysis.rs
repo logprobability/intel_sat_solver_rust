@@ -831,9 +831,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 									self.m_VarsParentSubsumed.push(parentSubsumed);
 								}
 								else
-								{
-									self.SetStatus(TToporStatus::STATUS_ALLOC_FAILED, "m_VarsParentSubsumed.push_back allocation failure".to_string());
-								}
+								{ // COVERAGE-NOT-REACHED: only if the system allocator fails (try_reserve has no fault injection)
+									self.SetStatus(TToporStatus::STATUS_ALLOC_FAILED, "m_VarsParentSubsumed.push_back allocation failure".to_string()); // COVERAGE-NOT-REACHED: only if the system allocator fails (try_reserve has no fault injection)
+								} // COVERAGE-NOT-REACHED: only if the system allocator fails (try_reserve has no fault injection)
 
 								if self.IsUnrecoverable()
 								{

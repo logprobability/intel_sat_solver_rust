@@ -35,9 +35,10 @@ The library is used through `intel_sat_solver::topor::CTopor<Ind, Compress>`, wh
 ## Coverage
 
 `scripts/coverage.sh` runs all the tests under LLVM source-based coverage and fails if any line is neither executed nor explicitly marked in the sources.
-All the 9360 lines are executed by the tests (100%). The rarest paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
-while another assumption is falsified) are driven by tests on crafted solver states, which the fuzzer never produces. The script also supports the marks
-`COVERAGE-UNREACHABLE` and `COVERAGE-NOT-REACHED` for lines, which aren't executed for a documented reason; no line carries them.
+Of the 9586 lines, the tests execute 9579. The rarest solver paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
+while another assumption is falsified) are driven by tests on crafted solver states, which the fuzzer never produces. The other 7 lines carry the mark
+`COVERAGE-NOT-REACHED` with its reason: they run only if the system allocator fails or the OS fails to spawn `sh`, which the test-only allocation-fault injection
+doesn't simulate. (The script also supports a `COVERAGE-UNREACHABLE` mark; no line carries it.)
 
 The script fails on a stale mark too (a marked line which is executed). It has a second pass, which builds with the debug assertions off and runs only the `nda_*` tests:
 the statement following a failing assertion (the C++ `assert(0); return false;` idiom) can execute only in such a build.
@@ -68,8 +69,15 @@ The control flow is the same statement by statement. The differences are confine
   iteration over the direct-index table never revisits them); the `first != last` test in the `remove_if` helper; the missing-DRAT-file case of the text-DRAT comment.
   Release builds don't check these conditions at all. (The unassigned-earliest-falsified-assumption error of `Solve` is kept as in the C++: it is reachable, when a stop requested
   from the new-learnt-clause callback interrupts conflict analysis.)
-* Headers that no translation unit includes (`BitArray.hpp`, `TableBitInfo.hpp`, `TopiGlobal.hpp`, `TopiHandleNewUserCls.hpp`) and the unused non-contiguous bit-array
-  classes of `ToporBitArrayBuffer.hpp` are not ported.
+* **The C++ exceptions are panics.** The non-contagious bit-array class `CBitArraySingleElemWidth` (which the solver itself doesn't use) is the only C++ code that throws:
+  `logic_error` from `ChangeElemWidth` and `bad_alloc` on an allocation failure. The port panics with the same messages.
+* **Four headers aren't ported, since no translation unit includes them, and they aren't parts of the live code:** `BitArray.hpp` and `TableBitInfo.hpp` are older,
+  diverged copies of `ToporBitArrayBuffer.hpp` and `ToporTableBitInfo.hpp` (e.g., their `BAGetElemAndGoToNext` advances the bit number before reading, and their class is
+  named `CBitArray`), `TopiHandleNewUserCls.hpp` is an older copy of the `CHandleNewCls` class of `Topi.hpp` (ported in `topi_types.rs`), and `TopiGlobal.hpp` doesn't compile
+  on its own (it uses `TLit` and `TUInd` without defining them). The live versions are ported, including the parts that the solver doesn't use (the non-contagious bit-array
+  functions and classes of `ToporBitArrayBuffer.hpp` and the `tableByBit`/`tableByEntry` tables of `ToporTableBitInfo.hpp`, with all their static asserts).
+* **The zlib input of `Main.cc` isn't ported:** the Makefile builds the C++ tool with `-DSKIP_ZLIB`, and the port implements that configuration (compressed inputs are read
+  through the shell's decompressors, as the C++ tool does then).
 
 ## Upstream issues found while testing the fork
 

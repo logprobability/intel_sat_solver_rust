@@ -188,7 +188,9 @@ Members already provided by `src/topi.rs` (everything defined inline in `Topi.hp
 * Unsigned arithmetic wraps as in C++ (`overflow-checks` is off in every profile); signed counters that rely on wrap-around use `wrapping_add`.
 * `CApplyFuncOnExitFromScope` / `CSetInScope`: put the body of the function in a `let res = 'body: { .. }` labeled block (every `return x` of the body becomes `break 'body x`) and run the exit code right after it, preserving the order of the exit actions (C++ destructors run in reverse declaration order).
 * Raw views (`Span`, `CCls`, `*mut TULit`) are exactly as fragile as their C++ counterparts: re-derive them wherever the C++ code re-derives them (after a reallocation of `m_B`/`m_W`).
-* Allocation failures never panic: they surface through `uninitialized_or_erroneous()` and `STATUS_ALLOC_FAILED`, as in C++.
+* Allocation failures never panic: they surface through `uninitialized_or_erroneous()` and `STATUS_ALLOC_FAILED`, as in C++ (the one exception is the C++ `throw` of `CBitArraySingleElemWidth`, which becomes a `panic!` with the same message).
+* Overloads: a C++ overload that differs by an extra argument gets the argument's name as a suffix (`reserve_exactly` / `reserve_exactly_init`); a compile-time template overload (`BAGetElem<startBitNum, elemWidth>(buf)`) gets the suffix `ConstExpr` and const generics (`BAGetElemConstExpr::<S, W>(buf)`), and its `static_assert`s become `const { assert!(..) }` blocks.
+* `static_assert`s become `const _: () = assert!(..);` items in the same order, reading a `const` copy of the table they check.
 
 ## Rust-side conventions
 

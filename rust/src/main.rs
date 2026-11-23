@@ -1530,8 +1530,8 @@ fn ToporToolMain(argv: &[String], out: &mut dyn Write) -> Result<i32, String>
 			}
 			Err(_) =>
 			{
-				coutln!(out, "c topor_tool ERROR: couldn't open the input file");
-				return Ok(BadRetVal);
+				coutln!(out, "c topor_tool ERROR: couldn't open the input file"); // COVERAGE-NOT-REACHED: only if the OS fails to spawn sh for a reason other than its absence
+				return Ok(BadRetVal); // COVERAGE-NOT-REACHED: only if the OS fails to spawn sh for a reason other than its absence
 			}
 		}
 	};

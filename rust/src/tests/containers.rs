@@ -410,3 +410,339 @@ fn win_average()
 	w.Clear(true);
 	assert!(w.IsError());
 }
+
+#[test]
+fn table_bit_info_run_time_builders()
+{
+	// The tables are built at compile time; building them at run time must give the same tables
+	let byBit = BuildTableByBitAtRunTime();
+	let byEntry = BuildTableByEntryAtRunTime();
+	for w in 0..MAX_BITS_NUM as usize
+	{
+		assert_eq!(byEntry[w].0, tableByEntry[w].0);
+		for b in 0..64
+		{
+			let (x, y) = (&byBit[w][b], &tableByBit[w][b]);
+			assert_eq!((x.w0ReadMask, x.w1ReadMask, x.w0ReadShr), (y.w0ReadMask, y.w1ReadMask, y.w0ReadShr));
+			let (x, y) = (&byEntry[w].1[b], &tableByEntry[w].1[b]);
+			assert_eq!((x.w0ReadMask, x.w1ReadMask, x.w0ReadShr), (y.w0ReadMask, y.w1ReadMask, y.w0ReadShr));
+		}
+	}
+	let i = &tableByBit[BitsInd(26)][52];
+	assert_eq!((i.W0WriteMask(), i.W0WriteShl(), i.W1WriteMask(), i.W0CleanMask(), i.W1CleanMask()), (!LsbMask(14), 38, LsbMask(14), LsbMask(52), !LsbMask(14)));
+}
+
+#[test]
+fn non_contagious_bit_array_buffer_exhaustive_widths()
+{
+	// Every width at every bit offset: write three consecutive elements and read them back; the neighbours must stay intact
+	for width in 1..=64u8
+	{
+		for start in 0..64u64
+		{
+			let mut buf = [0xaaaaaaaaaaaaaaaau64; 5];
+			let mask = LsbMask(width);
+			let vals = [0x0123456789abcdefu64 & mask, 0xfedcba9876543210u64 & mask, mask];
+			let mut b = start;
+			for v in vals
+			{
+				unsafe { BASetElemAndGoToNext(buf.as_mut_ptr(), &mut b, width, v) };
+			}
+			assert_eq!(b, start + 3 * width as u64);
+			let mut b = start;
+			for v in vals
+			{
+				assert_eq!(unsafe { BAGetElemAndGoToNext(buf.as_ptr(), &mut b, width) }, v);
+			}
+			// The words, which the elements don't touch, are intact
+			for w in 0..5u64
+			{
+				if w < start / 64 || w > (b - 1) / 64 + 1
+				{
+					assert_eq!(buf[w as usize], 0xaaaaaaaaaaaaaaaa, "width {} start {} word {}", width, start, w);
+				}
+			}
+			// Within a word, the non-contagious and the contagious layouts agree
+			if start + width as u64 <= 64
+			{
+				let mut cbuf = [0u64; 2];
+				unsafe { CSetElem(cbuf.as_mut_ptr(), start, width, vals[0]) };
+				let mut nbuf = [0u64; 2];
+				unsafe { BASetElem(nbuf.as_mut_ptr(), start, width, vals[0]) };
+				assert_eq!(cbuf, nbuf);
+			}
+			unsafe { BASetElem(buf.as_mut_ptr(), start, width, 0) };
+			assert_eq!(unsafe { BAGetElem(buf.as_ptr(), start, width) }, 0);
+			if width < 64
+			{
+				// The sum is returned as is, while only its width bits are stored
+				assert_eq!(unsafe { BAIncrAndGet(buf.as_mut_ptr(), start, width, 5) }, 5);
+				assert_eq!(unsafe { BAGetElem(buf.as_ptr(), start, width) }, 5 & mask);
+			}
+		}
+	}
+}
+
+#[test]
+fn non_contagious_bit_array_buffer_const_expr()
+{
+	fn Check<const S: u8, const W: u8>()
+	{
+		let vals = [0x0123456789abcdefu64 & LsbMask(W), LsbMask(W), 1];
+		for v in vals
+		{
+			let mut a = [0x5555555555555555u64; 2];
+			let mut b = a;
+			unsafe
+			{
+				BASetElemConstExpr::<S, W>(a.as_mut_ptr(), v);
+				BASetElem(b.as_mut_ptr(), S as u64, W, v);
+			}
+			assert_eq!(a, b, "{} {}", S, W);
+			assert_eq!(unsafe { BAGetElemConstExpr::<S, W>(a.as_ptr()) }, v);
+			assert_eq!(unsafe { BAGetElemConstExpr::<S, W>(a.as_ptr()) }, unsafe { BAGetElem(a.as_ptr(), S as u64, W) });
+		}
+		let mut a = [0u64; 2];
+		assert_eq!(unsafe { BAIncrAndGetConstExpr::<S, W>(a.as_mut_ptr(), 1) }, 1);
+		assert_eq!(unsafe { BAIncrAndGetConstExpr::<S, W>(a.as_mut_ptr(), 2) }, 3);
+	}
+	Check::<0, 1>();
+	Check::<0, 64>();
+	Check::<0, 9>();
+	Check::<5, 7>();
+	Check::<20, 44>();
+	Check::<60, 4>();
+	Check::<60, 10>();
+	Check::<63, 64>();
+	Check::<33, 31>();
+}
+
+#[test]
+fn bit_array_single_elem_width()
+{
+	// setUp sets the width of a dynamic-width array (ChangeElemWidth doesn't compile for the compile-time widths, as in C++); a dynamic-width array is returned for further checks
+	fn Check<const W: u8>(width: u8, setUp: impl FnOnce(&mut CBitArraySingleElemWidth<W>)) -> CBitArraySingleElemWidth<W>
+	{
+		let mut a = CBitArraySingleElemWidth::<W>::default();
+		setUp(&mut a);
+		assert_eq!((a.ElemWidth(), a.ElemsNum()), (width, 0));
+		let mask = LsbMask(width);
+		let Val = |i: u64| (i.wrapping_mul(0x9E3779B97F4A7C15) >> 3) & mask;
+		for i in 0..300u64
+		{
+			a.Push(Val(i));
+		}
+		assert_eq!(a.ElemsNum(), 300);
+		for i in 0..300u64
+		{
+			assert_eq!(a.Get(i), Val(i), "W {} width {} i {}", W, width, i);
+		}
+		// Set only ORs the bits in (as in the C++ version), so it's applied to zeroed elements
+		a.SetAllElemsTo0();
+		for i in 0..300u64
+		{
+			assert_eq!(a.Get(i), 0);
+			a.Set(i, Val(i + 1));
+		}
+		for i in 0..300u64
+		{
+			assert_eq!(a.Get(i), Val(i + 1));
+		}
+		// Beyond the existing elements: the array grows tightly, and the new elements are 0
+		a.ForceElemSetNonExistingTo0(1000, mask);
+		assert_eq!((a.ElemsNum(), a.Get(1000), a.Get(999), a.Get(500)), (1001, mask, 0, 0));
+		// Writing an existing element ORs the bits in, but for the compile-time width 64, where the word is assigned (as in the C++ version)
+		a.ForceElemSetNonExistingTo0(7, 0);
+		assert_eq!((a.ElemsNum(), a.Get(7)), (1001, if W == 64 { 0 } else { Val(8) }), "W {} width {}", W, width);
+		a
+	}
+	for width in [1u8, 2, 3, 5, 7, 8, 13, 16, 31, 32, 33, 63, 64]
+	{
+		let mut a = Check::<0>(width, |a| a.ChangeElemWidth(width));
+		// Changing the width of an allocated array only changes the interpretation of the bits
+		a.ChangeElemWidth(64);
+		assert_eq!(a.ElemWidth(), 64);
+	}
+	Check::<1>(1, |_| ());
+	Check::<2>(2, |_| ());
+	Check::<4>(4, |_| ());
+	Check::<8>(8, |_| ());
+	Check::<16>(16, |_| ());
+	Check::<32>(32, |_| ());
+	Check::<64>(64, |_| ());
+	Check::<7>(7, |_| ());
+	Check::<26>(26, |_| ());
+	// BitNum: WordInd uses it only for the widths, which aren't compile-time powers of 2 (as in the C++ version), so the other branch is checked directly
+	assert_eq!(CBitArraySingleElemWidth::<8>::new().BitNum(5), 40);
+	assert_eq!(CBitArraySingleElemWidth::<7>::new().BitNum(5), 35);
+	let mut z = CBitArraySingleElemWidth::<0>::new();
+	z.SetAllElemsTo0();
+	z.ChangeElemWidth(5);
+	assert_eq!(z.ElemWidth(), 5);
+	for badWidth in [0u8, 65]
+	{
+		let r = std::panic::catch_unwind(move || CBitArraySingleElemWidth::<0>::new().ChangeElemWidth(badWidth));
+		assert_eq!(*r.unwrap_err().downcast::<&str>().unwrap(), "ChangeElemWidth failed, since the new width == 0 or > 64");
+	}
+	// bad_alloc: on the first allocation and on a reallocation
+	let r = std::panic::catch_unwind(|| with_alloc_failure(0, || CBitArraySingleElemWidth::<8>::new().Push(1)));
+	alloc_fault::never_fail();
+	assert_eq!(*r.unwrap_err().downcast::<&str>().unwrap(), "bad_alloc");
+	let r = std::panic::catch_unwind(||
+	{
+		let mut a = CBitArraySingleElemWidth::<8>::new();
+		a.Push(1);
+		with_alloc_failure(0, || a.ForceElemSetNonExistingTo0(10000, 1));
+	});
+	alloc_fault::never_fail();
+	assert_eq!(*r.unwrap_err().downcast::<&str>().unwrap(), "bad_alloc");
+}
+
+#[test]
+fn bit_array_aligned()
+{
+	fn Check<const W: u8>()
+	where
+		crate::topor_bit_array_buffer::TElemWidth<W>: crate::topor_bit_array_buffer::TSelAlignedUInt,
+	{
+		let mut a = CBitArrayAligned::<W>::default();
+		assert_eq!((a.ElemWidth(), a.ElemsNum()), (W, 0));
+		let mask = LsbMask(W);
+		for i in 0..100u64
+		{
+			a.Push(i.wrapping_mul(0x9E3779B97F4A7C15) & mask);
+		}
+		assert_eq!(a.ElemsNum(), 100);
+		for i in 0..100u64
+		{
+			assert_eq!(a.Get(i), i.wrapping_mul(0x9E3779B97F4A7C15) & mask);
+		}
+		a.Set(3, mask);
+		assert_eq!(a.Get(3), mask);
+		a.ForceElemSetNonExistingTo0(200, 1);
+		assert_eq!((a.ElemsNum(), a.Get(200), a.Get(150)), (201, 1, 0));
+		a.ForceElemSetNonExistingTo0(5, 0);
+		assert_eq!(a.Get(5), 0);
+		a.SetAllElemsTo0();
+		assert!((0..201).all(|i| a.Get(i) == 0));
+	}
+	Check::<1>();
+	Check::<5>();
+	Check::<8>();
+	Check::<12>();
+	Check::<16>();
+	Check::<20>();
+	Check::<32>();
+	Check::<40>();
+	Check::<64>();
+	// The element is converted to the aligned type as in C++: a bool is any non-0 value; a narrower integer is truncated
+	let mut b = CBitArrayAligned::<1>::new();
+	b.Push(6);
+	assert_eq!(b.Get(0), 1);
+	let mut n = CBitArrayAligned::<12>::new();
+	n.Push(0x12345);
+	assert_eq!(n.Get(0), 0x2345);
+}
+
+// The buffers of the non-contagious bit-array functions and classes must be byte-identical to those of the C++ version:
+// tests/data/bit_array_buffer_cpp_golden.txt is the output of the C++ harness tests/data/bit_array_buffer_cpp_golden.cc over ToporBitArrayBuffer.hpp
+// (to regenerate: clang++ -std=c++20 -I<repository root> bit_array_buffer_cpp_golden.cc -o golden && ./golden > bit_array_buffer_cpp_golden.txt)
+#[test]
+fn bit_array_buffer_matches_cpp()
+{
+	use std::fmt::Write;
+	fn Val(i: u64, w: u8) -> u64
+	{
+		(i.wrapping_mul(0x9E3779B97F4A7C15) >> 3) & LsbMask(w)
+	}
+	fn Single<const W: u8>(out: &mut String, width: u8, setUp: impl FnOnce(&mut CBitArraySingleElemWidth<W>))
+	{
+		let mut a = CBitArraySingleElemWidth::<W>::new();
+		setUp(&mut a);
+		for i in 0..300
+		{
+			a.Push(Val(i, width));
+		}
+		write!(out, "S {} {} n={}", W, width, a.ElemsNum()).unwrap();
+		for i in 0..300
+		{
+			write!(out, " {:x}", a.Get(i)).unwrap();
+		}
+		a.ForceElemSetNonExistingTo0(1000, LsbMask(width));
+		writeln!(out, " | {:x} {:x}", a.Get(1000), a.Get(999)).unwrap();
+	}
+	fn Aligned<const W: u8>(out: &mut String)
+	where
+		crate::topor_bit_array_buffer::TElemWidth<W>: crate::topor_bit_array_buffer::TSelAlignedUInt,
+	{
+		let mut a = CBitArrayAligned::<W>::new();
+		for i in 0..100u64
+		{
+			a.Push(i.wrapping_mul(0x9E3779B97F4A7C15));
+		}
+		write!(out, "A {}", W).unwrap();
+		for i in 0..100
+		{
+			write!(out, " {:x}", a.Get(i)).unwrap();
+		}
+		writeln!(out).unwrap();
+	}
+	let mut out = String::new();
+	for w in 1..=64u8
+	{
+		for s in 0..64u64
+		{
+			let mut buf = [0xaaaaaaaaaaaaaaaau64; 5];
+			let mut b = s;
+			unsafe
+			{
+				BASetElemAndGoToNext(buf.as_mut_ptr(), &mut b, w, 0x0123456789abcdef & LsbMask(w));
+				BASetElemAndGoToNext(buf.as_mut_ptr(), &mut b, w, 0xfedcba9876543210 & LsbMask(w));
+			}
+			let inc = unsafe { BAIncrAndGet(buf.as_mut_ptr(), s, w, 3) };
+			write!(out, "B {} {}", w, s).unwrap();
+			for x in buf
+			{
+				write!(out, " {:x}", x).unwrap();
+			}
+			writeln!(out, " {:x} {:x}", unsafe { BAGetElem(buf.as_ptr(), s + w as u64, w) }, inc).unwrap();
+		}
+	}
+	let mut c = [0x5555555555555555u64; 2];
+	unsafe { BASetElemConstExpr::<60, 10>(c.as_mut_ptr(), 0x3ff) };
+	writeln!(out, "C {:x} {:x} {:x}", c[0], c[1], unsafe { BAGetElemConstExpr::<60, 10>(c.as_ptr()) }).unwrap();
+	unsafe { BASetElemConstExpr::<0, 64>(c.as_mut_ptr(), 7) };
+	// The C++ evaluates the arguments of printf in an unspecified order; clang evaluates them left to right, as here
+	let (c0, c1) = (c[0], c[1]);
+	writeln!(out, "C {:x} {:x} {:x}", c0, c1, unsafe { BAIncrAndGetConstExpr::<0, 64>(c.as_mut_ptr(), 2) }).unwrap();
+	unsafe { BASetElemConstExpr::<5, 7>(c.as_mut_ptr(), 0x55) };
+	writeln!(out, "C {:x} {:x} {:x}", c[0], c[1], unsafe { BAGetElemConstExpr::<5, 7>(c.as_ptr()) }).unwrap();
+	for w in [1u8, 2, 3, 5, 7, 8, 13, 16, 31, 32, 33, 63, 64]
+	{
+		Single::<0>(&mut out, w, |a| a.ChangeElemWidth(w));
+	}
+	Single::<1>(&mut out, 1, |_| ());
+	Single::<2>(&mut out, 2, |_| ());
+	Single::<4>(&mut out, 4, |_| ());
+	Single::<8>(&mut out, 8, |_| ());
+	Single::<16>(&mut out, 16, |_| ());
+	Single::<32>(&mut out, 32, |_| ());
+	Single::<64>(&mut out, 64, |_| ());
+	Single::<7>(&mut out, 7, |_| ());
+	Single::<26>(&mut out, 26, |_| ());
+	Aligned::<1>(&mut out);
+	Aligned::<5>(&mut out);
+	Aligned::<8>(&mut out);
+	Aligned::<12>(&mut out);
+	Aligned::<16>(&mut out);
+	Aligned::<20>(&mut out);
+	Aligned::<32>(&mut out);
+	Aligned::<40>(&mut out);
+	Aligned::<64>(&mut out);
+	let golden = include_str!("data/bit_array_buffer_cpp_golden.txt");
+	for (i, (r, c)) in out.lines().zip(golden.lines()).enumerate()
+	{
+		assert_eq!(r, c, "line {}", i + 1);
+	}
+	assert_eq!(out.lines().count(), golden.lines().count());
+}
