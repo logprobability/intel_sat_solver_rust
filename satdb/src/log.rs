@@ -292,14 +292,14 @@ pub(crate) fn records(bytes: &[u8]) -> Result<(Vec<(usize, &[u8])>, usize), Erro
 	Ok((out, at))
 }
 
-/// The databases of a log file's contents: the empty one, then the one after each record, and where the valid data ends
+/// The database of a log file's contents (its past values are `as_of` views of it), and where the valid data ends
 /// (`FILE_HEADER` at least, as a torn header is rewritten)
-pub(crate) fn replay(bytes: &[u8]) -> Result<(Vec<Db>, usize), Error>
+pub(crate) fn replay(bytes: &[u8]) -> Result<(Db, usize), Error>
 {
 	let header = file_header();
 	if bytes.len() < FILE_HEADER
 	{
-		return if header.starts_with(bytes) { Ok((vec![Db::new()], FILE_HEADER)) } else { Err(Error::CorruptLog { offset: 0, msg: "not a satdb log".into() }) };
+		return if header.starts_with(bytes) { Ok((Db::new(), FILE_HEADER)) } else { Err(Error::CorruptLog { offset: 0, msg: "not a satdb log".into() }) };
 	}
 	if bytes[..8] != *MAGIC
 	{
@@ -311,15 +311,14 @@ pub(crate) fn replay(bytes: &[u8]) -> Result<(Vec<Db>, usize), Error>
 		return Err(Error::CorruptLog { offset: 8, msg: format!("format version {v}, this library reads version {VERSION}") });
 	}
 	let (recs, end) = records(bytes)?;
-	let mut history = vec![Db::new()];
+	let mut db = Db::new();
 	for (at, payload) in recs
 	{
 		let corrupt = |msg: String| Error::CorruptLog { offset: at as u64, msg };
 		let rec = decode(payload).map_err(corrupt)?;
-		let db = history.last().expect("starts with the empty database").replay(&rec).map_err(corrupt)?;
-		history.push(db);
+		db = db.replay(&rec).map_err(corrupt)?;
 	}
-	Ok((history, end))
+	Ok((db, end))
 }
 
 /// An open log: the locked file and the length of its committed data
@@ -336,8 +335,8 @@ pub(crate) struct Log
 
 impl Log
 {
-	/// Open (or create) the log at `path` and replay it: the databases after each record, starting with the empty one
-	pub(crate) fn open(path: &Path) -> Result<(Log, Vec<Db>), Error>
+	/// Open (or create) the log at `path` and replay it: the database after its last record
+	pub(crate) fn open(path: &Path) -> Result<(Log, Db), Error>
 	{
 		let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).map_err(io)?;
 		file.try_lock().map_err(|e| match e
@@ -347,7 +346,7 @@ impl Log
 		})?;
 		let mut bytes = Vec::new();
 		file.read_to_end(&mut bytes).map_err(io)?;
-		let (history, end) = replay(&bytes)?;
+		let (db, end) = replay(&bytes)?;
 		if bytes.len() < FILE_HEADER
 		{
 			// A new file (or a torn header): write the header, and make the file's directory entry durable
@@ -375,7 +374,7 @@ impl Log
 			#[cfg(test)]
 			fault: 0,
 		};
-		Ok((log, history))
+		Ok((log, db))
 	}
 
 	/// Append a committed transaction's record and sync it; on an error, the file is truncated back to the committed data
@@ -425,7 +424,7 @@ impl Log
 mod tests
 {
 	use super::*;
-	use crate::db::tests::{assert_same_db, random_workload};
+	use crate::db::tests::{assert_same_db, assert_same_reads, random_workload};
 	use crate::db::{Conn, Entity, Tx, TxReport, TX_INSTANT};
 	use crate::testutil::Rng;
 	use std::fs;
@@ -593,7 +592,7 @@ mod tests
 				_ => (n - 1, start),
 			};
 			assert_eq!(file_len(&path), len, "cut at {cut}");
-			assert_same_db(&conn.db(), &mem.as_of(basis).unwrap(), &format!("cut at {cut}"));
+			assert_same_reads(&conn.db(), &mem.as_of(basis).unwrap(), &format!("cut at {cut}"));
 			if basis == n - 1
 			{
 				same_report(&conn.transact(&probe()).unwrap(), &last);
@@ -824,5 +823,55 @@ mod tests
 		assert_eq!(Conn::open(&path).unwrap().db().basis_t(), 1);
 		assert!(matches!(Conn::open(scratch.path("")), Err(Error::Io(_))));
 		assert!(matches!(Conn::open(scratch.path("missing/db.log")), Err(Error::Io(_))));
+	}
+
+	/// A log of `txs` transactions of 20 assertions each (and some retractions), written without syncing (the test is about reading)
+	fn big_log(path: &Path, txs: usize)
+	{
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		tx.define("n", ValueType::Int, Cardinality::One).define("tag", ValueType::Str, Cardinality::Many).define("ref", ValueType::Ref, Cardinality::Many);
+		let mut bytes = file_header().to_vec();
+		bytes.extend(frame(&encode(&conn.transact(&tx).unwrap().record())).unwrap());
+		let mut rng = Rng::new(3);
+		let mut eids: Vec<Eid> = Vec::new();
+		for _ in 1..txs
+		{
+			let mut tx = Tx::new();
+			for _ in 0..20
+			{
+				let e = if eids.is_empty() || rng.next() % 4 == 0 { tx.temp() } else { Entity::Id(eids[(rng.next() % eids.len() as u64) as usize]) };
+				match rng.next() % 3
+				{
+					0 => tx.add(e, "n", (rng.next() % 1000) as i64),
+					1 => tx.add(e, "tag", ["a", "b", "c", "d"][(rng.next() % 4) as usize]),
+					_ if !eids.is_empty() => tx.add(e, "ref", Entity::Id(eids[(rng.next() % eids.len() as u64) as usize])),
+					_ => tx.add(e, "n", 0),
+				};
+			}
+			if let Ok(r) = conn.transact(&tx)
+			{
+				eids.extend(r.tempids.iter().copied());
+				bytes.extend(frame(&encode(&r.record())).unwrap());
+			}
+		}
+		fs::write(path, bytes).unwrap();
+	}
+
+	// The time to open a durable log (release: cargo test --release open_timings -- --ignored --nocapture)
+	#[test]
+	#[ignore]
+	fn open_timings()
+	{
+		let scratch = Scratch::new("open_timings");
+		for txs in [1_000, 10_000, 50_000]
+		{
+			let path = scratch.path(&format!("{txs}.log"));
+			big_log(&path, txs);
+			let t = std::time::Instant::now();
+			let conn = Conn::open(&path).unwrap();
+			println!("{txs} transactions, {} bytes: open {:?}", file_len(&path), t.elapsed());
+			drop(conn);
+		}
 	}
 }
