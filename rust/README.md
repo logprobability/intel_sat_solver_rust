@@ -60,6 +60,9 @@ The control flow is the same statement by statement. The differences are confine
 * **Statistics callbacks and the heap's reference to the activity increment** are replaced by explicit parameters (`GetStatBufferInfo`, `increase_score(.., &mut inc)`),
   scope-exit lambdas by explicit exit code, and `std::function`/`ofstream*` by boxed closures/`Box<dyn Write>`.
 * **Out-of-range `/mode/value`**: the C++ indexes the per-mode default arrays out of bounds; the fork reports the parameter error and leaves the other parameters intact.
+* **The names of the dump files** (`TOPOR_DUMP_NAME`) also have the number of the dump in the process, after the process id. The address in the name doesn't tell
+  apart the solvers created in the same second: in the fork it is that of the solver inside `CTopi::new`, before it's moved out, so every solver has the same one,
+  and in the C++ a solver may reuse a freed one; their dumps would overwrite each other.
 * **Code that is unreachable by construction is replaced by assertions.** Where the C++ re-tests a condition that nothing since its previous test can change, handles
   a case that an assertion right above it excludes, or tests something that always holds (e.g., `expectedVal != -1` for a `uint8_t`), the fork drops the branch and keeps
   the condition as a `debug_assert!`. The reachable control flow is unchanged (verified by the differential testing). The places: the `IsUnrecoverable` re-tests in
