@@ -29,7 +29,9 @@
 //!   or in a rule, whose arguments are terms or lookup refs (see the `rules` module). Required variables (`(name [?a] ?b)`) are not supported.
 //!   The rules' variables are their own (an input named like one of them doesn't replace it), and their syntax errors say `in the rules`.
 //! * Patterns `[e :attr v tx added]` of 2 to 5 elements (missing positions are ignored); the attribute is a keyword constant.
-//!   `_` is a variable of its own at every occurrence. A lookup ref `[:attr value]` names an entity in the entity or value position.
+//!   `_` is a variable of its own at every occurrence, a *blank*, and so is each missing position. Blanks are never join variables:
+//!   `(not [?p :person/friend _])` is `(not-join [?p] ...)`, and the branches of `or` need the same variables apart from their blanks.
+//!   A lookup ref `[:attr value]` names an entity in the entity or value position.
 //! * Comparisons `[(op a b)]` with `=`, `!=` (or `not=`), `<`, `<=`, `>` and `>=`.
 //! * `(not clause ...)`, `(not-join [?v ...] clause ...)`, `(or branch ...)` and `(or-join [?v ...] branch ...)`, where a branch
 //!   is a clause or `(and clause ...)`.
@@ -41,7 +43,7 @@
 
 use crate::db::{Db, Error, Value};
 use crate::query::{Agg, Clause, Cmp, Find, Query, Term};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 /// A parsed text query: the query (planned as its clauses were read), its find spec and its `with` terms
 pub struct TextQuery
@@ -309,7 +311,7 @@ struct Parser<'a>
 	q: Query,
 	/// The scalar inputs, by variable name
 	inputs: HashMap<String, Value>,
-	/// The number of `_` read so far (each is a variable of its own)
+	/// The number of blanks so far (each `_` and each missing position of a pattern is a variable of its own, see `blank`)
 	fresh: usize,
 	/// The rules' names and arities
 	rule_names: HashMap<String, usize>,
@@ -472,11 +474,7 @@ impl<'a> Parser<'a>
 	{
 		match &node.form
 		{
-			Form::Symbol(s) if s == "_" =>
-			{
-				self.fresh += 1;
-				Ok(self.q.var(&format!("_{}", self.fresh)))
-			}
+			Form::Symbol(s) if s == "_" => Ok(self.blank()),
 			Form::Symbol(s) if s.starts_with('?') => Ok(match self.inputs.get(s)
 			{
 				Some(v) => Term::Val(v.clone()),
@@ -573,15 +571,7 @@ impl<'a> Parser<'a>
 			rest.push(if i == 2 { self.entity_term(n)? } else { self.term(n)? });
 		}
 		let mut rest = rest.into_iter();
-		let mut next = |p: &mut Self| match rest.next()
-		{
-			Some(t) => t,
-			None =>
-			{
-				p.fresh += 1;
-				p.q.var(&format!("_{}", p.fresh))
-			}
-		};
+		let mut next = |p: &mut Self| rest.next().unwrap_or_else(|| p.blank());
 		let v = next(self);
 		if items.len() <= 3
 		{
@@ -589,6 +579,21 @@ impl<'a> Parser<'a>
 		}
 		let (tx, added) = (next(self), next(self));
 		self.q.pattern_tx_clause(e, &attr, v, tx, added)
+	}
+
+	// A new blank: a variable named _n, which no variable of the text can be named (they start with ?)
+	fn blank(&mut self) -> Term
+	{
+		self.fresh += 1;
+		self.q.var(&format!("_{}", self.fresh))
+	}
+
+	// The variables of `clauses` that an implicit not or or joins on: their free variables, without the blanks
+	fn implicit_join(&self, clauses: &[Clause]) -> Vec<Term>
+	{
+		let mut vs = BTreeSet::new();
+		clauses.iter().for_each(|c| c.free_vars(&mut vs));
+		vs.into_iter().filter(|&x| !self.q.var_name(x).starts_with('_')).map(Term::Var).collect()
 	}
 
 	fn op(&self, name: &str) -> Option<Cmp>
@@ -765,7 +770,8 @@ impl<'a> Parser<'a>
 			return Err(self.err(node, "not needs at least one clause"));
 		}
 		let body = self.body(body)?;
-		self.q.not(join.as_deref(), body)
+		let join = join.unwrap_or_else(|| self.implicit_join(&body));
+		self.q.not(Some(&join), body)
 	}
 
 	fn or(&mut self, node: &Node, join: Option<Vec<Term>>, forms: &[Node]) -> Result<Clause, Error>
@@ -790,7 +796,22 @@ impl<'a> Parser<'a>
 				_ => vec![self.clause(f)?],
 			});
 		}
-		self.q.or(join.as_deref(), branches)
+		let join = match join
+		{
+			Some(j) => j,
+			None =>
+			{
+				let sets: Vec<Vec<Term>> = branches.iter().map(|b| self.implicit_join(b)).collect();
+				if let Some(i) = sets.iter().position(|s| *s != sets[0])
+				{
+					let name = |t: &Term| if let Term::Var(x) = t { self.q.var_name(*x) } else { unreachable!("join lists hold variables") };
+					let names = |s: &[Term]| s.iter().map(name).collect::<Vec<_>>().join(" ");
+					return Err(Error::InvalidQuery(format!("the branches of or use different variables: [{}] and [{}] (or-join names the shared ones)", names(&sets[0]), names(&sets[i]))));
+				}
+				sets.into_iter().next().unwrap_or_default()
+			}
+		};
+		self.q.or(Some(&join), branches)
 	}
 }
 
@@ -894,6 +915,39 @@ mod tests
 		tx.add(t, "tag", "say \"hi\"\n\t\\");
 		let t = conn.transact(&tx).unwrap().eid(t);
 		assert_eq!(conn.db().q(r#"[:find ?e :where [?e :tag "say \"hi\"\n\t\\"]]"#, &[]).unwrap(), vec![vec![Value::Ref(t)]]);
+	}
+
+	// Blanks (`_`, and the missing positions of a short pattern) are never join variables of an implicit not or or,
+	// as in Datomic: (not [?e :ref _]) keeps the entities without a ref, and (or [?e :tag _] [?e :ref _]) joins on ?e only
+	#[test]
+	fn blanks_dont_join()
+	{
+		let (conn, reports) = random_conn(71, 60);
+		let db = conn.db();
+		let log: Vec<_> = reports.iter().flat_map(|r| &r.tx_data).collect();
+		let facts: BTreeSet<(Eid, AttrId, Value)> = replay(log.iter().copied()).into_keys().collect();
+		let id = |n: &str| db.attr_id(n).unwrap();
+		let has = |e: Eid, a: &str| facts.iter().any(|f| f.0 == e && f.1 == id(a));
+		let with_n: Vec<Eid> = facts.iter().filter(|f| f.1 == id("n")).map(|f| f.0).collect();
+		let want = refs(with_n.iter().copied().filter(|&e| !has(e, "ref")));
+		assert!(!want.is_empty() && want.len() < with_n.iter().collect::<BTreeSet<_>>().len());
+		for text in ["[:find ?e :where [?e :n _] (not [?e :ref _])]", "[:find ?e :where [?e :n] (not [?e :ref])]", "[:find ?e :where [?e :n _] (not-join [?e] [?e :ref _])]"]
+		{
+			assert_eq!(db.q(text, &[]).unwrap(), want, "{text}");
+		}
+		let want = refs(with_n.iter().copied().filter(|&e| has(e, "tag") || has(e, "ref")));
+		for text in
+			["[:find ?e :where [?e :n _] (or [?e :tag _] [?e :ref _])]", "[:find ?e :where [?e :n] (or [?e :tag] (and [?e :ref _] [?e :n _]))]", "[:find ?e :where (or [?e :tag _] [?e :ref _]) [?e :n _]]"]
+		{
+			assert_eq!(db.q(text, &[]).unwrap(), want, "{text}");
+		}
+		// A body of blanks only joins on nothing: the rows survive only if no datom matches
+		let any_ref = facts.iter().any(|f| f.1 == id("ref"));
+		assert!(any_ref);
+		assert_eq!(db.q("[:find ?e :where [?e :n _] (not [_ :ref _])]", &[]).unwrap(), Vec::<Vec<Value>>::new());
+		assert_eq!(db.q("[:find ?e :where [?e :n _] (or [_ :ref _] [_ :tag \"no such tag\"])]", &[]).unwrap(), refs(with_n.iter().copied()));
+		// Named variables still have to agree between the branches of or
+		assert!(matches!(db.q("[:find ?e :where [?e :n _] (or [?e :tag _] [?f :ref _])]", &[]), Err(Error::InvalidQuery(_))));
 	}
 
 	#[test]

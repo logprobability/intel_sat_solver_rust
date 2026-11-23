@@ -40,6 +40,7 @@ use crate::pmap::PMap;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 pub type Eid = u64;
@@ -315,13 +316,17 @@ impl Default for Db
 }
 
 /// An entity in a transaction: an existing one, a new one (which the transaction allocates or upserts),
-/// a lookup ref (`Tx::lookup`) or the transaction's own entity
+/// a lookup ref (`Tx::lookup`) or the transaction's own entity.
+/// A tempid or a lookup ref carries the identity of its `Tx` (unique in the process) and its index in it,
+/// so that using it in another transaction is an `Error::ForeignEntity` rather than another entity of that transaction
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Entity
 {
 	Id(Eid),
-	Temp(u32),
-	Lookup(u32),
+	/// (transaction, index)
+	Temp(u64, u32),
+	/// (transaction, index)
+	Lookup(u64, u32),
 	Tx,
 }
 
@@ -385,14 +390,24 @@ enum Op
 }
 
 /// A transaction: attribute definitions (applied first), then a set of assertions and retractions (see the module documentation)
-#[derive(Default)]
 pub struct Tx
 {
+	/// The identity of this transaction's tempids and lookup refs
+	id: u64,
 	temps: u32,
 	lookups: Vec<(Arc<str>, Value)>,
 	defs: Vec<Attr>,
 	ops: Vec<Op>,
 	instant: Option<i64>,
+}
+
+impl Default for Tx
+{
+	fn default() -> Self
+	{
+		static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+		Tx { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), temps: 0, lookups: Vec::new(), defs: Vec::new(), ops: Vec::new(), instant: None }
+	}
 }
 
 impl Tx
@@ -406,14 +421,14 @@ impl Tx
 	pub fn temp(&mut self) -> Entity
 	{
 		self.temps += 1;
-		Entity::Temp(self.temps - 1)
+		Entity::Temp(self.id, self.temps - 1)
 	}
 
 	/// The lookup ref [attr v]: the entity whose unique attribute `attr` has the value `v` before the transaction
 	pub fn lookup(&mut self, attr: &str, v: impl Into<Value>) -> Entity
 	{
 		self.lookups.push((attr.into(), v.into()));
-		Entity::Lookup(self.lookups.len() as u32 - 1)
+		Entity::Lookup(self.id, self.lookups.len() as u32 - 1)
 	}
 
 	/// Define an attribute (neither unique nor a component); redefining an existing attribute identically is a no-op
@@ -468,6 +483,8 @@ pub struct TxReport
 	pub lookups: Vec<Eid>,
 	/// The transaction's `db/txInstant` datom, then the retractions and the assertions (each in EAV order)
 	pub tx_data: Vec<Datom>,
+	/// The identity of the `Tx` (see `Entity`)
+	tx_id: u64,
 }
 
 impl TxReport
@@ -478,9 +495,10 @@ impl TxReport
 		match e
 		{
 			Entity::Id(e) => e,
-			Entity::Temp(t) => self.tempids[t as usize],
-			Entity::Lookup(l) => self.lookups[l as usize],
+			Entity::Temp(x, t) if x == self.tx_id => self.tempids[t as usize],
+			Entity::Lookup(x, l) if x == self.tx_id => self.lookups[l as usize],
 			Entity::Tx => self.tx,
+			_ => panic!("{e:?} belongs to another transaction"),
 		}
 	}
 }
@@ -529,7 +547,7 @@ enum Res
 }
 
 /// A value of a transaction before its tempids are allocated
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 enum ResVal
 {
 	Val(Value),
@@ -805,8 +823,8 @@ impl Db
 			match e
 			{
 				Entity::Id(x) => Ok(Res::Eid(self.check_eid(x)?)),
-				Entity::Temp(t) if t < tx.temps => Ok(Res::Temp(t)),
-				Entity::Lookup(l) if (l as usize) < lookups.len() => Ok(Res::Eid(lookups[l as usize])),
+				Entity::Temp(x, t) if x == tx.id && t < tx.temps => Ok(Res::Temp(t)),
+				Entity::Lookup(x, l) if x == tx.id && (l as usize) < lookups.len() => Ok(Res::Eid(lookups[l as usize])),
 				Entity::Tx => Ok(Res::Eid(tx_eid)),
 				_ => Err(Error::ForeignEntity(e)),
 			}
@@ -847,17 +865,18 @@ impl Db
 		loop
 		{
 			let mut changed = false;
-			let mut holders: HashMap<(AttrId, Value), Res> = HashMap::new();
+			// The identity values asserted so far this round, each with its holder; a value that is a new entity is its class
+			// (which may be stale once classes merge later in the round, but then the round changed something and there is another)
+			let mut holders: HashMap<(AttrId, ResVal), Res> = HashMap::new();
 			for op in ops.iter().filter(|op| op.added && db.attr(op.a).unique == Some(Unique::Identity))
 			{
 				let v = match &op.v
 				{
-					ResVal::Val(v) => v.clone(),
+					ResVal::Val(v) => ResVal::Val(v.clone()),
 					ResVal::Temp(t) => match temps.res(*t)
 					{
-						Res::Eid(x) => Value::Ref(x),
-						// An identity value that is a new entity can't match an existing one; it may next round
-						Res::Temp(_) => continue,
+						Res::Eid(x) => ResVal::Val(Value::Ref(x)),
+						Res::Temp(r) => ResVal::Temp(r),
 					},
 				};
 				let me = match op.e
@@ -865,7 +884,13 @@ impl Db
 					Res::Temp(t) => temps.res(t),
 					e => e,
 				};
-				let other = self.entities(op.a, &v).next().map(Res::Eid).or_else(|| holders.get(&(op.a, v.clone())).copied());
+				// Only an existing value can belong to an existing entity
+				let existing = match &v
+				{
+					ResVal::Val(x) => self.entities(op.a, x).next().map(Res::Eid),
+					ResVal::Temp(_) => None,
+				};
+				let other = existing.or_else(|| holders.get(&(op.a, v.clone())).copied());
 				match (op.e, other)
 				{
 					(Res::Temp(t), Some(o)) => changed |= temps.unify(t, o)?,
@@ -974,7 +999,7 @@ impl Db
 		let mut tx_data = vec![datom((tx_eid, instant_attr, Value::Int(instant)), true)];
 		tx_data.extend(retracted.into_iter().map(|d| datom(d, false)));
 		tx_data.extend(asserted.into_iter().map(|d| datom(d, true)));
-		Ok(TxReport { db_before: self.clone(), db_after: db, tx: tx_eid, tempids, lookups, tx_data })
+		Ok(TxReport { db_before: self.clone(), db_after: db, tx: tx_eid, tempids, lookups, tx_data, tx_id: tx.id })
 	}
 
 	fn define(&mut self, def: &Attr) -> Result<(), Error>
@@ -1296,6 +1321,22 @@ pub(crate) mod tests
 		assert_eq!(conn.db().stats(name), AttrStats { datoms: 1, entities: 1, values: 1 });
 	}
 
+	// A report resolves the entities of its own transaction only, even where another transaction's tempid has an index in range
+	#[test]
+	#[should_panic(expected = "belongs to another transaction")]
+	fn a_report_refuses_another_transactions_tempid()
+	{
+		let (mut conn, _) = people();
+		let mut other = Tx::new();
+		let theirs = other.temp();
+		let mut tx = Tx::new();
+		let mine = tx.temp();
+		tx.add(mine, "person/name", "M");
+		let r = conn.transact(&tx).unwrap();
+		assert!(r.eid(mine) > r.tx);
+		r.eid(theirs);
+	}
+
 	#[test]
 	fn validation()
 	{
@@ -1329,6 +1370,15 @@ pub(crate) mod tests
 		{
 			let mut tx = Tx::new();
 			tx.add(e, "person/age", 1);
+			assert_eq!(conn.transact(&tx).err(), Some(Error::ForeignEntity(e)));
+			// Also when this transaction has a tempid and a lookup of the same index, as an entity and as a value
+			let mut tx = Tx::new();
+			let (mine, _) = (tx.temp(), tx.lookup("person/email", "bob@x"));
+			tx.add(mine, "person/name", "M").add(e, "person/age", 1);
+			assert_eq!(conn.transact(&tx).err(), Some(Error::ForeignEntity(e)));
+			let mut tx = Tx::new();
+			let (mine, _) = (tx.temp(), tx.lookup("person/email", "bob@x"));
+			tx.add(mine, "person/friend", e);
 			assert_eq!(conn.transact(&tx).err(), Some(Error::ForeignEntity(e)));
 		}
 		// Schema rules
@@ -1444,6 +1494,172 @@ pub(crate) mod tests
 		assert_eq!(r5.tempids, vec![bob]);
 		assert!(conn.db().values(bob, ssn).eq([&Value::from("456")]));
 		assert!(conn.db().values(bob, age).eq([&Value::Int(40)]));
+	}
+
+	// Identity values that are refs to new entities: tempids referring to the same new entity (or to tempids that unify) unify too
+	#[test]
+	fn identity_refs_to_tempids_unify()
+	{
+		let schema = |tx: &mut Tx| {
+			tx.define("org/name", ValueType::Str, Cardinality::One)
+				.define_attr(Attr::new("org/id", ValueType::Str, Cardinality::One).unique(Unique::Identity))
+				.define_attr(Attr::new("person/org", ValueType::Ref, Cardinality::One).unique(Unique::Identity))
+				.define("person/age", ValueType::Int, Cardinality::One);
+		};
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		schema(&mut tx);
+		conn.transact(&tx).unwrap();
+		let org = conn.db().attr_id("person/org").unwrap();
+		// p1 and p2 both name the new org o
+		let mut tx = Tx::new();
+		let (o, p1, p2) = (tx.temp(), tx.temp(), tx.temp());
+		tx.add(o, "org/name", "Acme").add(p1, "person/org", o).add(p2, "person/org", o).add(p2, "person/age", 3);
+		let r = conn.transact(&tx).unwrap();
+		assert_eq!(r.tempids[1], r.tempids[2]);
+		assert_ne!(r.tempids[0], r.tempids[1]);
+		assert_eq!(conn.db().attr_datoms(org).collect::<Vec<_>>(), vec![(r.tempids[1], &Value::Ref(r.tempids[0]))]);
+		// o1 and o2 unify through their own identity first, then p1 and p2 through them (p2's ops come first: a second round)
+		let mut tx = Tx::new();
+		let (p2, p1, o1, o2) = (tx.temp(), tx.temp(), tx.temp(), tx.temp());
+		tx.add(p2, "person/org", o2).add(p1, "person/org", o1).add(o1, "org/id", "globex").add(o2, "org/id", "globex");
+		let r = conn.transact(&tx).unwrap();
+		assert_eq!((r.tempids[0], r.tempids[2]), (r.tempids[1], r.tempids[3]));
+		assert_ne!(r.tempids[0], r.tempids[2]);
+		// Refs to different new entities don't unify
+		let mut tx = Tx::new();
+		let (o1, o2, p1, p2) = (tx.temp(), tx.temp(), tx.temp(), tx.temp());
+		tx.add(o1, "org/name", "A").add(o2, "org/name", "B").add(p1, "person/org", o1).add(p2, "person/org", o2);
+		let r = conn.transact(&tx).unwrap();
+		assert_eq!(r.tempids.iter().collect::<BTreeSet<_>>().len(), 4);
+		// p1 and p2 are one entity through o, but p1 upserts to ann and p2 to ben (existing entities): a conflict
+		let mut tx = Tx::new();
+		let (ann, ben) = (tx.temp(), tx.temp());
+		tx.add(ann, "org/id", "ann").add(ben, "org/id", "ben");
+		conn.transact(&tx).unwrap();
+		let mut tx = Tx::new();
+		let (o, p1, p2) = (tx.temp(), tx.temp(), tx.temp());
+		tx.add(o, "org/name", "Initech").add(p1, "person/org", o).add(p2, "person/org", o);
+		tx.add(p1, "org/id", "ann").add(p2, "org/id", "ben");
+		assert!(matches!(conn.transact(&tx), Err(Error::UpsertConflict(..))));
+	}
+
+	// Random upserts and unifications through string and ref-valued identities against a naive fixpoint over every pair of assertions
+	#[test]
+	fn identity_unification_matches_a_naive_fixpoint()
+	{
+		let mut rng = Rng::new(21);
+		// How many transactions conflicted, and how many unified two tempids only through a ref to a new entity
+		let (mut conflicts, mut through_refs) = (0, 0);
+		for _ in 0..300
+		{
+			let mut conn = Conn::new();
+			let mut tx = Tx::new();
+			tx.define_attr(Attr::new("k/id", ValueType::Str, Cardinality::Many).unique(Unique::Identity))
+				.define_attr(Attr::new("k/ref", ValueType::Ref, Cardinality::Many).unique(Unique::Identity));
+			// Existing entities: e0 and e1 with ids, e2 referring to e0
+			let ex: Vec<Entity> = (0..3).map(|_| tx.temp()).collect();
+			tx.add(ex[0], "k/id", "x0").add(ex[1], "k/id", "x1").add(ex[2], "k/ref", ex[0]);
+			let eids = conn.transact(&tx).unwrap().tempids;
+			// The new tempids' identity assertions: (subject, Ok(id) or Err(ref target: a tempid or an existing entity))
+			let nt = 2 + (rng.next() % 5) as usize;
+			let mut tx = Tx::new();
+			let ts: Vec<Entity> = (0..nt).map(|_| tx.temp()).collect();
+			let mut ops: Vec<(usize, Result<String, usize>)> = Vec::new();
+			for _ in 0..rng.next() % 8
+			{
+				let s = (rng.next() % nt as u64) as usize;
+				let v = match rng.next() % 4
+				{
+					0 => Ok(["x0", "x1", "n0", "n1"][(rng.next() % 4) as usize].to_string()),
+					1 => Err(nt + (rng.next() % 3) as usize),
+					_ => Err((rng.next() % nt as u64) as usize),
+				};
+				match &v
+				{
+					Ok(id) => tx.add(ts[s], "k/id", id.as_str()),
+					Err(t) if *t >= nt => tx.add(ts[s], "k/ref", Entity::Id(eids[t - nt])),
+					Err(t) => tx.add(ts[s], "k/ref", ts[*t]),
+				};
+				ops.push((s, v));
+			}
+			// The naive fixpoint: nodes 0..nt are the tempids, nt..nt+3 the existing entities
+			let mut class: Vec<usize> = (0..nt + 3).collect();
+			let existing_id = |id: &str| ["x0", "x1"].iter().position(|x| *x == id).map(|i| nt + i);
+			loop
+			{
+				let mut merged = false;
+				let mut merge = |class: &mut Vec<usize>, a: usize, b: usize| {
+					let (ca, cb) = (class[a], class[b]);
+					if ca != cb
+					{
+						class.iter_mut().filter(|c| **c == cb).for_each(|c| *c = ca);
+						merged = true;
+					}
+				};
+				for i in 0..ops.len()
+				{
+					// An existing holder of the value
+					let holder = match &ops[i].1
+					{
+						Ok(id) => existing_id(id),
+						Err(t) => (class[nt] == class[*t]).then_some(nt + 2),
+					};
+					if let Some(h) = holder
+					{
+						merge(&mut class, h, ops[i].0);
+					}
+					for j in 0..i
+					{
+						let same = match (&ops[i].1, &ops[j].1)
+						{
+							(Ok(a), Ok(b)) => a == b,
+							(Err(a), Err(b)) => class[*a] == class[*b],
+							_ => false,
+						};
+						if same
+						{
+							merge(&mut class, ops[i].0, ops[j].0);
+						}
+					}
+				}
+				if !merged
+				{
+					break;
+				}
+			}
+			let conflict = (nt..nt + 3).any(|x| (x + 1..nt + 3).any(|y| class[x] == class[y]));
+			match conn.transact(&tx)
+			{
+				Err(Error::UpsertConflict(..)) =>
+				{
+					assert!(conflict, "{ops:?}");
+					conflicts += 1;
+				}
+				Err(e) => panic!("{e:?} for {ops:?}"),
+				Ok(r) =>
+				{
+					assert!(!conflict, "{ops:?}");
+					// Two tempids unified, neither of them with a string identity nor upserted
+					let plain = |t: usize| !ops.iter().any(|(s, v)| *s == t && v.is_ok()) && r.tempids[t] > r.tx;
+					through_refs += (0..nt).any(|a| (0..a).any(|b| plain(a) && plain(b) && r.tempids[a] == r.tempids[b])) as usize;
+					for a in 0..nt
+					{
+						for b in 0..nt
+						{
+							assert_eq!(r.tempids[a] == r.tempids[b], class[a] == class[b], "{ops:?}");
+						}
+						let upserted = (nt..nt + 3).find(|&x| class[x] == class[a]).map(|x| eids[x - nt]);
+						match upserted
+						{
+							Some(e) => assert_eq!(r.tempids[a], e, "{ops:?}"),
+							None => assert!(r.tempids[a] > r.tx, "{ops:?}"),
+						}
+					}
+				}
+			}
+		}
+		assert!(conflicts >= 10 && through_refs >= 10, "{conflicts} conflicts, {through_refs} unifications through refs");
 	}
 
 	#[test]

@@ -2,9 +2,10 @@
 //!
 //! A `Query` is assembled clause by clause, and every clause is handed to the query's planner as soon as it is added:
 //! the planner orders a small query exactly (a dynamic program, up to 16 clauses), and keeps one incremental SAT solver for a larger one,
-//! which refines the join order within a small conflict budget per clause, so a good (often optimal) plan already exists when the query is complete.
+//! which refines the join order within a small conflict budget per clause (past 16 clauses that rarely improves on the greedy plan yet),
+//! so a plan, optimal for a small query, exists when the query is complete.
 //! `Query::require_before` adds hard ordering constraints, and refuses one that conflicts with the others (with a minimal conflicting subset).
-//! `run` then finishes the optimization and executes the plan as nested loops,
+//! `run` then finishes the optimization (within `RUN_BUDGET` conflicts) and executes the plan as nested loops,
 //! each clause using the index that its bound positions select (EAVT, AVET or AEVT; their history counterparts in a history view,
 //! where a pattern can also match the datom's transaction and added flag, see `Query::pattern_tx`).
 //! The `parse` module reads the same queries from a Datalog text (`Db::q`).
@@ -47,6 +48,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// The conflict budget of the refinement that follows every added clause
 const ONLINE_BUDGET: u64 = 1000;
+/// The conflict budget with which `run` (and `find`) finishes the optimization: past `DP_MAX` clauses, SAT rarely proves the optimum
+/// even in 200k conflicts, so an unbounded optimization could take hours; `optimize(u64::MAX)` asks for the optimum explicitly
+const RUN_BUDGET: u64 = 10_000;
 /// The conflict budget of planning the body of a `not` or the branch of an `or` (once per run)
 const BODY_BUDGET: u64 = 1000;
 /// The estimated fraction of the rows that a `not` keeps
@@ -177,7 +181,7 @@ impl Clause
 	}
 
 	// The variables the clause shares with the clauses around it: all of a pattern's or a predicate's, the join variables of not and or
-	fn free_vars(&self, out: &mut BTreeSet<VarId>)
+	pub(crate) fn free_vars(&self, out: &mut BTreeSet<VarId>)
 	{
 		match self
 		{
@@ -662,10 +666,11 @@ impl Query
 		self.planner.solves
 	}
 
-	/// Optimize the plan and run it; returns the distinct tuples of the `find` terms, sorted
+	/// Optimize the plan (within `RUN_BUDGET` conflicts: the optimum up to `DP_MAX` clauses, the best plan found past it) and run it;
+	/// returns the distinct tuples of the `find` terms, sorted
 	pub fn run(&mut self, find: &[Term]) -> Result<Vec<Vec<Value>>, Error>
 	{
-		let order = self.optimize(u64::MAX).order.clone();
+		let order = self.optimize(RUN_BUDGET).order.clone();
 		debug_assert!(self.planner.constraints().iter().all(|&(a, b)| order.iter().position(|&c| c == a) < order.iter().position(|&c| c == b)), "the plan respects the ordering constraints");
 		self.run_in_order(&order, find)
 	}
@@ -1131,7 +1136,7 @@ pub(crate) mod tests
 {
 	use super::*;
 	use crate::db::{Cardinality, Conn, Entity, Tx};
-	use crate::planner::PlanSource;
+	use crate::planner::{PlanSource, DP_MAX};
 	use crate::testutil::Rng;
 
 	// People with ages and cities, a few of whom follow each other
@@ -1244,6 +1249,48 @@ pub(crate) mod tests
 		assert_eq!(q.planner_solves(), 0);
 		assert_eq!(q.require_before(0, 1), Err(Error::OrderConflict(vec![(0, 1)])));
 		assert!(q.planner_solves() > 0 && q.planner.fallback_cores == 0);
+	}
+
+	// A query past the DP's size runs within a bounded optimization (SAT rarely proves the optimum there), and its answer is right:
+	// a chain of 16 steps through a graph against a step-by-step reachability
+	#[test]
+	fn a_large_query_runs_in_a_bounded_time()
+	{
+		let n = 40;
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		tx.define("a/next", ValueType::Ref, Cardinality::Many).define("a/tag", ValueType::Int, Cardinality::One);
+		let es: Vec<Entity> = (0..n).map(|_| tx.temp()).collect();
+		let succ = |i: usize| [(i + 1) % n, (i * 3 + 5) % n];
+		for i in 0..n
+		{
+			tx.add(es[i], "a/tag", (i % 7) as i64);
+			for j in succ(i)
+			{
+				tx.add(es[i], "a/next", es[j]);
+			}
+		}
+		let r = conn.transact(&tx).unwrap();
+		let mut q = conn.db().query();
+		let steps = DP_MAX;
+		let xs: Vec<Term> = (0..=steps).map(|i| q.var(&format!("?x{i}"))).collect();
+		for i in 0..steps
+		{
+			q.pattern(xs[i].clone(), "a/next", xs[i + 1].clone()).unwrap();
+		}
+		q.pattern(xs[0].clone(), "a/tag", 3).unwrap();
+		assert!(q.clauses().len() > DP_MAX);
+		let (conflicts, solves) = (q.planner.conflicts, q.planner_solves());
+		let rows = q.run(&[xs[steps].clone()]).unwrap();
+		// A solve can overshoot its threshold by a few conflicts (see the planner)
+		assert!(q.planner.conflicts - conflicts <= RUN_BUDGET + 8 * (q.planner_solves() - solves));
+		let mut reach: BTreeSet<usize> = (0..n).filter(|i| i % 7 == 3).collect();
+		for _ in 0..steps
+		{
+			reach = reach.iter().flat_map(|&i| succ(i)).collect();
+		}
+		let expected: Vec<Vec<Value>> = reach.into_iter().map(|i| vec![Value::Ref(r.eid(es[i]))]).collect::<BTreeSet<_>>().into_iter().collect();
+		assert_eq!(rows, expected);
 	}
 
 	#[test]

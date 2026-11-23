@@ -8,7 +8,10 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
 * **Transactions** (`src/db.rs`). As in Datomic, a transaction is a *set* of assertions and retractions against the database before it,
   so the order of its operations doesn't matter:
   * a tempid asserting an existing `:db.unique/identity` value upserts to that entity, and tempids asserting the same new identity value
-    unify into one entity (to a fixed point, so ref-valued identities chain); a tempid resolving to two entities is an `UpsertConflict`;
+    unify into one entity (to a fixed point, so ref-valued identities chain, and tempids whose ref-valued identity is the same new entity unify too);
+    a tempid resolving to two entities is an `UpsertConflict`;
+  * a tempid or lookup ref carries the identity of its `Tx` (unique in the process), so using it in another transaction is an
+    `Error::ForeignEntity` (and `TxReport::eid` panics on it) rather than silently naming that transaction's entity of the same index;
   * lookup refs (`Tx::lookup(attr, v)` in transactions, `Query::lookup` in queries) name an entity by a unique attribute's value, resolved against
     the database before the transaction;
   * `retract_entity` retracts an entity's datoms and the refs to it (through VAET), and cascades to the entities it owns through component attributes;
@@ -57,8 +60,9 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   * Find specs (`Query::find`) take plain terms and the aggregates `count`, `count-distinct`, `sum`, `min`, `max` and `avg`, grouped by the plain terms,
     over the distinct tuples of the find and `with` variables, as in Datomic. There is no floating-point type, so `avg` is the integer mean rounded down.
 * **Text queries** (`src/parse.rs`). `Db::q(text, inputs)` reads a subset of Datomic's Datalog in EDN into the builder, clause by clause (so it is planned
-  as it is read): `[:find ?a (count ?b) :with ?c :in $ ?x :where [?e :attr ?v] [(> ?v ?x)] (not ...) (or-join [?e] ... (and ...))]`, with `_`,
-  2- to 5-element patterns, lookup refs `[:attr value]`, string, integer and boolean constants, and scalar inputs, which become constants of the query.
+  as it is read): `[:find ?a (count ?b) :with ?c :in $ ?x :where [?e :attr ?v] [(> ?v ?x)] (not ...) (or-join [?e] ... (and ...))]`, with `_`
+  (a variable of its own at each occurrence, as is each missing position of a short pattern, and never a join variable of an implicit `not` or `or`,
+  so `(not [?p :person/friend _])` keeps the people without friends, as in Datomic), 2- to 5-element patterns, lookup refs `[:attr value]`, string, integer and boolean constants, and scalar inputs, which become constants of the query.
   Syntax errors carry their line and column; keywords only name attributes (there is no keyword value type).
   `Db::q_rules(text, rules, inputs)` takes a rule set as `%`, written as in Datomic: `[[(reach ?a ?b) [?a :edge ?b]] [(reach ?a ?b) [?a :edge ?c] (reach ?c ?b)]]`.
 * **Rules** (`src/rules.rs`). `Query::rule(name, head, body)` defines a rule (several definitions are a union) and `Query::call`/`call_clause`
@@ -74,7 +78,8 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   * the relations keep a hash index per combination of bound argument positions that a call uses, extended as tuples arrive.
   A rule's variables are its own (its body runs in an environment of its own), and every head variable must be bound by the body.
 * **The planner** (`src/planner.rs`). It chooses the join order *while the query is being assembled*: every added clause is followed by
-  a refinement, so a good plan exists before the query is complete, and `run` finishes the optimization.
+  a refinement, so a good plan exists before the query is complete, and `run` finishes the optimization within `RUN_BUDGET` (10k conflicts:
+  the optimum up to 16 clauses, the best plan found past that, where SAT rarely proves the optimum); `Query::optimize(u64::MAX)` asks for the optimum.
   * Queries of up to 16 clauses (`DP_MAX`) are ordered exactly by a dynamic program over the subsets of clauses (a clause's cost depends only on
     the set before it and that set's size), constrained or not: 10 µs to 2.5 ms in release builds, see the timings below.
   * Hard ordering constraints: `Query::require_before(a, b)` makes clause `a` run before clause `b`. A constraint under which no order is valid
@@ -86,13 +91,15 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     falling back to deletion with the test if the solver runs out of budget.
   * Larger queries use one incremental SAT solver per query, encoded when first needed and then extended clause by clause (nothing is retracted),
     with a refinement bounded by a conflict budget after each clause (each solve is charged at least one conflict, so the budget also bounds
-    the number of solves, and a spent budget solves nothing). The module documentation has the details; in short:
+    the number of solves, and a spent budget solves nothing; a finite budget is clamped so that the solver's threshold, its conflict count
+    plus the budget, doesn't wrap; and a solve can overshoot by the few conflicts of its last round of conflict analysis).
+    The module documentation has the details; in short:
     * the order is an acyclic tournament (one variable per pair of clauses), so adding a clause only adds variables and clauses;
     * "variable bound before clause c" points to an open disjunction of the binders seen so far plus a *tail* literal assumed false,
       which a binder added later extends;
-    * a predicate's requirement that its variables be bound is an assumption: when a variable has no binder yet, the UNSAT core
-      (`IsAssumptionRequired`) names the predicate, which is reported as pending while the rest of the query is planned;
-      an ordering constraint is an assumption too (`r -> before(a, b)`);
+    * a predicate's requirement that its variables be bound is an assumption; a predicate with a variable that has no binder yet is
+      pending (known in closed form, so no solve is spent finding it), and only the boundness of its other variables is assumed while the
+      rest of the query is planned; an ordering constraint is an assumption too (`r -> before(a, b)`);
     * the cost, the sum of the estimated log-sizes of the intermediate results, is linear over pairwise indicators and is summed
       by a lower-bounding binary adder network, which grows with the query;
     * optimization tightens `sum <= K` bounds guarded by activation literals, starting below the greedy plan, until UNSAT (proved optimal)
@@ -118,11 +125,13 @@ The crate depends on the solver by path (`../rust`), with the solver's profiles 
     cargo test              # unit tests, incl. the planner (SAT and the DP) against brute force (every order of random queries of up to 6 clauses,
                             # with random ordering constraints arriving between the clauses: acceptance, the minimality of each refused
                             # constraint's core and the constrained optimum), the DP against SAT on 8 clauses, the bounds of the online
-                            # refinement on a 24-clause query, ordering constraints in queries,
-                            # transactions and retract_entity against naive reference models, the history and since views of
+                            # refinement on a 24-clause query, refinements of one conflict adding up to the optimum, a budget just below
+                            # u64::MAX, a 17-clause query run within its budget against reachability, ordering constraints in queries,
+                            # transactions and retract_entity against naive reference models, upserts and tempid unification
+                            # through string and ref-valued identities against a naive fixpoint, foreign tempids and lookups, the history and since views of
                             # every past value against the transactions' logs, history queries and pull against brute force,
                             # random queries with (nested) not and or in every clause order against a bottom-up relational
-                            # evaluator, aggregates against a hand grouping, text queries against the builder, transitive closure
+                            # evaluator, aggregates against a hand grouping, text queries against the builder, blanks in not and or, transitive closure
                             # (four formulations, random graphs with cycles) against Floyd-Warshall, mutual recursion against a
                             # parity search, stratified negation, random rule programs against a naive simultaneous fixpoint,
                             # and the plan count of semi-naive evaluation on a long chain; the durable log: a random history reopened
@@ -152,11 +161,14 @@ This is a start. What is missing, roughly in order of value:
   In a history view, the current-state accessors (`values`, `lookup`, ...) still read the current datoms; only scans and queries see the history.
 * Pull: recursion limits (`...`), attribute options (defaults, limits, renaming) and pulling from a query's find spec.
 * Schema evolution (altering an attribute's cardinality or uniqueness, which needs validating the existing datoms); today a definition
-  that differs from the existing one is an `AttrConflict`. Also: tempid unification through identity values that are themselves new tempids
-  (a ref-valued identity pointing at a tempid that resolves to nothing existing doesn't unify), transaction functions (e.g. CAS),
-  and an Instant value type.
+  that differs from the existing one is an `AttrConflict`. Also: transaction functions (e.g. CAS), and an Instant value type.
 * Planner scale beyond 16 clauses: the DP covers up to 16 clauses (20 would take up to 120 ms per refinement), and above that SAT
-  ends 1-13% above the optimum after 200k conflicts and rarely proves it. Candidates: core-guided optimization (lower bounds from cores;
+  ends 1-13% above the optimum after 200k conflicts and rarely proves it. The online refinement doesn't help there yet: on random
+  24-clause queries (`cargo test --release online_refinement_budgets -- --ignored --nocapture`), no refinement after clauses 17 to 24
+  beat the greedy plan, with 1k, 10k or 100k conflicts each (the first `sum < greedy` solve alone takes them all), and adding a clause
+  resets the plan to the greedy one, dropping what earlier refinements found; so `run` past 16 clauses usually runs the greedy plan.
+  Candidates: a local search (insertion moves) from the greedy plan before SAT, keeping the previous plan (with the new clause inserted)
+  when a clause is added, core-guided optimization (lower bounds from cores;
   the simple rearrangement bound is too weak), a DP over connected subsets or with pruning by a bound, and a cheaper SAT refinement
   for each added clause (each solve re-propagates the whole encoding). (Measured earlier: lower-bounding adders instead of exact ones
   cut SAT's time from ~40 s; reducing the adder columns in rounds instead of chains made it much slower.)

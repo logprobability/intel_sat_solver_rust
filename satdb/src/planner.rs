@@ -30,9 +30,10 @@
 //! * Boundness: for each variable `v` at a position of clause `c`, a literal `b(v,c)` with `b(v,c) -> OR_{d binds v} before(d,c) OR tail(v,c)`.
 //!   The tail stands for "binders yet to be added": each solve assumes `!tail`, and a binder added later extends the disjunction
 //!   with a fresh tail (`tail_old -> before(d_new,c) OR tail_new`).
-//! * Predicates require their variables to be bound: `req(c) -> b(v,c)`, under the assumption `req(c)`. When a predicate cannot be satisfied yet
-//!   (one of its variables has no binder), the solver's UNSAT core names it, and the planner plans the rest, reporting the predicate as pending
-//!   (the boundness of its variables that have binders is then assumed directly).
+//! * Predicates require their variables to be bound: `req(c) -> b(v,c)`, under the assumption `req(c)`. A predicate that cannot be satisfied yet
+//!   (one of its variables has no binder, `unbindable`) is pending: its requirement isn't assumed, the boundness of its variables that have
+//!   binders is assumed directly, and the planner plans the rest. (Finding the pending predicates by UNSAT cores instead cost a solve
+//!   of every refinement, which past `DP_MAX` clauses took the refinement's whole budget.)
 //! * User constraints: `r -> before(a,b)`, under the assumption `r`. A refused constraint's UNSAT core over the constraints' assumptions
 //!   (with every requirement held) is shrunk by deletion, a solve per deletion, then re-confirmed by the exact feasibility test before it is reported.
 //! * Cost: a mode literal `m(c,k) <- conditions of mode k` and pairwise literals `z <- before(c,d) AND m(c,k)`, all weighted by `w(c,k)`.
@@ -41,8 +42,9 @@
 //!   the comparators bound the sum from above only, so the exact values always remain a solution, and minimizing pushes everything down to them.
 //! * Optimization: `sum <= K` comparators, each guarded by its own activation literal (assumed by one solve only). The bound starts below the greedy plan's cost
 //!   and tightens after every model, until UNSAT (optimal) or until the conflict budget runs out (the best plan so far).
-//!   Every solve is charged at least one conflict, so a budget of B conflicts allows at most B solves, which use at most B + (number of solves)
-//!   conflicts (the solver may finish the conflict at which it reaches its threshold).
+//!   Every solve is charged at least one conflict, so a budget of B conflicts allows at most B solves, which use about B conflicts:
+//!   the solver checks its threshold between rounds of conflict analysis, so a solve can overshoot by the few conflicts of its last round.
+//!   (The solver's threshold is its conflict count plus the budget; a finite budget is clamped so that the sum doesn't wrap.)
 
 use intel_sat_solver::{CTopor, TLit, TToporLitVal, TToporReturnVal};
 use std::collections::HashMap;
@@ -456,11 +458,7 @@ impl Planner
 		let r = self.new_var();
 		self.solver.AddClause(&[-r, self.before(a, b)]);
 		let lits: Vec<TLit> = self.before_lits.iter().copied().chain([r]).collect();
-		// Every requirement is held: the predicates' (a pending one's: of its variables that have binders)
-		let pending = unbindable(&self.shapes);
-		let mut hard: Vec<TLit> = self.bound.iter().flatten().map(|e| -e.2).collect();
-		hard.extend((0..self.shapes.len()).filter(|c| !pending.contains(c)).filter_map(|c| self.req[c]));
-		hard.extend(self.pending_needs(&pending));
+		let hard = self.requirements();
 
 		let mut budget = CORE_BUDGET;
 		let mut core: Vec<usize> = (0..lits.len()).collect();
@@ -492,10 +490,15 @@ impl Planner
 		found
 	}
 
-	// The boundness literals of the pending predicates' variables that have binders (assumed: those binders run before them)
-	fn pending_needs(&self, pending: &[usize]) -> Vec<TLit>
+	// The assumptions that hold every requirement: no binder yet to be added (the tails), the predicates' requirements,
+	// and for a pending predicate (one of whose variables has no binder, see `unbindable`) the boundness of its variables that have binders
+	fn requirements(&self) -> Vec<TLit>
 	{
-		pending.iter().flat_map(|&c| self.shapes[c].needs.iter().filter(|v| self.binders.contains_key(v)).map(move |&v| self.bound_lit(c, v))).collect()
+		let pending = unbindable(&self.shapes);
+		let mut out: Vec<TLit> = self.bound.iter().flatten().map(|e| -e.2).collect();
+		out.extend((0..self.shapes.len()).filter(|c| !pending.contains(c)).filter_map(|c| self.req[c]));
+		out.extend(pending.iter().flat_map(|&c| self.shapes[c].needs.iter().filter(|v| self.binders.contains_key(v)).map(move |&v| self.bound_lit(c, v))));
+		out
 	}
 
 	// Encode the clauses and the constraints added since the latest call, in order (a clause's encoding refers to the earlier ones only)
@@ -794,7 +797,9 @@ impl Planner
 			}
 		}
 		let before = self.solver.GetConflictsNumber();
-		let r = self.solver.Solve(assumps, (f64::MAX, true), *budget);
+		// The solver's threshold is its conflict count plus the budget (wrapping), so a finite budget is clamped below u64::MAX - count
+		let thr = if *budget == u64::MAX { u64::MAX } else { (*budget).min(u64::MAX - 1 - before) };
+		let r = self.solver.Solve(assumps, (f64::MAX, true), thr);
 		let used = self.solver.GetConflictsNumber() - before;
 		self.solves += 1;
 		self.conflicts += used;
@@ -844,61 +849,10 @@ impl Planner
 			}
 		}
 
+		// Which predicates are pending is known in closed form (`unbindable`, which the plan has), so every solve goes to the minimization
 		self.sync();
-		let hard: Vec<TLit> = self.bound.iter().flatten().map(|e| -e.2).chain(self.before_lits.iter().copied()).collect();
-
-		// Find the predicates that can't be satisfied: drop the requirements in each UNSAT core, then re-admit those which hold on their own
-		let mut reqs: Vec<(usize, TLit)> = self.req.iter().enumerate().filter_map(|(c, r)| r.map(|r| (c, r))).collect();
-		let mut dropped = Vec::new();
-		loop
-		{
-			let assumps: Vec<TLit> = hard.iter().copied().chain(reqs.iter().map(|r| r.1)).collect();
-			match self.solve(&assumps, &mut budget)
-			{
-				TToporReturnVal::RET_SAT => break,
-				TToporReturnVal::RET_UNSAT =>
-				{
-					let core: Vec<usize> = (0..reqs.len()).filter(|&i| self.solver.IsAssumptionRequired(hard.len() + i)).collect();
-					if core.is_empty()
-					{
-						self.fail("the order and the accepted constraints are unsatisfiable without any predicate requirement");
-						return &self.plan;
-					}
-					for &i in core.iter().rev()
-					{
-						dropped.push(reqs.remove(i));
-					}
-				}
-				TToporReturnVal::RET_CONFLICT_OUT => return &self.plan,
-				_ =>
-				{
-					self.fail("unexpected solver result");
-					return &self.plan;
-				}
-			}
-		}
-		let mut pending = Vec::new();
-		for r in dropped
-		{
-			let assumps: Vec<TLit> = hard.iter().copied().chain(reqs.iter().map(|r| r.1)).chain([r.1]).collect();
-			match self.solve(&assumps, &mut budget)
-			{
-				TToporReturnVal::RET_SAT => reqs.push(r),
-				TToporReturnVal::RET_UNSAT => pending.push(r.0),
-				TToporReturnVal::RET_CONFLICT_OUT => return &self.plan,
-				_ =>
-				{
-					self.fail("unexpected solver result");
-					return &self.plan;
-				}
-			}
-		}
-		pending.sort_unstable();
-		debug_assert_eq!(pending, self.plan.pending, "a predicate is unsatisfiable exactly when one of its variables has no binder");
-		self.plan.pending = pending;
-
+		let base: Vec<TLit> = self.requirements().into_iter().chain(self.before_lits.iter().copied()).collect();
 		// Minimize, starting from the best plan so far (the greedy one, or the result of an earlier refine, which ran out of budget)
-		let base: Vec<TLit> = hard.iter().copied().chain(reqs.iter().map(|r| r.1)).chain(self.pending_needs(&self.plan.pending)).collect();
 		while self.plan.cost > 0
 		{
 			let act = self.at_most(self.plan.cost - 1);
@@ -1268,9 +1222,9 @@ mod tests
 			p.add_clause(s.clone(), nvars);
 			let (solves, conflicts) = (p.solves, p.conflicts);
 			let plan = p.refine(1000).clone();
-			// The solver may finish the conflict at which it reaches its threshold, so a solve can use one conflict more than its budget
+			// The solver checks its threshold between rounds of conflict analysis, so a solve can overshoot by a few conflicts (3 measured)
 			let (solves, conflicts) = (p.solves - solves, p.conflicts - conflicts);
-			assert!(solves <= 1000 && conflicts <= 1000 + solves, "clause {c}: {solves} solves, {conflicts} conflicts");
+			assert!(solves <= 1000 && conflicts <= 1000 + 8 * solves, "clause {c}: {solves} solves, {conflicts} conflicts");
 			assert!(respects(&shapes[..=c], nvars, &before, &plan.order));
 			assert!(plan.cost <= cost_of_order(&shapes[..=c], &greedy_order(&shapes[..=c], nvars, &before).unwrap(), nvars));
 			if c < DP_MAX
@@ -1281,6 +1235,104 @@ mod tests
 			let solves = p.solves;
 			p.refine(0);
 			assert_eq!(p.solves, solves);
+		}
+	}
+
+	// Refinements in small budgets add up: every solve goes to the minimization (what is pending is known in closed form),
+	// and what the solver learns stays, so repeated refine(1) reaches the optimum
+	#[test]
+	fn small_refinements_make_progress()
+	{
+		let mut rng = Rng::new(11);
+		for _ in 0..10
+		{
+			let (n, nvars) = (5, 4);
+			let shapes = random_query(&mut rng, n, nvars);
+			let mut p = sat_planner();
+			for s in &shapes
+			{
+				p.add_clause(s.clone(), nvars);
+			}
+			for _ in 0..5000
+			{
+				if p.refine(1).optimal
+				{
+					break;
+				}
+			}
+			assert!(p.plan().optimal, "5000 refinements of one conflict didn't reach the optimum");
+			assert_eq!(Some(p.plan().cost), brute_force(&shapes, nvars, &[]));
+		}
+		// On a large query, each refine(1) searches (a conflict each)
+		let shapes = random_query(&mut rng, 20, 10);
+		let mut p = Planner::new();
+		for s in &shapes
+		{
+			p.add_clause(s.clone(), 10);
+		}
+		for _ in 0..100
+		{
+			p.refine(1);
+		}
+		assert!(p.solver.GetConflictsNumber() >= 50, "{} conflicts in 100 refinements", p.solver.GetConflictsNumber());
+	}
+
+	// How often a refinement after each added clause beats the greedy plan past DP_MAX, by budget
+	// (release: cargo test --release online_refinement_budgets -- --ignored --nocapture)
+	#[test]
+	#[ignore]
+	fn online_refinement_budgets()
+	{
+		for budget in [1000, 10_000, 100_000]
+		{
+			let (mut improved, mut total, t) = (0, 0, std::time::Instant::now());
+			for seed in 0..5
+			{
+				let mut rng = Rng::new(50 + seed);
+				let (n, nvars) = (24, 10);
+				let shapes = random_query(&mut rng, n, nvars);
+				let mut p = Planner::new();
+				for (c, s) in shapes.iter().enumerate()
+				{
+					p.add_clause(s.clone(), nvars);
+					let plan = p.refine(budget).clone();
+					if c >= DP_MAX
+					{
+						total += 1;
+						improved += (plan.source == PlanSource::Sat) as usize;
+					}
+				}
+			}
+			println!("budget {budget}: {improved} of {total} refinements beat the greedy plan, {:?}", t.elapsed());
+		}
+	}
+
+	// A budget just below u64::MAX is (nearly) unlimited: the solver's threshold is its conflict count plus the budget, which must not wrap
+	#[test]
+	fn huge_budget_is_not_zero()
+	{
+		let mut rng = Rng::new(7);
+		let (n, nvars) = (6, 4);
+		for _ in 0..20
+		{
+			let shapes = random_query(&mut rng, n, nvars);
+			let mut p = sat_planner();
+			for s in &shapes
+			{
+				p.add_clause(s.clone(), nvars);
+			}
+			// Spend a few conflicts first, so that the solver's count is past 0
+			for _ in 0..100
+			{
+				if p.plan().optimal || p.solver.GetConflictsNumber() >= 2
+				{
+					break;
+				}
+				p.refine(1);
+			}
+			let plan = p.refine(u64::MAX - 1).clone();
+			assert!(plan.optimal);
+			assert_eq!(Some(plan.cost), brute_force(&shapes, nvars, &[]));
 		}
 	}
 
