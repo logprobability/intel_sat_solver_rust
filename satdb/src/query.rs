@@ -1,8 +1,10 @@
 //! Datalog-style queries over a database value.
 //!
 //! A `Query` is assembled clause by clause, and every clause is handed to the query's planner as soon as it is added:
-//! the planner keeps one incremental SAT solver for the whole query and refines the join order within a small conflict budget per clause,
-//! so a good (often optimal) plan already exists when the query is complete. `run` then finishes the optimization and executes the plan as nested loops,
+//! the planner orders a small query exactly (a dynamic program, up to 16 clauses), and keeps one incremental SAT solver for a larger one,
+//! which refines the join order within a small conflict budget per clause, so a good (often optimal) plan already exists when the query is complete.
+//! `Query::require_before` adds hard ordering constraints, and refuses one that conflicts with the others (with a minimal conflicting subset).
+//! `run` then finishes the optimization and executes the plan as nested loops,
 //! each clause using the index that its bound positions select (EAVT, AVET or AEVT; their history counterparts in a history view,
 //! where a pattern can also match the datom's transaction and added flag, see `Query::pattern_tx`).
 //! The `parse` module reads the same queries from a Datalog text (`Db::q`).
@@ -601,7 +603,7 @@ impl Query
 					let shapes: Vec<ClauseShape> = b.iter().map(|c| self.shape(c, &inner, ctx)).collect();
 					let mut bound = vec![false; pre.len()];
 					let mut log2 = 0.0;
-					for k in greedy_order(&shapes, pre.len())
+					for k in greedy_order(&shapes, pre.len(), &[]).expect("unconstrained clauses always have an order")
 					{
 						log2 += fanout_of_weight(shapes[k].weights[shapes[k].mode(&bound)]).log2();
 						for &x in &shapes[k].binds
@@ -632,6 +634,22 @@ impl Query
 		self.planner.refine(budget)
 	}
 
+	/// Require clause `a` (an index returned when it was added) to run before clause `b`, as a hard constraint of the plan;
+	/// returns the constraint's index. A constraint under which no order is valid, given the other constraints and what the clauses need
+	/// (a predicate after a binder of each of its variables, ...), is refused with `Error::OrderConflict`, which names a minimal conflicting
+	/// subset of the constraints, and the query stays as it was. Clauses added later never make the accepted constraints conflict
+	pub fn require_before(&mut self, a: usize, b: usize) -> Result<usize, Error>
+	{
+		let n = self.clauses.len();
+		if a >= n || b >= n || a == b
+		{
+			return Err(Error::InvalidQuery(format!("an ordering constraint needs two distinct clauses of the query's {n}, got {a} and {b}")));
+		}
+		let i = self.planner.require_before(a, b).map_err(Error::OrderConflict)?;
+		self.planner.refine(ONLINE_BUDGET);
+		Ok(i)
+	}
+
 	/// The planner's error, if a solver error disabled the SAT planner (the plans are greedy then)
 	pub fn planner_error(&self) -> Option<&str>
 	{
@@ -648,6 +666,7 @@ impl Query
 	pub fn run(&mut self, find: &[Term]) -> Result<Vec<Vec<Value>>, Error>
 	{
 		let order = self.optimize(u64::MAX).order.clone();
+		debug_assert!(self.planner.constraints().iter().all(|&(a, b)| order.iter().position(|&c| c == a) < order.iter().position(|&c| c == b)), "the plan respects the ordering constraints");
 		self.run_in_order(&order, find)
 	}
 
@@ -1112,6 +1131,7 @@ pub(crate) mod tests
 {
 	use super::*;
 	use crate::db::{Cardinality, Conn, Entity, Tx};
+	use crate::planner::PlanSource;
 	use crate::testutil::Rng;
 
 	// People with ages and cities, a few of whom follow each other
@@ -1214,7 +1234,84 @@ pub(crate) mod tests
 		let young = q.run(&[p.clone()]).unwrap();
 		let age_a = db.attr_id("person/age").unwrap();
 		assert_eq!(young.len(), db.attr_datoms(age_a).filter(|(_, v)| **v < Value::Int(10)).count());
-		assert!(q.planner_solves() > 0);
+		// A small query is ordered by the DP, constrained or not; the SAT planner explains a refused constraint
+		assert_eq!(q.plan().source, PlanSource::Dp);
+		let name = q.var("?name");
+		q.pattern(p.clone(), "person/name", name).unwrap();
+		q.require_before(2, 1).unwrap();
+		assert!(q.optimize(u64::MAX).optimal && q.plan().order == vec![2, 1, 0] && q.plan().source == PlanSource::Dp);
+		assert_eq!(q.run(&[p.clone()]).unwrap(), young);
+		assert_eq!(q.planner_solves(), 0);
+		assert_eq!(q.require_before(0, 1), Err(Error::OrderConflict(vec![(0, 1)])));
+		assert!(q.planner_solves() > 0 && q.planner.fallback_cores == 0);
+	}
+
+	#[test]
+	fn ordering_constraints()
+	{
+		let conn = social(60);
+		let db = conn.db();
+		let mut q = db.query();
+		let (p, f, ff, name, age, city) = (q.var("?p"), q.var("?f"), q.var("?ff"), q.var("?name"), q.var("?age"), q.var("?city"));
+		q.pattern(p.clone(), "person/follows", f.clone()).unwrap();
+		q.pattern(f.clone(), "person/follows", ff.clone()).unwrap();
+		q.pattern(ff.clone(), "person/name", name.clone()).unwrap();
+		q.pattern(ff.clone(), "person/age", age.clone()).unwrap();
+		q.pred(age.clone(), Cmp::Gt, 40).unwrap();
+		q.pattern(p.clone(), "person/city", city.clone()).unwrap();
+		q.pattern(p.clone(), "person/name", "p7").unwrap();
+		let find = [name.clone(), age.clone(), city.clone()];
+		let want = q.run(&find).unwrap();
+		let free = q.plan().clone();
+		assert!(free.optimal && free.source == PlanSource::Dp && free.order[0] == 6);
+
+		// A constraint that the optimum breaks: the plan changes, at a higher cost, and the answer doesn't
+		assert_eq!(q.require_before(0, 6), Ok(0));
+		assert_eq!(q.run(&find).unwrap(), want);
+		let plan = q.plan().clone();
+		assert!(plan.optimal && plan.source == PlanSource::Dp && plan.cost > free.cost);
+		let pos = |c: usize| plan.order.iter().position(|&x| x == c).unwrap();
+		assert!(pos(0) < pos(6) && pos(3) < pos(4));
+
+		// A cycle, and a predicate before the only binder of its variable: refused, and the query stays as it was
+		assert_eq!(q.require_before(6, 1), Ok(1));
+		assert_eq!(q.require_before(1, 0), Err(Error::OrderConflict(vec![(0, 6), (6, 1), (1, 0)])));
+		assert_eq!(q.require_before(4, 3), Err(Error::OrderConflict(vec![(4, 3)])));
+		let msg = q.require_before(4, 3).unwrap_err().to_string();
+		assert!(msg.contains("clause 4 before clause 3"), "{msg}");
+		// The cores came from the SAT planner, confirmed by the feasibility test
+		assert!(q.planner_solves() > 0 && q.planner.fallback_cores == 0);
+		assert_eq!(q.run(&find).unwrap(), want);
+		let pos = |c: usize| q.plan().order.iter().position(|&x| x == c).unwrap();
+		assert!(pos(0) < pos(6) && pos(6) < pos(1));
+
+		// Clauses that don't exist, or a clause before itself
+		assert!(matches!(q.require_before(0, 7), Err(Error::InvalidQuery(_))));
+		assert!(matches!(q.require_before(2, 2), Err(Error::InvalidQuery(_))));
+
+		// A constraint on a predicate that is still pending: it must follow the binders that exist, and clauses added later keep it plannable
+		let mut q = db.query();
+		let (p, a, p2, n) = (q.var("?p"), q.var("?a"), q.var("?p2"), q.var("?n"));
+		q.pattern(p.clone(), "person/age", a.clone()).unwrap();
+		q.pred(a.clone(), Cmp::Lt, n.clone()).unwrap();
+		assert_eq!(q.require_before(1, 0), Err(Error::OrderConflict(vec![(1, 0)])));
+		assert_eq!(q.require_before(0, 1), Ok(0));
+		assert_eq!(q.plan().pending, vec![1]);
+		q.pattern(p2.clone(), "person/age", n.clone()).unwrap();
+		assert!(q.plan().pending.is_empty());
+		let got = q.run(&[a.clone(), n.clone()]).unwrap();
+		let age_a = db.attr_id("person/age").unwrap();
+		let ages: BTreeSet<Value> = db.attr_datoms(age_a).map(|(_, v)| v.clone()).collect();
+		let mut want = Vec::new();
+		for x in &ages
+		{
+			for y in ages.iter().filter(|&y| x < y)
+			{
+				want.push(vec![x.clone(), y.clone()]);
+			}
+		}
+		assert!(!want.is_empty());
+		assert_eq!(got, want);
 	}
 
 	#[test]

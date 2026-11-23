@@ -9,7 +9,8 @@
 //! * `rules`: Datalog rules, recursive and mutually recursive ones included, evaluated bottom-up (stratified, semi-naive,
 //!   each body planned by the SAT planner once per stratum) when a query first calls them.
 //! * `parse`: the text syntax of queries (a subset of Datomic's Datalog, in EDN), read into the query builder (`Db::q`, `Db::q_rules`).
-//! * `planner`: the incremental SAT encoding of the join-order problem (see its documentation).
+//! * `planner`: the join order, by an exact dynamic program for queries of up to 16 clauses and an incremental SAT encoding beyond,
+//!   with hard ordering constraints (`Query::require_before`), whose conflicts the SAT solver's UNSAT cores explain (see its documentation).
 //! * `pmap`: the persistent sorted map under the indexes.
 //!
 //! ```

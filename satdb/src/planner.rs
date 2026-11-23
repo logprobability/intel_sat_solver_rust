@@ -1,5 +1,5 @@
 //! The join-order planner: an incremental SAT encoding of "the cheapest order of the query's clauses", kept alive in one solver
-//! while the query is being assembled.
+//! while the query is being assembled, with an exact dynamic program for small queries.
 //!
 //! # The cost model
 //! A plan runs the clauses as nested loops in its order. A clause's *access mode* is which of its (at most two) variable positions
@@ -8,19 +8,41 @@
 //! the sum of the log-sizes of all the intermediate results. (A proxy: it underweights a single huge intermediate result.)
 //! The weights are shifted by the constant `SHIFT` to be non-negative; for a fixed number of clauses that adds the same constant to every order.
 //!
+//! # Valid orders
+//! A clause can run once its needed variables are bound (by a binder before it) and the clauses that user constraints
+//! (`require_before`) put before it have run. A *pending* predicate, one with a variable that no clause binds yet, waits for
+//! the binders of its other variables only (it can't run, but its place in the plan respects whatever is known).
+//! Being able to run is monotone in the set of clauses that ran, so the greedy order (`greedy_order`) gets stuck exactly when
+//! no order is valid: it is an exact feasibility test, which `respects`, the planner and the tests share.
+//! Feasibility survives adding a clause (a new binder can run first, a new predicate last), so constraints that admit an order
+//! when they are accepted admit one from then on; a constraint that doesn't is refused, with a minimal conflicting subset of the constraints.
+//!
+//! # Dynamic programming
+//! The mode of a clause depends only on the set of clauses before it, and its multiplier only on that set's size, so the optimum
+//! is a shortest path over the subsets (`dp_order`, `O(2^n n)`; a constraint only restricts which clause may come next).
+//! The planner uses it for queries of up to `DP_MAX` clauses, constrained or not: measured (release), it takes 10 us to 2.5 ms up to 16 clauses,
+//! where SAT takes 0.1 to 0.9 s for 8 clauses and rarely reaches the optimum of 12 or 16 within 200k conflicts (3 to 5 s).
+//! SAT orders the larger queries, incrementally, and explains refused constraints; the tests use the DP as a cross-check of SAT.
+//!
 //! # The encoding (everything is added monotonically, so that nothing has to be retracted when a clause is added)
+//! The clauses are encoded when the SAT planner is first needed (a query larger than `DP_MAX`, or a refused constraint), in the order they were added.
 //! * Order: a tournament over the clauses, one variable per pair, with both 3-cycles of every triple forbidden (an acyclic tournament is a total order).
 //! * Boundness: for each variable `v` at a position of clause `c`, a literal `b(v,c)` with `b(v,c) -> OR_{d binds v} before(d,c) OR tail(v,c)`.
 //!   The tail stands for "binders yet to be added": each solve assumes `!tail`, and a binder added later extends the disjunction
 //!   with a fresh tail (`tail_old -> before(d_new,c) OR tail_new`).
 //! * Predicates require their variables to be bound: `req(c) -> b(v,c)`, under the assumption `req(c)`. When a predicate cannot be satisfied yet
-//!   (one of its variables has no binder), the solver's UNSAT core names it, and the planner plans the rest, reporting the predicate as pending.
+//!   (one of its variables has no binder), the solver's UNSAT core names it, and the planner plans the rest, reporting the predicate as pending
+//!   (the boundness of its variables that have binders is then assumed directly).
+//! * User constraints: `r -> before(a,b)`, under the assumption `r`. A refused constraint's UNSAT core over the constraints' assumptions
+//!   (with every requirement held) is shrunk by deletion, a solve per deletion, then re-confirmed by the exact feasibility test before it is reported.
 //! * Cost: a mode literal `m(c,k) <- conditions of mode k` and pairwise literals `z <- before(c,d) AND m(c,k)`, all weighted by `w(c,k)`.
 //!   The weighted sum is a binary adder network; each new clause adds its terms (and the old clauses' terms against it) to the previous sum.
 //!   Only lower bounds are encoded, both on the indicators and in the adders (which guarantee `encoded sum >= true sum`, see `full_adder`):
 //!   the comparators bound the sum from above only, so the exact values always remain a solution, and minimizing pushes everything down to them.
 //! * Optimization: `sum <= K` comparators, each guarded by its own activation literal (assumed by one solve only). The bound starts below the greedy plan's cost
-//!   and tightens after every model, until UNSAT (optimal) or the conflict budget runs out (the best plan so far).
+//!   and tightens after every model, until UNSAT (optimal) or until the conflict budget runs out (the best plan so far).
+//!   Every solve is charged at least one conflict, so a budget of B conflicts allows at most B solves, which use at most B + (number of solves)
+//!   conflicts (the solver may finish the conflict at which it reaches its threshold).
 
 use intel_sat_solver::{CTopor, TLit, TToporLitVal, TToporReturnVal};
 use std::collections::HashMap;
@@ -32,6 +54,11 @@ const SCALE: f64 = 4.0;
 const SHIFT: i64 = 16 * SCALE as i64;
 const MIN_LOG2: f64 = -16.0;
 const MAX_LOG2: f64 = 40.0;
+
+/// The largest query that the planner orders by dynamic programming instead of SAT (the DP has 2^n states)
+pub(crate) const DP_MAX: usize = 16;
+/// The conflict budget of finding the core of a refused constraint (its solves have no cost bound, so they are easy)
+const CORE_BUDGET: u64 = 100_000;
 
 pub(crate) fn weight_of_fanout(f: f64) -> u32
 {
@@ -93,6 +120,17 @@ pub(crate) fn cost_of_order(shapes: &[ClauseShape], order: &[usize], nvars: usiz
 	cost
 }
 
+/// Which variables some clause binds
+fn bindable(shapes: &[ClauseShape], nvars: usize) -> Vec<bool>
+{
+	let mut out = vec![false; nvars];
+	for &v in shapes.iter().flat_map(|s| &s.binds)
+	{
+		out[v] = true;
+	}
+	out
+}
+
 /// The predicates (by clause index) that one of whose needed variables no clause binds
 pub(crate) fn unbindable(shapes: &[ClauseShape]) -> Vec<usize>
 {
@@ -100,32 +138,141 @@ pub(crate) fn unbindable(shapes: &[ClauseShape]) -> Vec<usize>
 	(0..shapes.len()).filter(|&c| shapes[c].needs.iter().any(|v| !bindable.contains(v))).collect()
 }
 
-/// Run the cheapest ready clause next; predicates are ready once their variables are bound, unbindable ones go last
-pub(crate) fn greedy_order(shapes: &[ClauseShape], nvars: usize) -> Vec<usize>
+/// Run the cheapest clause that can run next (see "Valid orders" in the module documentation), and pending predicates as late as
+/// the constraints `before` (pairs `(a, b)`: a runs before b) allow. None when no order is valid (exact, since being able to run is monotone)
+pub(crate) fn greedy_order(shapes: &[ClauseShape], nvars: usize, before: &[(usize, usize)]) -> Option<Vec<usize>>
 {
-	let pending = unbindable(shapes);
+	let n = shapes.len();
+	let (bindable, pending) = (bindable(shapes, nvars), unbindable(shapes));
 	let mut bound = vec![false; nvars];
-	let mut left: Vec<usize> = (0..shapes.len()).filter(|c| !pending.contains(c)).collect();
-	let mut order = Vec::new();
-	while !left.is_empty()
+	let mut done = vec![false; n];
+	let mut order = Vec::with_capacity(n);
+	while order.len() < n
 	{
-		let ready = |&&c: &&usize| shapes[c].needs.iter().all(|&v| bound[v]);
-		let &best = left.iter().filter(ready).min_by_key(|&&c| shapes[c].weights[shapes[c].mode(&bound)]).expect("a pattern is always ready, and so is a predicate whose binders already ran");
-		left.retain(|&c| c != best);
+		let ready = |c: &usize| !done[*c] && before.iter().all(|&(a, b)| b != *c || done[a]) && shapes[*c].needs.iter().all(|&v| bound[v] || !bindable[v]);
+		let best = (0..n).filter(|c| ready(c) && !pending.contains(c)).min_by_key(|&c| shapes[c].weights[shapes[c].mode(&bound)]).or_else(|| (0..n).find(ready))?;
+		done[best] = true;
 		order.push(best);
 		for &v in &shapes[best].binds
 		{
 			bound[v] = true;
 		}
 	}
-	order.extend(pending);
-	order
+	Some(order)
+}
+
+/// Whether `order` is a valid order of all the clauses (see "Valid orders" in the module documentation) under the constraints `before`
+pub(crate) fn respects(shapes: &[ClauseShape], nvars: usize, before: &[(usize, usize)], order: &[usize]) -> bool
+{
+	let n = shapes.len();
+	let mut pos = vec![usize::MAX; n];
+	for (p, &c) in order.iter().enumerate()
+	{
+		if c >= n || pos[c] != usize::MAX
+		{
+			return false;
+		}
+		pos[c] = p;
+	}
+	if order.len() != n || before.iter().any(|&(a, b)| pos[a] > pos[b])
+	{
+		return false;
+	}
+	let bindable = bindable(shapes, nvars);
+	let mut bound = vec![false; nvars];
+	for &c in order
+	{
+		if !shapes[c].needs.iter().all(|&v| bound[v] || !bindable[v])
+		{
+			return false;
+		}
+		for &v in &shapes[c].binds
+		{
+			bound[v] = true;
+		}
+	}
+	true
+}
+
+/// The cheapest valid order under the constraints `before`, with its cost, by dynamic programming over the sets of clauses that run first
+/// (see the module documentation). None when no order is valid, or when the clauses bind more than 64 variables
+pub(crate) fn dp_order(shapes: &[ClauseShape], nvars: usize, before: &[(usize, usize)]) -> Option<(Vec<usize>, u64)>
+{
+	let n = shapes.len();
+	assert!(n <= 24, "the DP is exponential in the number of clauses");
+	// A bit per bindable variable (a variable that no clause binds is never bound)
+	let mut bit: Vec<Option<u32>> = vec![None; nvars];
+	let mut nbits = 0;
+	for &v in shapes.iter().flat_map(|s| &s.binds)
+	{
+		if bit[v].is_none()
+		{
+			bit[v] = Some(nbits);
+			nbits += 1;
+		}
+	}
+	if nbits > 64
+	{
+		return None;
+	}
+	let mask = |vs: &[VarId]| vs.iter().filter_map(|&v| bit[v]).fold(0u64, |m, b| m | 1 << b);
+	let binds: Vec<u64> = shapes.iter().map(|s| mask(&s.binds)).collect();
+	let needs: Vec<u64> = shapes.iter().map(|s| mask(&s.needs)).collect();
+	// Per slot: the bit that binds it (0 for a constant), or None for a variable that is never bound
+	let slots: Vec<[Option<u64>; 2]> = shapes.iter().map(|s| s.slots.map(|x| x.map_or(Some(0), |v| bit[v].map(|b| 1u64 << b)))).collect();
+	let mut preds = vec![0u32; n];
+	for &(a, b) in before
+	{
+		preds[b] |= 1 << a;
+	}
+
+	// cost[s]: the cheapest way to run the clauses of s first; bound[s]: the variables they bind; last[s]: the last of them in that way
+	let full = (1usize << n) - 1;
+	let mut cost = vec![u64::MAX; full + 1];
+	let mut bound = vec![0u64; full + 1];
+	let mut last = vec![0u8; full + 1];
+	cost[0] = 0;
+	for s in 0..full
+	{
+		if cost[s] == u64::MAX
+		{
+			continue;
+		}
+		let (b, mult) = (bound[s], (n - s.count_ones() as usize) as u64);
+		let on = |x: Option<u64>| x.map_or(false, |m| m & !b == 0);
+		for c in (0..n).filter(|&c| s >> c & 1 == 0 && preds[c] & !(s as u32) == 0 && needs[c] & !b == 0)
+		{
+			let w = shapes[c].weights[on(slots[c][0]) as usize | (on(slots[c][1]) as usize) << 1] as u64;
+			let t = s | 1 << c;
+			bound[t] = b | binds[c];
+			if cost[s] + w * mult < cost[t]
+			{
+				cost[t] = cost[s] + w * mult;
+				last[t] = c as u8;
+			}
+		}
+	}
+	if cost[full] == u64::MAX
+	{
+		return None;
+	}
+	let mut order = Vec::with_capacity(n);
+	let mut s = full;
+	while s != 0
+	{
+		order.push(last[s] as usize);
+		s &= !(1 << last[s]);
+	}
+	order.reverse();
+	Some((order, cost[full]))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlanSource
 {
 	Sat,
+	/// The dynamic program over subsets (a query of at most `DP_MAX` clauses)
+	Dp,
 	/// The greedy heuristic: before the first solve, or after a solver error disabled the SAT planner
 	Greedy,
 }
@@ -139,7 +286,7 @@ pub struct Plan
 	pub cost: u64,
 	/// Proved optimal under the cost model
 	pub optimal: bool,
-	/// Predicates that can't be satisfied yet, since one of their variables has no binder (they are last in the order, and the query can't run)
+	/// Predicates that can't be satisfied yet, since one of their variables has no binder (the query can't run)
 	pub pending: Vec<usize>,
 	pub source: PlanSource,
 }
@@ -151,6 +298,11 @@ pub(crate) struct Planner
 	t: TLit,
 	shapes: Vec<ClauseShape>,
 	nvars: usize,
+	// The number of clauses encoded in the solver, the first ones (see `sync`)
+	encoded: usize,
+	// The user constraints (a, b), clause a before clause b, and the assumption literals of those encoded so far
+	before: Vec<(usize, usize)>,
+	before_lits: Vec<TLit>,
 	// prec[j][i], i < j: "clause i runs before clause j"
 	prec: Vec<Vec<TLit>>,
 	// Per clause: the boundness literal and the current tail of each of its variables
@@ -169,7 +321,12 @@ pub(crate) struct Planner
 	act: Option<TLit>,
 	// Decision hints for the literals added since the latest solve (see `solve`)
 	hints: Vec<TLit>,
+	/// The largest query that the DP orders (the tests lower it to exercise SAT)
+	pub(crate) dp_max: usize,
 	pub(crate) solves: u64,
+	pub(crate) conflicts: u64,
+	/// The refused constraints whose core the SAT solver didn't give (out of budget, or not confirmed), found by deletion with the feasibility test
+	pub(crate) fallback_cores: u64,
 }
 
 impl Planner
@@ -182,6 +339,9 @@ impl Planner
 			t: 0,
 			shapes: Vec::new(),
 			nvars: 0,
+			encoded: 0,
+			before: Vec::new(),
+			before_lits: Vec::new(),
 			prec: Vec::new(),
 			bound: Vec::new(),
 			modes: Vec::new(),
@@ -192,7 +352,10 @@ impl Planner
 			error: None,
 			act: None,
 			hints: Vec::new(),
+			dp_max: DP_MAX,
 			solves: 0,
+			conflicts: 0,
+			fallback_cores: 0,
 		};
 		p.t = p.new_var();
 		p.solver.AddClause(&[p.t]);
@@ -207,6 +370,12 @@ impl Planner
 	pub(crate) fn error(&self) -> Option<&str>
 	{
 		self.error.as_deref()
+	}
+
+	/// The accepted user constraints (a, b): clause a before clause b
+	pub(crate) fn constraints(&self) -> &[(usize, usize)]
+	{
+		&self.before
 	}
 
 	fn new_var(&mut self) -> TLit
@@ -226,9 +395,130 @@ impl Planner
 	{
 		let w = shape.weights;
 		assert!(w[1] <= w[0] && w[2] <= w[0] && w[3] <= w[1] && w[3] <= w[2], "the weights must not increase when a slot becomes bound");
-		self.retire_bound();
-		let c = self.shapes.len();
+		self.shapes.push(shape);
 		self.nvars = nvars;
+		self.set_greedy();
+	}
+
+	/// Require clause `a` to run before clause `b`; returns the constraint's index. A constraint under which no order is valid
+	/// (with the other constraints and the clauses' needs) is refused, with a minimal conflicting subset of the constraints, the new one included
+	pub(crate) fn require_before(&mut self, a: usize, b: usize) -> Result<usize, Vec<(usize, usize)>>
+	{
+		assert!(a != b && a < self.shapes.len() && b < self.shapes.len(), "the query validates the constraint's clauses");
+		let mut all = self.before.clone();
+		all.push((a, b));
+		if greedy_order(&self.shapes, self.nvars, &all).is_some()
+		{
+			self.before.push((a, b));
+			self.set_greedy();
+			return Ok(self.before.len() - 1);
+		}
+		let core = self.sat_core(a, b);
+		let feasible = |set: &[usize]| greedy_order(&self.shapes, self.nvars, &set.iter().map(|&i| all[i]).collect::<Vec<_>>()).is_some();
+		let minimal = |core: &[usize]| !feasible(core) && (0..core.len()).all(|k| feasible(&[&core[..k], &core[k + 1..]].concat()));
+		let core = match core
+		{
+			Some(core) if minimal(&core) => core,
+			_ =>
+			{
+				// Deletion with the feasibility test
+				self.fallback_cores += 1;
+				let mut core: Vec<usize> = (0..all.len()).collect();
+				let mut k = 0;
+				while k < core.len()
+				{
+					let rest = [&core[..k], &core[k + 1..]].concat();
+					if feasible(&rest)
+					{
+						k += 1;
+					}
+					else
+					{
+						core = rest;
+					}
+				}
+				core
+			}
+		};
+		debug_assert!(core.contains(&self.before.len()), "the accepted constraints admit an order, so the new one is in every core");
+		Err(core.into_iter().map(|i| all[i]).collect())
+	}
+
+	// The UNSAT core of the constraints plus (a, b), shrunk by deletion: indices into the constraints, (a, b) being the last.
+	// None when the budget runs out or the solver disagrees with the feasibility test
+	fn sat_core(&mut self, a: usize, b: usize) -> Option<Vec<usize>>
+	{
+		if self.error.is_some()
+		{
+			return None;
+		}
+		self.sync();
+		let r = self.new_var();
+		self.solver.AddClause(&[-r, self.before(a, b)]);
+		let lits: Vec<TLit> = self.before_lits.iter().copied().chain([r]).collect();
+		// Every requirement is held: the predicates' (a pending one's: of its variables that have binders)
+		let pending = unbindable(&self.shapes);
+		let mut hard: Vec<TLit> = self.bound.iter().flatten().map(|e| -e.2).collect();
+		hard.extend((0..self.shapes.len()).filter(|c| !pending.contains(c)).filter_map(|c| self.req[c]));
+		hard.extend(self.pending_needs(&pending));
+
+		let mut budget = CORE_BUDGET;
+		let mut core: Vec<usize> = (0..lits.len()).collect();
+		// The position in the core of the constraint that the next solve leaves out (none in the first solve)
+		let mut k = usize::MAX;
+		let found = loop
+		{
+			let trial: Vec<usize> = core.iter().enumerate().filter(|&(i, _)| i != k).map(|(_, &x)| x).collect();
+			let assumps: Vec<TLit> = hard.iter().copied().chain(trial.iter().map(|&i| lits[i])).collect();
+			match self.solve(&assumps, &mut budget)
+			{
+				TToporReturnVal::RET_UNSAT =>
+				{
+					// The new core is a subset of the trial, which keeps the constraints found necessary (those before k) in place
+					core = (0..trial.len()).filter(|&i| self.solver.IsAssumptionRequired(hard.len() + i)).map(|i| trial[i]).collect();
+					k = if k == usize::MAX { 0 } else { k };
+				}
+				// The constraint left out is necessary
+				TToporReturnVal::RET_SAT if k != usize::MAX => k += 1,
+				_ => break None,
+			}
+			if k >= core.len()
+			{
+				break Some(core);
+			}
+		};
+		// The refused constraint must not constrain a later solve
+		self.solver.AddClause(&[-r]);
+		found
+	}
+
+	// The boundness literals of the pending predicates' variables that have binders (assumed: those binders run before them)
+	fn pending_needs(&self, pending: &[usize]) -> Vec<TLit>
+	{
+		pending.iter().flat_map(|&c| self.shapes[c].needs.iter().filter(|v| self.binders.contains_key(v)).map(move |&v| self.bound_lit(c, v))).collect()
+	}
+
+	// Encode the clauses and the constraints added since the latest call, in order (a clause's encoding refers to the earlier ones only)
+	fn sync(&mut self)
+	{
+		self.retire_bound();
+		while self.encoded < self.shapes.len()
+		{
+			self.encode(self.encoded);
+			self.encoded += 1;
+		}
+		while self.before_lits.len() < self.before.len()
+		{
+			let (a, b) = self.before[self.before_lits.len()];
+			let r = self.new_var();
+			self.solver.AddClause(&[-r, self.before(a, b)]);
+			self.before_lits.push(r);
+		}
+	}
+
+	fn encode(&mut self, c: usize)
+	{
+		let shape = self.shapes[c].clone();
 
 		// The order
 		let row: Vec<TLit> = (0..c).map(|_| self.new_var()).collect();
@@ -330,7 +620,6 @@ impl Planner
 			modes.push((m, shape.weights[k]));
 		}
 		self.modes.push(modes);
-		self.shapes.push(shape);
 
 		let mut terms: Vec<(TLit, u32)> = self.modes[c].clone();
 		for d in 0..c
@@ -348,8 +637,6 @@ impl Planner
 			}
 		}
 		self.add_to_sum(&terms);
-
-		self.set_greedy();
 	}
 
 	fn bound_lit(&self, c: usize, v: VarId) -> TLit
@@ -482,8 +769,13 @@ impl Planner
 	// Decision hints (each measured to speed up the optimization): boundness prefers true, the cost indicators and the adder outputs prefer false
 	// (they are only ever implied), and the order starts from the best plan so far.
 	// The upstream solver requires that these calls be followed by Solve (and not by AddClause), hence they are made here.
+	// With the budget spent, nothing is solved (RET_CONFLICT_OUT): a solve that needs no conflict would succeed even with a zero threshold
 	fn solve(&mut self, assumps: &[TLit], budget: &mut u64) -> TToporReturnVal
 	{
+		if *budget == 0
+		{
+			return TToporReturnVal::RET_CONFLICT_OUT;
+		}
 		for l in std::mem::take(&mut self.hints)
 		{
 			self.solver.FixPolarity(l, false);
@@ -503,11 +795,14 @@ impl Planner
 		}
 		let before = self.solver.GetConflictsNumber();
 		let r = self.solver.Solve(assumps, (f64::MAX, true), *budget);
+		let used = self.solver.GetConflictsNumber() - before;
 		self.solves += 1;
-		// u64::MAX means unlimited to the solver, while any other threshold is added to its conflict count, so u64::MAX must stay as it is
+		self.conflicts += used;
+		// u64::MAX means unlimited to the solver, while any other threshold is added to its conflict count, so u64::MAX must stay as it is;
+		// every solve is charged at least one conflict, so that a budget bounds the number of solves too
 		if *budget != u64::MAX
 		{
-			*budget = budget.saturating_sub(self.solver.GetConflictsNumber() - before);
+			*budget = budget.saturating_sub(used.max(1));
 		}
 		r
 	}
@@ -521,7 +816,7 @@ impl Planner
 
 	fn set_greedy(&mut self)
 	{
-		let order = greedy_order(&self.shapes, self.nvars);
+		let order = greedy_order(&self.shapes, self.nvars, &self.before).expect("the accepted constraints admit an order");
 		let cost = cost_of_order(&self.shapes, &order, self.nvars);
 		self.plan = Plan { order, cost, optimal: false, pending: unbindable(&self.shapes), source: PlanSource::Greedy };
 	}
@@ -538,24 +833,35 @@ impl Planner
 		{
 			return &self.plan;
 		}
-		self.retire_bound();
-		let tails: Vec<TLit> = self.bound.iter().flatten().map(|e| -e.2).collect();
+
+		// A small query: the DP's optimum (it can only fail on more than 64 bindable variables, as the accepted constraints admit an order)
+		if self.shapes.len() <= self.dp_max
+		{
+			if let Some((order, cost)) = dp_order(&self.shapes, self.nvars, &self.before)
+			{
+				self.plan = Plan { order, cost, optimal: true, pending: unbindable(&self.shapes), source: PlanSource::Dp };
+				return &self.plan;
+			}
+		}
+
+		self.sync();
+		let hard: Vec<TLit> = self.bound.iter().flatten().map(|e| -e.2).chain(self.before_lits.iter().copied()).collect();
 
 		// Find the predicates that can't be satisfied: drop the requirements in each UNSAT core, then re-admit those which hold on their own
 		let mut reqs: Vec<(usize, TLit)> = self.req.iter().enumerate().filter_map(|(c, r)| r.map(|r| (c, r))).collect();
 		let mut dropped = Vec::new();
 		loop
 		{
-			let assumps: Vec<TLit> = tails.iter().copied().chain(reqs.iter().map(|r| r.1)).collect();
+			let assumps: Vec<TLit> = hard.iter().copied().chain(reqs.iter().map(|r| r.1)).collect();
 			match self.solve(&assumps, &mut budget)
 			{
 				TToporReturnVal::RET_SAT => break,
 				TToporReturnVal::RET_UNSAT =>
 				{
-					let core: Vec<usize> = (0..reqs.len()).filter(|&i| self.solver.IsAssumptionRequired(tails.len() + i)).collect();
+					let core: Vec<usize> = (0..reqs.len()).filter(|&i| self.solver.IsAssumptionRequired(hard.len() + i)).collect();
 					if core.is_empty()
 					{
-						self.fail("the order constraints are unsatisfiable without any predicate requirement");
+						self.fail("the order and the accepted constraints are unsatisfiable without any predicate requirement");
 						return &self.plan;
 					}
 					for &i in core.iter().rev()
@@ -574,7 +880,7 @@ impl Planner
 		let mut pending = Vec::new();
 		for r in dropped
 		{
-			let assumps: Vec<TLit> = tails.iter().copied().chain(reqs.iter().map(|r| r.1)).chain([r.1]).collect();
+			let assumps: Vec<TLit> = hard.iter().copied().chain(reqs.iter().map(|r| r.1)).chain([r.1]).collect();
 			match self.solve(&assumps, &mut budget)
 			{
 				TToporReturnVal::RET_SAT => reqs.push(r),
@@ -592,7 +898,7 @@ impl Planner
 		self.plan.pending = pending;
 
 		// Minimize, starting from the best plan so far (the greedy one, or the result of an earlier refine, which ran out of budget)
-		let base: Vec<TLit> = tails.iter().copied().chain(reqs.iter().map(|r| r.1)).collect();
+		let base: Vec<TLit> = hard.iter().copied().chain(reqs.iter().map(|r| r.1)).chain(self.pending_needs(&self.plan.pending)).collect();
 		while self.plan.cost > 0
 		{
 			let act = self.at_most(self.plan.cost - 1);
@@ -609,6 +915,7 @@ impl Planner
 					};
 					let cost = cost_of_order(&self.shapes, &order, self.nvars);
 					debug_assert!(cost < self.plan.cost, "the true cost of a model is at most its objective value");
+					debug_assert!(respects(&self.shapes, self.nvars, &self.before, &order), "a model is a valid order");
 					self.plan.order = order;
 					self.plan.cost = cost;
 					self.plan.source = PlanSource::Sat;
@@ -652,23 +959,10 @@ mod tests
 		out
 	}
 
-	// Predicates that have binders must come after one binder of each of their variables
-	fn valid(shapes: &[ClauseShape], order: &[usize], nvars: usize) -> bool
+	// The cost of the cheapest valid order under the constraints, by enumeration; None when no order is valid
+	fn brute_force(shapes: &[ClauseShape], nvars: usize, before: &[(usize, usize)]) -> Option<u64>
 	{
-		let pending = unbindable(shapes);
-		let mut bound = vec![false; nvars];
-		for &c in order
-		{
-			if !pending.contains(&c) && !shapes[c].needs.iter().all(|&v| bound[v])
-			{
-				return false;
-			}
-			for &v in &shapes[c].binds
-			{
-				bound[v] = true;
-			}
-		}
-		true
+		permutations(shapes.len()).into_iter().filter(|o| respects(shapes, nvars, before, o)).map(|o| cost_of_order(shapes, &o, nvars)).min()
 	}
 
 	fn random_query(rng: &mut Rng, n: usize, nvars: usize) -> Vec<ClauseShape>
@@ -695,6 +989,42 @@ mod tests
 		shapes
 	}
 
+	// Feasible random constraints: up to `tries` random pairs, each kept if the constraints still admit an order
+	fn random_constraints(rng: &mut Rng, shapes: &[ClauseShape], nvars: usize, tries: usize) -> Vec<(usize, usize)>
+	{
+		let n = shapes.len() as u64;
+		let mut before = Vec::new();
+		for _ in 0..tries
+		{
+			let (a, b) = ((rng.next() % n) as usize, (rng.next() % n) as usize);
+			let mut all = before.clone();
+			all.push((a, b));
+			if a != b && greedy_order(shapes, nvars, &all).is_some()
+			{
+				before = all;
+			}
+		}
+		before
+	}
+
+	// A planner that never uses the DP
+	fn sat_planner() -> Planner
+	{
+		let mut p = Planner::new();
+		p.dp_max = 0;
+		p
+	}
+
+	fn pattern(slots: [Option<VarId>; 2], fanout: f64) -> ClauseShape
+	{
+		ClauseShape { slots, needs: vec![], binds: slots.iter().flatten().copied().collect(), weights: [weight_of_fanout(fanout); 4] }
+	}
+
+	fn predicate(needs: Vec<VarId>) -> ClauseShape
+	{
+		ClauseShape { slots: [None, None], needs, binds: vec![], weights: [weight_of_fanout(0.3); 4] }
+	}
+
 	#[test]
 	fn optimum_matches_brute_force_and_incremental_matches_batch()
 	{
@@ -704,46 +1034,56 @@ mod tests
 			let n = 1 + round % 6;
 			let nvars = 1 + (rng.next() % 4) as usize;
 			let shapes = random_query(&mut rng, n, nvars);
-			let best = permutations(n).into_iter().filter(|o| valid(&shapes, o, nvars)).map(|o| cost_of_order(&shapes, &o, nvars)).min().unwrap();
+			let best = brute_force(&shapes, nvars, &[]).unwrap();
+			let (order, cost) = dp_order(&shapes, nvars, &[]).unwrap();
+			assert!(cost == best && cost_of_order(&shapes, &order, nvars) == cost && respects(&shapes, nvars, &[], &order), "round {round}: DP {order:?} {cost}");
 
 			// Online: refine after every clause
-			let mut online = Planner::new();
+			let mut online = sat_planner();
 			for s in &shapes
 			{
 				online.add_clause(s.clone(), nvars);
 				online.refine(u64::MAX);
 			}
 			// Batch: one refine at the end
-			let mut batch = Planner::new();
+			let mut batch = sat_planner();
 			for s in &shapes
 			{
 				batch.add_clause(s.clone(), nvars);
 			}
-			for p in [&mut online, &mut batch]
+			// The default planner: the DP
+			let mut dp = Planner::new();
+			for s in &shapes
+			{
+				dp.add_clause(s.clone(), nvars);
+			}
+			for p in [&mut online, &mut batch, &mut dp]
 			{
 				let plan = p.refine(u64::MAX).clone();
 				assert!(plan.optimal && p.error().is_none(), "round {round}: {:?} {plan:?}", p.error());
-				assert!(valid(&shapes, &plan.order, nvars), "round {round}: invalid order {:?}", plan.order);
+				assert!(respects(&shapes, nvars, &[], &plan.order), "round {round}: invalid order {:?}", plan.order);
 				assert_eq!(plan.cost, best, "round {round}: shapes {shapes:?}");
 				assert_eq!(plan.cost, cost_of_order(&shapes, &plan.order, nvars));
 				assert_eq!(plan.pending, unbindable(&shapes));
 			}
+			assert_eq!(dp.plan().source, PlanSource::Dp);
+			assert_eq!(dp.solves, 0);
 		}
 	}
 
 	#[test]
 	fn pending_predicate_becomes_plannable()
 	{
-		let pred = ClauseShape { slots: [None, None], needs: vec![1], binds: vec![], weights: [weight_of_fanout(0.3); 4] };
-		let pat = |slots: [Option<VarId>; 2], w: f64| ClauseShape { slots, needs: vec![], binds: slots.iter().flatten().copied().collect(), weights: [weight_of_fanout(w); 4] };
-		let mut p = Planner::new();
-		p.add_clause(pat([Some(0), None], 100.0), 2);
-		p.add_clause(pred, 2);
-		assert_eq!(p.refine(u64::MAX).pending, vec![1]);
-		p.add_clause(pat([Some(0), Some(1)], 10.0), 2);
-		let plan = p.refine(u64::MAX).clone();
-		assert!(plan.pending.is_empty() && plan.optimal);
-		assert!(plan.order.iter().position(|&c| c == 2) < plan.order.iter().position(|&c| c == 1));
+		for mut p in [Planner::new(), sat_planner()]
+		{
+			p.add_clause(pattern([Some(0), None], 100.0), 2);
+			p.add_clause(predicate(vec![1]), 2);
+			assert_eq!(p.refine(u64::MAX).pending, vec![1]);
+			p.add_clause(pattern([Some(0), Some(1)], 10.0), 2);
+			let plan = p.refine(u64::MAX).clone();
+			assert!(plan.pending.is_empty() && plan.optimal);
+			assert!(plan.order.iter().position(|&c| c == 2) < plan.order.iter().position(|&c| c == 1));
+		}
 	}
 
 	#[test]
@@ -751,15 +1091,237 @@ mod tests
 	{
 		let mut rng = Rng::new(3);
 		let shapes = random_query(&mut rng, 12, 6);
-		let mut p = Planner::new();
+		let mut p = sat_planner();
 		for s in &shapes
 		{
 			p.add_clause(s.clone(), 6);
 		}
 		let quick = p.refine(1).clone();
-		assert!(quick.cost <= cost_of_order(&shapes, &greedy_order(&shapes, 6), 6));
+		assert!(quick.cost <= cost_of_order(&shapes, &greedy_order(&shapes, 6, &[]).unwrap(), 6));
 		let full = p.refine(u64::MAX).clone();
 		assert!(full.optimal && full.cost <= quick.cost);
-		assert!(valid(&shapes, &full.order, 6));
+		assert!(respects(&shapes, 6, &[], &full.order));
+		assert_eq!(full.cost, dp_order(&shapes, 6, &[]).unwrap().1);
+	}
+
+	#[test]
+	fn constraint_examples()
+	{
+		// A pending predicate waits for the binders that exist: P (1) needs x and y, and only x has a binder (A, 0)
+		let mut p = Planner::new();
+		p.add_clause(pattern([Some(0), None], 100.0), 2);
+		p.add_clause(predicate(vec![0, 1]), 2);
+		assert_eq!(p.require_before(1, 0), Err(vec![(1, 0)]));
+		assert_eq!(p.require_before(0, 1), Ok(0));
+		// A binder of y, cheap enough to go first; P still follows A
+		p.add_clause(pattern([Some(1), None], 1.0), 2);
+		let plan = p.refine(u64::MAX).clone();
+		assert!(plan.optimal && plan.pending.is_empty());
+		assert_eq!(plan.order, vec![2, 0, 1]);
+		// P needs y, whose only binder is B (2)
+		assert_eq!(p.require_before(1, 2), Err(vec![(1, 2)]));
+
+		// A cycle: every constraint of it is needed, and the others aren't
+		let mut p = Planner::new();
+		for _ in 0..4
+		{
+			p.add_clause(pattern([Some(0), None], 10.0), 1);
+		}
+		assert_eq!(p.require_before(0, 1), Ok(0));
+		assert_eq!(p.require_before(3, 2), Ok(1));
+		assert_eq!(p.require_before(1, 2), Ok(2));
+		assert_eq!(p.require_before(2, 0), Err(vec![(0, 1), (1, 2), (2, 0)]));
+		let plan = p.refine(u64::MAX).clone();
+		assert!(plan.optimal && respects(&p.shapes, 1, &[(0, 1), (3, 2), (1, 2)], &plan.order));
+
+		// Not syntactic: a predicate (2) may follow either binder of its variable (0 and 1), but the constraints put it before both
+		let mut p = Planner::new();
+		p.add_clause(pattern([Some(0), None], 10.0), 1);
+		p.add_clause(pattern([Some(0), None], 20.0), 1);
+		p.add_clause(predicate(vec![0]), 1);
+		p.add_clause(pattern([None, None], 5.0), 1);
+		assert_eq!(p.require_before(2, 0), Ok(0));
+		assert_eq!(p.require_before(3, 1), Ok(1));
+		assert_eq!(p.require_before(2, 3), Err(vec![(2, 0), (3, 1), (2, 3)]));
+		assert_eq!(p.refine(u64::MAX).order, vec![3, 1, 2, 0]);
+		assert_eq!(p.fallback_cores, 0);
+	}
+
+	#[test]
+	fn constraints_and_cores_match_brute_force()
+	{
+		let mut rng = Rng::new(11);
+		let (mut refused, mut largest) = (0, 0);
+		for round in 0..150
+		{
+			let n = 2 + round % 5;
+			let nvars = 1 + (rng.next() % 4) as usize;
+			let shapes = random_query(&mut rng, n, nvars);
+			// Constraints arrive between the clauses, so that clauses also arrive after constraints (pending predicates included)
+			let mut planners = [Planner::new(), sat_planner()];
+			let mut accepted: Vec<(usize, usize)> = Vec::new();
+			for c in 0..n
+			{
+				for p in &mut planners
+				{
+					p.add_clause(shapes[c].clone(), nvars);
+					p.refine(100);
+				}
+				for _ in 0..if c == 0 { 0 } else { rng.next() % 3 }
+				{
+					let a = (rng.next() % (c as u64 + 1)) as usize;
+					let b = (a + 1 + (rng.next() % c as u64) as usize) % (c + 1);
+					let mut all = accepted.clone();
+					all.push((a, b));
+					let feasible = brute_force(&shapes[..=c], nvars, &all).is_some();
+					for p in &mut planners
+					{
+						match p.require_before(a, b)
+						{
+							Ok(i) => assert!(feasible && i == accepted.len(), "round {round}: accepted {all:?}"),
+							Err(core) =>
+							{
+								assert!(!feasible, "round {round}: refused {all:?}");
+								assert!(core.contains(&(a, b)) && core.iter().all(|x| all.contains(x)), "round {round}: core {core:?} of {all:?}");
+								assert!(brute_force(&shapes[..=c], nvars, &core).is_none(), "round {round}: core {core:?} admits an order");
+								for k in 0..core.len()
+								{
+									let rest = [&core[..k], &core[k + 1..]].concat();
+									assert!(brute_force(&shapes[..=c], nvars, &rest).is_some(), "round {round}: core {core:?} isn't minimal");
+								}
+								largest = largest.max(core.len());
+							}
+						}
+					}
+					if feasible
+					{
+						accepted.push((a, b));
+					}
+					else
+					{
+						refused += 1;
+					}
+				}
+			}
+			let best = brute_force(&shapes, nvars, &accepted).expect("accepted constraints keep admitting an order");
+			assert_eq!(dp_order(&shapes, nvars, &accepted).unwrap().1, best);
+			for p in &mut planners
+			{
+				let plan = p.refine(u64::MAX).clone();
+				assert!(plan.optimal && p.error().is_none(), "round {round}: {:?}", p.error());
+				assert!(respects(&shapes, nvars, &accepted, &plan.order), "round {round}: {:?} breaks {accepted:?}", plan.order);
+				assert_eq!(plan.cost, best, "round {round}: {shapes:?} {accepted:?}");
+				assert_eq!(plan.pending, unbindable(&shapes));
+				assert_eq!(p.fallback_cores, 0, "round {round}: the SAT core wasn't confirmed");
+			}
+		}
+		assert!(refused > 50 && largest >= 3, "refused {refused}, largest core {largest}");
+	}
+
+	#[test]
+	fn dp_matches_sat_beyond_brute_force()
+	{
+		let mut rng = Rng::new(23);
+		for round in 0..4
+		{
+			let (n, nvars) = (8, 4);
+			let shapes = random_query(&mut rng, n, nvars);
+			let before = if round < 2 { Vec::new() } else { random_constraints(&mut rng, &shapes, nvars, 4) };
+			let (order, best) = dp_order(&shapes, nvars, &before).unwrap();
+			assert!(respects(&shapes, nvars, &before, &order) && cost_of_order(&shapes, &order, nvars) == best);
+			let mut p = sat_planner();
+			for s in &shapes
+			{
+				p.add_clause(s.clone(), nvars);
+			}
+			for &(a, b) in &before
+			{
+				p.require_before(a, b).unwrap();
+			}
+			let plan = p.refine(u64::MAX).clone();
+			assert!(plan.optimal && respects(&shapes, nvars, &before, &plan.order));
+			assert_eq!(plan.cost, best, "round {round}: {shapes:?} {before:?}");
+		}
+	}
+
+	#[test]
+	fn online_refinement_is_bounded()
+	{
+		let mut rng = Rng::new(5);
+		let (n, nvars) = (24, 10);
+		let shapes = random_query(&mut rng, n, nvars);
+		let mut p = Planner::new();
+		let mut before = Vec::new();
+		for (c, s) in shapes.iter().enumerate()
+		{
+			if c == 18
+			{
+				// A constraint on the way
+				let cons = random_constraints(&mut rng, &shapes[..c], nvars, 3);
+				assert!(!cons.is_empty());
+				for &(a, b) in &cons
+				{
+					p.require_before(a, b).unwrap();
+				}
+				before.extend(cons);
+			}
+			p.add_clause(s.clone(), nvars);
+			let (solves, conflicts) = (p.solves, p.conflicts);
+			let plan = p.refine(1000).clone();
+			// The solver may finish the conflict at which it reaches its threshold, so a solve can use one conflict more than its budget
+			let (solves, conflicts) = (p.solves - solves, p.conflicts - conflicts);
+			assert!(solves <= 1000 && conflicts <= 1000 + solves, "clause {c}: {solves} solves, {conflicts} conflicts");
+			assert!(respects(&shapes[..=c], nvars, &before, &plan.order));
+			assert!(plan.cost <= cost_of_order(&shapes[..=c], &greedy_order(&shapes[..=c], nvars, &before).unwrap(), nvars));
+			if c < DP_MAX
+			{
+				assert!(plan.optimal && plan.source == PlanSource::Dp && p.solves == 0);
+			}
+			// Without a budget, nothing is solved
+			let solves = p.solves;
+			p.refine(0);
+			assert_eq!(p.solves, solves);
+		}
+	}
+
+	// Timings of the DP and of SAT (release: cargo test --release planner_timings -- --ignored --nocapture)
+	#[test]
+	#[ignore]
+	fn planner_timings()
+	{
+		for n in [8, 12, 16, 20]
+		{
+			for seed in 0..3
+			{
+				let mut rng = Rng::new(100 + seed);
+				let nvars = n / 2;
+				let shapes = random_query(&mut rng, n, nvars);
+				let t = std::time::Instant::now();
+				let (_, best) = dp_order(&shapes, nvars, &[]).unwrap();
+				let dp = t.elapsed();
+				let before = random_constraints(&mut rng, &shapes, nvars, 3);
+				let t = std::time::Instant::now();
+				let constrained = dp_order(&shapes, nvars, &before).unwrap().1;
+				let dpc = t.elapsed();
+				let mut line = format!("n={n} seed={seed} dp={dp:?} best={best} | {} constraints: dp={dpc:?} best={constrained}", before.len());
+				// SAT (without the DP), unconstrained and constrained
+				for (what, cons) in [("sat", &[][..]), ("sat+constraints", &before[..])]
+				{
+					let mut p = sat_planner();
+					let t = std::time::Instant::now();
+					for s in &shapes
+					{
+						p.add_clause(s.clone(), nvars);
+					}
+					for &(a, b) in cons
+					{
+						p.require_before(a, b).unwrap();
+					}
+					let plan = p.refine(if n <= 8 { u64::MAX } else { 200_000 }).clone();
+					line += &format!(" | {what}: {:?} optimal={} cost={}", t.elapsed(), plan.optimal, plan.cost);
+				}
+				println!("{line}");
+			}
+		}
 	}
 }

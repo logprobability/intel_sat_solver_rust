@@ -214,6 +214,9 @@ pub enum Error
 	Unbound(String),
 	/// The SAT planner was disabled after a solver error; the message is the solver's explanation
 	Planner(String),
+	/// An ordering constraint (`Query::require_before`) under which no order of the clauses is valid; the pairs `(a, b)`, clause a before clause b,
+	/// are a minimal conflicting subset of the query's constraints, the refused one included
+	OrderConflict(Vec<(usize, usize)>),
 	/// A query that is malformed beyond its terms' types: a variable of another query, `or` branches over different variables,
 	/// an empty `not` or `or`, the wrong number of inputs, or an aggregate over values it can't combine
 	InvalidQuery(String),
@@ -244,6 +247,11 @@ impl fmt::Display for Error
 			Error::FilteredDb => write!(f, "a history or since view can't be transacted against, and a history view can't be pulled from"),
 			Error::Unbound(v) => write!(f, "variable {v} is not bound where it is needed"),
 			Error::Planner(m) => write!(f, "planner error: {m}"),
+			Error::OrderConflict(pairs) =>
+			{
+				let pairs: Vec<String> = pairs.iter().map(|(a, b)| format!("clause {a} before clause {b}")).collect();
+				write!(f, "conflicting ordering constraints (with the clauses' needs, no order satisfies them all): {}", pairs.join(", "))
+			}
 			Error::InvalidQuery(m) => write!(f, "invalid query: {m}"),
 			Error::Parse { line, col, msg } => write!(f, "parse error at {line}:{col}: {msg}"),
 		}

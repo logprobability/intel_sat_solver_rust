@@ -56,24 +56,52 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     in every round (`Query::rule_stats` counts strata, rounds and plans);
   * the relations keep a hash index per combination of bound argument positions that a call uses, extended as tuples arrive.
   A rule's variables are its own (its body runs in an environment of its own), and every head variable must be bound by the body.
-* **The planner** (`src/planner.rs`). It chooses the join order with one incremental SAT solver per query, *while the query is being assembled*:
-  every added clause extends the encoding (nothing is retracted) and is followed by a short, conflict-bounded refinement, so a good plan exists
-  before the query is complete, and `run` finishes the optimization. The module documentation has the details; in short:
-  * the order is an acyclic tournament (one variable per pair of clauses), so adding a clause only adds variables and clauses;
-  * "variable bound before clause c" points to an open disjunction of the binders seen so far plus a *tail* literal assumed false,
-    which a binder added later extends;
-  * a predicate's requirement that its variables be bound is an assumption: when a variable has no binder yet, the UNSAT core
-    (`IsAssumptionRequired`) names the predicate, which is reported as pending while the rest of the query is planned;
-  * the cost, the sum of the estimated log-sizes of the intermediate results, is linear over pairwise indicators and is summed
-    by a lower-bounding binary adder network, which grows with the query;
-  * optimization tightens `sum <= K` bounds guarded by activation literals, starting below the greedy plan, until UNSAT (proved optimal)
-    or until the conflict budget runs out (the best plan so far, which is never worse than greedy).
+* **The planner** (`src/planner.rs`). It chooses the join order *while the query is being assembled*: every added clause is followed by
+  a refinement, so a good plan exists before the query is complete, and `run` finishes the optimization.
+  * Queries of up to 16 clauses (`DP_MAX`) are ordered exactly by a dynamic program over the subsets of clauses (a clause's cost depends only on
+    the set before it and that set's size), constrained or not: 10 µs to 2.5 ms in release builds, see the timings below.
+  * Hard ordering constraints: `Query::require_before(a, b)` makes clause `a` run before clause `b`. A constraint under which no order is valid
+    (with the other constraints and the clauses' needs: a predicate, `not` or filtering `or` after a binder of each of its variables) is refused
+    with `Error::OrderConflict`, naming a minimal conflicting subset of the constraints, and the query is unchanged. A predicate still pending
+    (a variable without binder) must follow the binders its other variables have, so clauses added later never break accepted constraints.
+    Feasibility itself is decided exactly by the greedy order (being able to run is monotone in the set of clauses that ran); the core comes
+    from the SAT solver (`IsAssumptionRequired` over the constraints' assumptions, shrunk by deletion) and is re-confirmed by that test,
+    falling back to deletion with the test if the solver runs out of budget.
+  * Larger queries use one incremental SAT solver per query, encoded when first needed and then extended clause by clause (nothing is retracted),
+    with a refinement bounded by a conflict budget after each clause (each solve is charged at least one conflict, so the budget also bounds
+    the number of solves, and a spent budget solves nothing). The module documentation has the details; in short:
+    * the order is an acyclic tournament (one variable per pair of clauses), so adding a clause only adds variables and clauses;
+    * "variable bound before clause c" points to an open disjunction of the binders seen so far plus a *tail* literal assumed false,
+      which a binder added later extends;
+    * a predicate's requirement that its variables be bound is an assumption: when a variable has no binder yet, the UNSAT core
+      (`IsAssumptionRequired`) names the predicate, which is reported as pending while the rest of the query is planned;
+      an ordering constraint is an assumption too (`r -> before(a, b)`);
+    * the cost, the sum of the estimated log-sizes of the intermediate results, is linear over pairwise indicators and is summed
+      by a lower-bounding binary adder network, which grows with the query;
+    * optimization tightens `sum <= K` bounds guarded by activation literals, starting below the greedy plan, until UNSAT (proved optimal)
+      or until the conflict budget runs out (the best plan so far, which is never worse than greedy).
+
+  Timings (release, random queries of the planner tests, `cargo test --release planner_timings -- --ignored --nocapture`):
+
+  | clauses | DP (unconstrained / 2-3 constraints) | SAT to the optimum, or 200k conflicts |
+  |---------|--------------------------------------|----------------------------------------|
+  | 8       | 7-40 µs / 4 µs                       | 0.13-0.85 s, optimal                    |
+  | 12      | 70-115 µs / 20-60 µs                 | 3-5.5 s, optimal in 1 of 6 runs (before this change: 12-595 s to the optimum) |
+  | 16      | 0.8-2.5 ms / 0.2-1.1 ms              | 3-5 s, 1-13% above the optimum (before: no better than greedy in 300k conflicts) |
+  | 20      | 28-120 ms / 11-75 ms                 | 3-5 s, 3-10% above the optimum           |
+
+  So the DP also orders the small constrained queries (rather than SAT with the DP as a lower bound, which was measured and saved
+  0.6 s in the one run where SAT reached the bound). Another lower bound that would end the SAT search early (each clause at its
+  cheapest weight, the cheapest at the largest multipliers) is 2-11% below the optimum, which SAT's plans don't reach, so it isn't used either.
 
 ## Building and testing
 
 The crate depends on the solver by path (`../rust`), with the solver's profiles mirrored (it relies on wrap-around arithmetic).
 
-    cargo test              # unit tests, incl. the planner against brute force (every order of random queries of up to 6 clauses),
+    cargo test              # unit tests, incl. the planner (SAT and the DP) against brute force (every order of random queries of up to 6 clauses,
+                            # with random ordering constraints arriving between the clauses: acceptance, the minimality of each refused
+                            # constraint's core and the constrained optimum), the DP against SAT on 8 clauses, the bounds of the online
+                            # refinement on a 24-clause query, ordering constraints in queries,
                             # transactions and retract_entity against naive reference models, the history and since views of
                             # every past value against the transactions' logs, history queries and pull against brute force,
                             # random queries with (nested) not and or in every clause order against a bottom-up relational
@@ -105,12 +133,12 @@ This is a start. What is missing, roughly in order of value:
   that differs from the existing one is an `AttrConflict`. Also: tempid unification through identity values that are themselves new tempids
   (a ref-valued identity pointing at a tempid that resolves to nothing existing doesn't unify), transaction functions (e.g. CAS),
   and an Instant value type.
-* Hard user constraints in the planner (e.g., "run clause A before B"). They would be assumptions like the predicates' requirements,
-  and that's where the UNSAT cores become non-trivial: today a predicate is unsatisfiable exactly when one of its variables has no binder,
-  which the tests check against the cores.
-* Planner scale: on the random 12-clause query of the tests, finding and proving the optimum takes about 6 s (release build);
-  most of it is the first improvements over greedy and the final UNSAT proof. Within a conflict budget the result is the best plan so far.
-  Candidates: core-guided optimization (lower bounds from cores), and exact DP over subsets for small queries, as a fast path and a cross-check.
-  (Measured: lower-bounding adders instead of exact ones cut this from ~40 s; reducing the adder columns in rounds instead of chains made it much slower.)
+* Planner scale beyond 16 clauses: the DP covers up to 16 clauses (20 would take up to 120 ms per refinement), and above that SAT
+  ends 1-13% above the optimum after 200k conflicts and rarely proves it. Candidates: core-guided optimization (lower bounds from cores;
+  the simple rearrangement bound is too weak), a DP over connected subsets or with pruning by a bound, and a cheaper SAT refinement
+  for each added clause (each solve re-propagates the whole encoding). (Measured earlier: lower-bounding adders instead of exact ones
+  cut SAT's time from ~40 s; reducing the adder columns in rounds instead of chains made it much slower.)
+* Ordering constraints: only `require_before` on the query's top-level clauses (not inside `not`, `or` or rule bodies), no text syntax,
+  and no way to drop an accepted constraint.
 * Cost model: independence assumptions and fixed predicate selectivities; no histograms.
 * Storage: everything is in memory; no durable log or segment storage.
