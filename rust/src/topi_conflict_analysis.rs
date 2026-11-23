@@ -1258,7 +1258,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				return;
 			}
 
-			let mut buf: Vec<u8> = Vec::new();
+			let mut buf = std::mem::take(&mut self.m_DratBuf);
+			buf.clear();
 
 			if self.m_IsDratBinary
 			{
@@ -1281,8 +1282,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			{
 				for l in userClsSpan
 				{
-					buf.extend_from_slice(l.to_string().as_bytes());
-					buf.push(b' ');
+					// Writing into a vector can't fail
+					let _ = write!(buf, "{} ", l);
 				}
 				buf.extend_from_slice(b"0\n");
 			}
@@ -1291,6 +1292,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			let o = self.m_OpenedDratFile.as_mut().unwrap();
 			// endl flushes the stream in the textual mode
 			let isGood = o.write_all(&buf).is_ok() && (isDratBinary || o.flush().is_ok());
+			self.m_DratBuf = buf;
 			if !isGood
 			{
 				self.OnBadDratFile();
