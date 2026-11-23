@@ -204,10 +204,11 @@ This is a start. What is missing, roughly in order of value:
 * Planner scale beyond 16 clauses: the DP covers up to 16 clauses (20 would take up to 120 ms per refinement), and above that SAT
   ends 1-13% above the optimum after 200k conflicts and rarely proves it. The online refinement doesn't help there yet: on random
   24-clause queries (`cargo test --release online_refinement_budgets -- --ignored --nocapture`), no refinement after clauses 17 to 24
-  beat the greedy plan, with 1k, 10k or 100k conflicts each (the first `sum < greedy` solve alone takes them all), and adding a clause
-  resets the plan to the greedy one, dropping what earlier refinements found; so `run` past 16 clauses usually runs the greedy plan.
-  Candidates: a local search (insertion moves) from the greedy plan before SAT, keeping the previous plan (with the new clause inserted)
-  when a clause is added, core-guided optimization (lower bounds from cores;
+  beat the plan it started from, with 1k, 10k or 100k conflicts each (the first `sum < best` solve alone takes them all). What helps is
+  that a change of the query carries the previous plan over (`PlanSource::Carried`): an added clause goes to its cheapest valid position
+  in it, and an accepted constraint keeps it if it respects the constraint, whenever that beats the greedy plan. So the DP's optimum at
+  16 clauses carries into the larger query: past 16 clauses the plans cost 0.956 of the greedy ones on average (before, exactly the greedy ones).
+  A local search by insertion moves on top of that was measured and dropped (0.953). Candidates: core-guided optimization (lower bounds from cores;
   the simple rearrangement bound is too weak), a DP over connected subsets or with pruning by a bound, and a cheaper SAT refinement
   for each added clause (each solve re-propagates the whole encoding). (Measured earlier: lower-bounding adders instead of exact ones
   cut SAT's time from ~40 s; reducing the adder columns in rounds instead of chains made it much slower.)
