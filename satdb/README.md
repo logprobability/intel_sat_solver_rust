@@ -78,7 +78,10 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
 * **Pull** (`src/query.rs`). `Db::pull(pattern, eid)` reads an entity as a tree (`Pulled`): attribute lists, the wildcard (which pulls
   components recursively, stopping at cycles), nested patterns for Ref attributes, and reverse refs through VAET (`Pull::reverse`, key `ns/_name`).
   Cardinality-one attributes and reverse components give one value, the others a list; absent attributes are left out. The pattern is
-  validated before anything is pulled.
+  validated before anything is pulled. Attributes take options (`Pull::limit`, `default`, `key`: Datomic's `:limit`, `:default`, `:as`), and
+  `Pull::recurse(depth)` pulls the referenced entities by the enclosing pattern again, to a depth or (None) until an entity repeats on the
+  path, where it stays a Ref (Datomic's `{:attr ...}` and `{:attr 3}`). `Db::pull_str` reads a pattern in Datomic's EDN syntax
+  (`[:person/name * :person/_friend [:person/aka :limit 2 :as "aliases"] {:person/friend [:person/name]} {:person/boss ...}]`).
 * **Persistent indexes** (`src/pmap.rs`). A treap with `Arc`-shared nodes and hash-of-key priorities: an update copies one root-to-leaf path,
   and the tree's shape depends on its key set only.
 * **Queries** (`src/query.rs`). Datalog-style queries over any view: patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`),
@@ -194,7 +197,7 @@ This is a start. What is missing, roughly in order of value:
 * Time: the planner's estimates for `since` and `as_of` views
   (they use the latest value's statistics). An as-of view derives each read from the history, so it costs more than a read of the current value.
   In a history view, the current-state accessors (`values`, `lookup`, ...) still read the current datoms; only scans and queries see the history.
-* Pull: recursion limits (`...`), attribute options (defaults, limits, renaming) and pulling from a query's find spec.
+* Pull: pulling from a query's find spec (a find result would need to hold a tree as well as values), and `:limit nil`.
 * Schema: renaming attributes, altering the value type, and attribute retirement; user-defined transaction functions
   (CAS is the only built-in); a keyword value type.
 * Planner scale beyond 16 clauses: the DP covers up to 16 clauses (20 would take up to 120 ms per refinement), and above that SAT

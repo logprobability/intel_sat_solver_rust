@@ -987,30 +987,84 @@ pub enum Pull
 	/// The attribute `name`, or its reverse (the entities referring to this one through it); `nested` pulls the referenced entities
 	Attr
 	{
-		name: String, reverse: bool, nested: Option<Vec<Pull>>
+		name: String, reverse: bool, nested: Option<Nested>, opts: PullOpts
 	},
+}
+
+/// How a pull attribute pulls the entities it refers to
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Nested
+{
+	/// By a pattern of their own
+	Pattern(Vec<Pull>),
+	/// By the pattern that holds the attribute, again (Datomic's `...` or a depth): up to that many levels of this attribute
+	/// (None: unbounded); an entity already being pulled further up, or past the depth, stays a Ref
+	Recurse(Option<usize>),
+}
+
+/// The options of a pull attribute (Datomic's `:as`, `:limit` and `:default`)
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct PullOpts
+{
+	/// The result's key, instead of the attribute's name (or `ns/_name` for a reverse attribute)
+	pub key: Option<String>,
+	/// At most this many values of a cardinality-many (or a non-component reverse) attribute, the first in index order
+	pub limit: Option<usize>,
+	/// The value when the entity has none (it must be of the attribute's type; not for a reverse attribute)
+	pub default: Option<Value>,
 }
 
 impl Pull
 {
 	pub fn attr(name: &str) -> Self
 	{
-		Pull::Attr { name: name.to_string(), reverse: false, nested: None }
+		Pull::Attr { name: name.to_string(), reverse: false, nested: None, opts: PullOpts::default() }
 	}
 
 	pub fn reverse(name: &str) -> Self
 	{
-		Pull::Attr { name: name.to_string(), reverse: true, nested: None }
+		Pull::Attr { name: name.to_string(), reverse: true, nested: None, opts: PullOpts::default() }
 	}
 
-	/// Pull the attribute's entities by `pattern` (the attribute must be a Ref, which `Db::pull` checks); panics on the wildcard
-	pub fn nest(self, pattern: Vec<Pull>) -> Self
+	fn with(self, f: impl FnOnce(&mut Option<Nested>, &mut PullOpts)) -> Self
 	{
 		match self
 		{
-			Pull::Attr { name, reverse, .. } => Pull::Attr { name, reverse, nested: Some(pattern) },
-			Pull::Wildcard => panic!("the wildcard has no entities to nest a pattern in"),
+			Pull::Attr { name, reverse, mut nested, mut opts } =>
+			{
+				f(&mut nested, &mut opts);
+				Pull::Attr { name, reverse, nested, opts }
+			}
+			Pull::Wildcard => panic!("the wildcard takes no nested pattern or options"),
 		}
+	}
+
+	/// Pull the attribute's entities by `pattern` (the attribute must be a Ref, which `Db::pull` checks); panics on the wildcard, as do the others
+	pub fn nest(self, pattern: Vec<Pull>) -> Self
+	{
+		self.with(|n, _| *n = Some(Nested::Pattern(pattern)))
+	}
+
+	/// Pull the attribute's entities by the enclosing pattern, `depth` levels deep (None: until an entity repeats)
+	pub fn recurse(self, depth: Option<usize>) -> Self
+	{
+		self.with(|n, _| *n = Some(Nested::Recurse(depth)))
+	}
+
+	pub fn key(self, key: &str) -> Self
+	{
+		self.with(|_, o| o.key = Some(key.to_string()))
+	}
+
+	pub fn limit(self, n: usize) -> Self
+	{
+		self.with(|_, o| o.limit = Some(n))
+	}
+
+	pub fn default(self, v: impl Into<Value>) -> Self
+	{
+		let v = v.into();
+		self.with(|_, o| o.default = Some(v))
 	}
 }
 
@@ -1046,8 +1100,21 @@ impl Pulled
 struct PullSpec
 {
 	wildcard: bool,
-	/// (attribute, reverse, nested pattern)
-	attrs: Vec<(AttrId, bool, Option<PullSpec>)>,
+	attrs: Vec<PullAttr>,
+}
+
+struct PullAttr
+{
+	a: AttrId,
+	reverse: bool,
+	nested: Option<NestedSpec>,
+	opts: PullOpts,
+}
+
+enum NestedSpec
+{
+	Pattern(PullSpec),
+	Recurse(Option<usize>),
 }
 
 impl PullSpec
@@ -1063,7 +1130,7 @@ impl PullSpec
 			match p
 			{
 				Pull::Wildcard => spec.wildcard = true,
-				Pull::Attr { name, reverse, nested } =>
+				Pull::Attr { name, reverse, nested, opts } =>
 				{
 					let a = db.attr_id(name).ok_or_else(|| Error::UnknownAttr(name.clone()))?;
 					let t = db.attr(a).value_type;
@@ -1071,8 +1138,19 @@ impl PullSpec
 					{
 						return Err(Error::TypeMismatch { attr: name.clone(), expected: ValueType::Ref, got: t });
 					}
-					let nested = nested.as_ref().map(|n| Self::compile(db, n)).transpose()?;
-					spec.attrs.push((a, *reverse, nested));
+					match &opts.default
+					{
+						Some(_) if *reverse => return Err(Error::InvalidQuery(format!("a default for the reverse attribute {name}"))),
+						Some(v) if v.value_type() != t => return Err(Error::TypeMismatch { attr: name.clone(), expected: t, got: v.value_type() }),
+						_ => {}
+					}
+					let nested = match nested
+					{
+						None => None,
+						Some(Nested::Pattern(n)) => Some(NestedSpec::Pattern(Self::compile(db, n)?)),
+						Some(Nested::Recurse(depth)) => Some(NestedSpec::Recurse(*depth)),
+					};
+					spec.attrs.push(PullAttr { a, reverse: *reverse, nested, opts: opts.clone() });
 				}
 			}
 		}
@@ -1108,11 +1186,12 @@ impl Db
 		}
 		self.check_eid(e)?;
 		let spec = PullSpec::compile(self, pattern)?;
-		Ok(self.pull_spec(&spec, e, &mut Vec::new()))
+		Ok(self.pull_spec(&spec, e, &mut Vec::new(), &mut vec![0; spec.attrs.len()]))
 	}
 
-	// path: the entities being pulled above this one, where the wildcard stops following components
-	fn pull_spec(&self, spec: &PullSpec, e: Eid, path: &mut Vec<Eid>) -> Pulled
+	// path: the entities being pulled above this one, where the wildcard and recursion stop;
+	// levels: for each attribute of `spec`, how many times the pull has recursed through it to get here
+	fn pull_spec(&self, spec: &PullSpec, e: Eid, path: &mut Vec<Eid>, levels: &mut Vec<usize>) -> Pulled
 	{
 		path.push(e);
 		let mut attrs = BTreeMap::new();
@@ -1131,34 +1210,50 @@ impl Db
 				{
 					items.push(match v
 					{
-						Value::Ref(c) if def.component && !path.contains(&c) => PullValue::Entity(self.pull_spec(&PullSpec::WILDCARD, c, path)),
+						Value::Ref(c) if def.component && !path.contains(&c) => PullValue::Entity(self.pull_spec(&PullSpec::WILDCARD, c, path, &mut Vec::new())),
 						v => PullValue::Val(v),
 					});
 				}
 				attrs.insert(def.name.to_string(), shape(def.cardinality == Cardinality::One, items));
 			}
 		}
-		for (a, reverse, nested) in &spec.attrs
+		for (i, pa) in spec.attrs.iter().enumerate()
 		{
-			let def = self.attr(*a);
-			let (key, one, vals): (String, bool, Vec<Value>) = if *reverse
+			let def = self.attr(pa.a);
+			let (key, one, mut vals): (String, bool, Vec<Value>) = if pa.reverse
 			{
-				(reverse_key(&def.name), def.component, self.referrers(e).filter(|(b, _)| b == a).map(|(_, x)| Value::Ref(x)).collect())
+				(reverse_key(&def.name), def.component, self.referrers(e).filter(|(b, _)| *b == pa.a).map(|(_, x)| Value::Ref(x)).collect())
 			}
 			else
 			{
-				(def.name.to_string(), def.cardinality == Cardinality::One, self.values(e, *a).cloned().collect())
+				(def.name.to_string(), def.cardinality == Cardinality::One, self.values(e, pa.a).cloned().collect())
 			};
+			let key = pa.opts.key.clone().unwrap_or(key);
+			if let Some(n) = pa.opts.limit.filter(|_| !one)
+			{
+				vals.truncate(n);
+			}
 			if vals.is_empty()
 			{
+				if let Some(d) = &pa.opts.default
+				{
+					attrs.insert(key, PullValue::Val(d.clone()));
+				}
 				continue;
 			}
 			let mut items = Vec::with_capacity(vals.len());
 			for v in vals
 			{
-				items.push(match (nested, v)
+				items.push(match (&pa.nested, v)
 				{
-					(Some(n), Value::Ref(c)) => PullValue::Entity(self.pull_spec(n, c, path)),
+					(Some(NestedSpec::Pattern(n)), Value::Ref(c)) => PullValue::Entity(self.pull_spec(n, c, path, &mut vec![0; n.attrs.len()])),
+					(Some(NestedSpec::Recurse(depth)), Value::Ref(c)) if depth.map_or(true, |d| levels[i] < d) && !path.contains(&c) =>
+					{
+						levels[i] += 1;
+						let pulled = self.pull_spec(spec, c, path, levels);
+						levels[i] -= 1;
+						PullValue::Entity(pulled)
+					}
 					(_, v) => PullValue::Val(v),
 				});
 			}
@@ -1988,6 +2083,12 @@ pub(crate) mod tests
 	// A naive pull over a set of (e, a, v) triples, by scanning it
 	fn naive_pull(db: &Db, facts: &BTreeSet<(Eid, AttrId, Value)>, pattern: &[Pull], e: Eid, path: &mut Vec<Eid>) -> Pulled
 	{
+		naive_pull_at(db, facts, pattern, e, path, &mut vec![0; pattern.len()])
+	}
+
+	// levels: how many times the pull recursed through each element of `pattern` to get here
+	fn naive_pull_at(db: &Db, facts: &BTreeSet<(Eid, AttrId, Value)>, pattern: &[Pull], e: Eid, path: &mut Vec<Eid>, levels: &mut Vec<usize>) -> Pulled
+	{
 		path.push(e);
 		let mut attrs = BTreeMap::new();
 		let mut put = |key: String, one: bool, items: Vec<PullValue>| {
@@ -2014,12 +2115,13 @@ pub(crate) mod tests
 				put(def.name.to_string(), def.cardinality == Cardinality::One, items);
 			}
 		}
-		for p in pattern
+		for (i, p) in pattern.iter().enumerate()
 		{
-			let Pull::Attr { name, reverse, nested } = p else { continue };
+			let Pull::Attr { name, reverse, nested, opts } = p else { continue };
 			let a = db.attr_id(name).unwrap();
 			let def = db.attr(a).clone();
-			let vals: Vec<Value> = if *reverse
+			let one = if *reverse { def.component } else { def.cardinality == Cardinality::One };
+			let mut vals: Vec<Value> = if *reverse
 			{
 				facts.iter().filter(|f| f.1 == a && f.2 == Value::Ref(e)).map(|f| Value::Ref(f.0)).collect()
 			}
@@ -2027,17 +2129,32 @@ pub(crate) mod tests
 			{
 				facts.iter().filter(|f| f.0 == e && f.1 == a).map(|f| f.2.clone()).collect()
 			};
+			if !one
+			{
+				vals.truncate(opts.limit.unwrap_or(usize::MAX));
+			}
 			let mut items = Vec::new();
 			for v in vals
 			{
 				items.push(match (nested, v)
 				{
-					(Some(n), Value::Ref(x)) => PullValue::Entity(naive_pull(db, facts, n, x, path)),
+					(Some(Nested::Pattern(n)), Value::Ref(x)) => PullValue::Entity(naive_pull(db, facts, n, x, path)),
+					(Some(Nested::Recurse(d)), Value::Ref(x)) if d.map_or(true, |d| levels[i] < d) && !path.contains(&x) =>
+					{
+						levels[i] += 1;
+						let pulled = naive_pull_at(db, facts, pattern, x, path, levels);
+						levels[i] -= 1;
+						PullValue::Entity(pulled)
+					}
 					(_, v) => PullValue::Val(v),
 				});
 			}
-			let key = if *reverse { format!("_{name}") } else { name.clone() };
-			put(key, if *reverse { def.component } else { def.cardinality == Cardinality::One }, items);
+			let key = opts.key.clone().unwrap_or(if *reverse { format!("_{name}") } else { name.clone() });
+			match (&opts.default, items.is_empty())
+			{
+				(Some(d), true) => put(key, true, vec![PullValue::Val(d.clone())]),
+				_ => put(key, one, items),
+			}
 		}
 		path.pop();
 		Pulled { id: e, attrs }
@@ -2058,11 +2175,32 @@ pub(crate) mod tests
 			{
 				let name = refs[(rng.next() % 3) as usize];
 				let x = if rng.next() % 2 == 0 { Pull::reverse(name) } else { Pull::attr(name) };
-				p.push(if depth > 0 && rng.next() % 2 == 0 { x.nest(random_pull(rng, depth - 1)) } else { x });
+				let x = match rng.next() % 4
+				{
+					0 if depth > 0 => x.nest(random_pull(rng, depth - 1)),
+					1 => x.recurse([None, Some(1), Some(2)][(rng.next() % 3) as usize]),
+					_ => x,
+				};
+				let x = if rng.next() % 3 == 0 { x.limit((rng.next() % 3) as usize) } else { x };
+				// A renamed key may collide with another element's (the later one wins, in both pulls)
+				p.push(if rng.next() % 4 == 0 { x.key(["k1", "k2"][(rng.next() % 2) as usize]) } else { x });
 			}
 			else
 			{
-				p.push(Pull::attr(RANDOM_ATTRS[(rng.next() % 6) as usize]));
+				let name = RANDOM_ATTRS[(rng.next() % 6) as usize];
+				let x = Pull::attr(name);
+				// A default of the attribute's type
+				let default = match name
+				{
+					"n" | "key" => Some(Value::Int(-1)),
+					"tag" => Some(Value::from("none")),
+					_ => None,
+				};
+				p.push(match default
+				{
+					Some(d) if rng.next() % 3 == 0 => x.default(d),
+					_ => x,
+				});
 			}
 		}
 		p

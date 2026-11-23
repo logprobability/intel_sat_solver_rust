@@ -35,14 +35,16 @@
 //! * Comparisons `[(op a b)]` with `=`, `!=` (or `not=`), `<`, `<=`, `>` and `>=`.
 //! * `(not clause ...)`, `(not-join [?v ...] clause ...)`, `(or branch ...)` and `(or-join [?v ...] branch ...)`, where a branch
 //!   is a clause or `(and clause ...)`.
-//! * Constants: strings (with the escapes `\"`, `\\`, `\n`, `\t` and `\r`), integers and booleans. There is no keyword value type,
+//! * Constants: strings (with the escapes `\"`, `\\`, `\n`, `\t` and `\r`), integers, floats (`1.5`, `-2e3`), booleans and instants
+//!   (`#inst "2024-02-29T13:45:00Z"`, RFC 3339 with `Z` or an offset, or a date alone). There is no keyword value type,
 //!   so a keyword can only name an attribute.
+//! * Pull patterns (`Db::pull_str`, not in queries' find specs) are EDN too, the only place where maps are allowed.
 //!
 //! Commas are whitespace and `;` starts a comment. Syntax errors are `Error::Parse`, with the line and column; the errors of the clauses
 //! themselves (an unknown attribute, a type mismatch, ...) are those of the builder.
 
-use crate::db::{Db, Error, Value};
-use crate::query::{Agg, Clause, Cmp, Find, Query, Term};
+use crate::db::{Db, Eid, Error, Value};
+use crate::query::{Agg, Clause, Cmp, Find, Pull, Pulled, Query, Term};
 use std::collections::{BTreeSet, HashMap};
 
 /// A parsed text query: the query (planned as its clauses were read), its find spec and its `with` terms
@@ -93,6 +95,97 @@ impl Db
 	{
 		self.parse_query_rules(text, rules, inputs)?.run()
 	}
+
+	/// Pull entity `e` by a pull pattern in Datomic's EDN syntax (see `Db::pull`):
+	/// `[:person/name *  :person/_friend  [:person/aka :limit 2 :as "aliases"]  [:person/age :default 0]
+	///   {:person/friend [:person/name]}  {[:person/boss :as "chain"] ...}  {:person/friend 2}]`.
+	/// A keyword whose name starts with `_` is a reverse attribute; a map nests a pattern under each of its keys, or recurses
+	/// (`...`: until an entity repeats, or a depth)
+	pub fn pull_str(&self, pattern: &str, e: Eid) -> Result<Pulled, Error>
+	{
+		let node = Reader { text: pattern, pos: 0 }.read_all()?;
+		self.pull(&pull_pattern(pattern, &node)?, e)
+	}
+}
+
+/// A pull pattern of EDN (see `Db::pull_str`)
+fn pull_pattern(text: &str, node: &Node) -> Result<Vec<Pull>, Error>
+{
+	let Form::Vector(items) = &node.form
+	else
+	{
+		return Err(error_at(text, node.pos, "a pull pattern is a vector"));
+	};
+	let mut out = Vec::new();
+	for item in items
+	{
+		match &item.form
+		{
+			Form::Symbol(s) if s == "*" => out.push(Pull::Wildcard),
+			Form::Keyword(_) | Form::Vector(_) | Form::List(_) => out.push(pull_attr(text, item)?),
+			Form::Map(pairs) =>
+			{
+				for pair in pairs.chunks(2)
+				{
+					let attr = pull_attr(text, &pair[0])?;
+					out.push(match &pair[1].form
+					{
+						Form::Symbol(s) if s == "..." => attr.recurse(None),
+						Form::Int(n) if *n >= 0 => attr.recurse(Some(*n as usize)),
+						Form::Vector(_) => attr.nest(pull_pattern(text, &pair[1])?),
+						_ => return Err(error_at(text, pair[1].pos, "a map of a pull pattern takes a pattern, ... or a depth for each attribute")),
+					});
+				}
+			}
+			_ => return Err(error_at(text, item.pos, "expected an attribute, *, an attribute with options or a map")),
+		}
+	}
+	Ok(out)
+}
+
+/// An attribute of a pull pattern: `:ns/name` (`:ns/_name` for the reverse), or `[:ns/name option value ...]` with the options
+/// `:as` (a string or a keyword), `:limit` (a count) and `:default` (a constant)
+fn pull_attr(text: &str, node: &Node) -> Result<Pull, Error>
+{
+	let err = |n: &Node, msg: &str| error_at(text, n.pos, msg);
+	let named = |n: &Node| match &n.form
+	{
+		Form::Keyword(k) => Ok(match k.rsplit_once('/')
+		{
+			Some((ns, local)) if local.len() > 1 && local.starts_with('_') => Pull::reverse(&format!("{ns}/{}", &local[1..])),
+			None if k.len() > 1 && k.starts_with('_') => Pull::reverse(&k[1..]),
+			_ => Pull::attr(k),
+		}),
+		_ => Err(err(n, "expected an attribute keyword")),
+	};
+	let (Form::Vector(items) | Form::List(items)) = &node.form else { return named(node) };
+	let Some((first, opts)) = items.split_first() else { return Err(err(node, "an attribute with options needs the attribute")) };
+	if opts.len() % 2 == 1
+	{
+		return Err(err(node, "every option of a pull attribute needs a value"));
+	}
+	let mut attr = named(first)?;
+	for pair in opts.chunks(2)
+	{
+		let (k, v) = (&pair[0], &pair[1]);
+		attr = match (&k.form, &v.form)
+		{
+			(Form::Keyword(o), Form::Str(s) | Form::Keyword(s)) if o == "as" => attr.key(s),
+			(Form::Keyword(o), Form::Int(n)) if o == "limit" && *n >= 0 => attr.limit(*n as usize),
+			(Form::Keyword(o), _) if o == "default" => attr.default(match &v.form
+			{
+				Form::Str(s) => Value::from(s.as_str()),
+				Form::Int(i) => Value::Int(*i),
+				Form::Float(f) => Value::Float(*f),
+				Form::Bool(b) => Value::Bool(*b),
+				Form::Instant(i) => Value::Instant(*i),
+				_ => return Err(err(v, "a default is a constant")),
+			}),
+			(Form::Keyword(o), _) if ["as", "limit"].contains(&o.as_str()) => return Err(err(v, "invalid value of the option")),
+			_ => return Err(err(k, "unknown option of a pull attribute (the options are :as, :limit and :default)")),
+		};
+	}
+	Ok(attr)
 }
 
 /// The error at byte offset `pos` of `text`
@@ -109,6 +202,8 @@ enum Form
 {
 	Vector(Vec<Node>),
 	List(Vec<Node>),
+	/// The keys and values, alternating (only pull patterns take maps)
+	Map(Vec<Node>),
 	Keyword(String),
 	Symbol(String),
 	Str(String),
@@ -249,10 +344,15 @@ impl<'a> Reader<'a>
 		};
 		let form = match c
 		{
-			'[' | '(' =>
+			'[' | '(' | '{' =>
 			{
 				self.pos += 1;
-				let close = if c == '[' { ']' } else { ')' };
+				let close = match c
+				{
+					'[' => ']',
+					'(' => ')',
+					_ => '}',
+				};
 				let mut items = Vec::new();
 				loop
 				{
@@ -265,13 +365,19 @@ impl<'a> Reader<'a>
 							self.pos += 1;
 							break;
 						}
-						Some(d @ (']' | ')')) => return Err(error_at(self.text, self.pos, format!("expected {close} (to close the {c} at {}), found {d}", self.place(pos)))),
+						Some(d @ (']' | ')' | '}')) => return Err(error_at(self.text, self.pos, format!("expected {close} (to close the {c} at {}), found {d}", self.place(pos)))),
 						Some(_) => items.push(self.read()?),
 					}
 				}
-				if c == '[' { Form::Vector(items) } else { Form::List(items) }
+				match c
+				{
+					'[' => Form::Vector(items),
+					'(' => Form::List(items),
+					_ if items.len() % 2 == 1 => return Err(error_at(self.text, pos, "a map needs a value for every key")),
+					_ => Form::Map(items),
+				}
 			}
-			']' | ')' => return Err(error_at(self.text, pos, format!("unexpected {c}"))),
+			']' | ')' | '}' => return Err(error_at(self.text, pos, format!("unexpected {c}"))),
 			'"' => Form::Str(self.string()?),
 			'#' if self.text[pos..].starts_with("#inst") && self.text[pos + 5..].starts_with(|c: char| c.is_whitespace() || c == '"') =>
 			{
@@ -285,7 +391,7 @@ impl<'a> Reader<'a>
 				let s = self.string()?;
 				Form::Instant(parse_instant(&s).ok_or_else(|| error_at(self.text, at, format!("{s:?} is not an RFC 3339 timestamp (e.g. \"2024-02-29T13:45:00Z\")")))?)
 			}
-			'{' | '}' | '#' | '\'' | '`' | '~' | '^' | '@' | '\\' => return Err(error_at(self.text, pos, format!("{c} is not supported in queries (no maps, sets, tags other than #inst, quotes or characters)"))),
+			'#' | '\'' | '`' | '~' | '^' | '@' | '\\' => return Err(error_at(self.text, pos, format!("{c} is not supported (no sets, tags other than #inst, quotes or characters)"))),
 			_ =>
 			{
 				let token = self.token();
@@ -572,7 +678,7 @@ impl<'a> Parser<'a>
 			Form::Instant(i) => Ok(Term::Val(Value::Instant(*i))),
 			Form::Bool(b) => Ok(Term::Val((*b).into())),
 			Form::Keyword(k) => Err(self.err(node, format!("the keyword :{k} is not a value (keywords only name attributes)"))),
-			Form::Vector(_) | Form::List(_) => Err(self.err(node, "expected a variable or a constant")),
+			Form::Vector(_) | Form::List(_) | Form::Map(_) => Err(self.err(node, "expected a variable or a constant")),
 		}
 	}
 
@@ -1261,6 +1367,87 @@ mod tests
 		{
 			assert_eq!(parse_instant(bad), None, "{bad}");
 		}
+	}
+
+	// Pull patterns in EDN: the same as the builder's, and the options and recursion they express
+	#[test]
+	fn pull_patterns_in_text()
+	{
+		use crate::db::Entity;
+		use crate::query::PullValue;
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		tx.define("person/name", ValueType::Str, Cardinality::One)
+			.define("person/aka", ValueType::Str, Cardinality::Many)
+			.define("person/age", ValueType::Int, Cardinality::One)
+			.define("person/friend", ValueType::Ref, Cardinality::Many)
+			.define("person/boss", ValueType::Ref, Cardinality::One);
+		// A chain of bosses a -> b -> c -> d, and a friendship cycle a <-> b
+		let ps: Vec<Entity> = (0..4).map(|_| tx.temp()).collect();
+		for (i, p) in ps.iter().enumerate()
+		{
+			tx.add(*p, "person/name", ["a", "b", "c", "d"][i]);
+			if i + 1 < ps.len()
+			{
+				tx.add(*p, "person/boss", ps[i + 1]);
+			}
+		}
+		tx.add(ps[0], "person/aka", "x").add(ps[0], "person/aka", "y").add(ps[0], "person/aka", "z").add(ps[0], "person/age", 30);
+		tx.add(ps[0], "person/friend", ps[1]).add(ps[1], "person/friend", ps[0]);
+		let r = conn.transact(&tx).unwrap();
+		let db = conn.db();
+		let e: Vec<Eid> = ps.iter().map(|p| r.eid(*p)).collect();
+		let name = || Pull::attr("person/name");
+		// Text and builder agree
+		let cases: Vec<(&str, Vec<Pull>)> = vec![
+			("[:person/name *]", vec![name(), Pull::Wildcard]),
+			("[:person/_friend :person/_boss]", vec![Pull::reverse("person/friend"), Pull::reverse("person/boss")]),
+			("[[:person/aka :limit 2 :as \"aliases\"] (:person/age :default 0)]", vec![Pull::attr("person/aka").limit(2).key("aliases"), Pull::attr("person/age").default(0)]),
+			("[{:person/friend [:person/name]}]", vec![Pull::attr("person/friend").nest(vec![name()])]),
+			("[:person/name {[:person/boss :as :chain] ...}]", vec![name(), Pull::attr("person/boss").key("chain").recurse(None)]),
+			("[:person/name {:person/boss 2 :person/friend [:person/name]}]", vec![name(), Pull::attr("person/boss").recurse(Some(2)), Pull::attr("person/friend").nest(vec![name()])]),
+		];
+		for (text, pattern) in &cases
+		{
+			for &x in &e
+			{
+				assert_eq!(db.pull_str(text, x).unwrap(), db.pull(pattern, x).unwrap(), "{text}");
+			}
+		}
+		// What the options do
+		let p = db.pull_str("[[:person/aka :limit 2 :as \"aliases\"] [:person/age :default 0] [:person/name :default \"?\"]]", e[1]).unwrap();
+		assert_eq!(p.get("person/age"), Some(&PullValue::Val(Value::Int(0))));
+		assert_eq!(p.get("aliases"), None);
+		let p = db.pull_str("[[:person/aka :limit 2 :as \"aliases\"] [:person/age :default 0]]", e[0]).unwrap();
+		assert_eq!(p.get("aliases"), Some(&PullValue::Many(vec![PullValue::Val("x".into()), PullValue::Val("y".into())])));
+		assert_eq!(p.get("person/age"), Some(&PullValue::Val(Value::Int(30))));
+		// Recursion: unbounded down the chain, two levels by a depth, and a cycle ends with a Ref
+		fn depth(p: &Pulled, key: &str) -> usize
+		{
+			match p.get(key)
+			{
+				Some(PullValue::Entity(q)) => 1 + depth(q, key),
+				_ => 0,
+			}
+		}
+		assert_eq!(depth(&db.pull_str("[:person/name {:person/boss ...}]", e[0]).unwrap(), "person/boss"), 3);
+		assert_eq!(depth(&db.pull_str("[:person/name {:person/boss 2}]", e[0]).unwrap(), "person/boss"), 2);
+		assert!(matches!(db.pull_str("[:person/name {:person/boss 2}]", e[0]).unwrap().get("person/boss"), Some(PullValue::Entity(q)) if matches!(q.get("person/boss"), Some(PullValue::Entity(r)) if r.get("person/boss") == Some(&PullValue::Val(Value::Ref(e[3]))))));
+		let p = db.pull_str("[:person/name {:person/friend ...}]", e[0]).unwrap();
+		let PullValue::Many(fs) = p.get("person/friend").unwrap() else { panic!() };
+		let PullValue::Entity(b) = &fs[0] else { panic!() };
+		assert_eq!(b.get("person/friend"), Some(&PullValue::Many(vec![PullValue::Val(Value::Ref(e[0]))])));
+		// Errors: syntax with positions, then the pattern's own (an unknown attribute, a default of the wrong type, recursion through a non-Ref)
+		for bad in ["[:person/name", "{:person/name}", "[1]", "[[:person/aka :limit]]", "[[:person/aka :color 2]]", "[[:person/aka :limit -1]]", "[{:person/boss :x}]", "[[]]", ":person/name"]
+		{
+			assert!(matches!(db.pull_str(bad, e[0]), Err(Error::Parse { .. })), "{bad}");
+		}
+		assert!(matches!(db.pull_str("[:nope]", e[0]), Err(Error::UnknownAttr(_))));
+		assert!(matches!(db.pull_str("[[:person/age :default \"old\"]]", e[0]), Err(Error::TypeMismatch { .. })));
+		assert!(matches!(db.pull_str("[{:person/name ...}]", e[0]), Err(Error::TypeMismatch { .. })));
+		assert!(matches!(db.pull_str("[[:person/_friend :default 1]]", e[0]), Err(Error::InvalidQuery(_))));
+		// A map in a query is a syntax error there
+		assert!(matches!(db.q("[:find ?e :where {:a 1}]", &[]), Err(Error::Parse { .. })));
 	}
 
 	// Floats and instants in text queries: literals, numeric comparison of Ints and Floats, and aggregates
