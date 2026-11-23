@@ -136,6 +136,11 @@ pub struct TToporStatistics
 	// The number of duplicate binary clauses, removed by inprocessing
 	pub m_IngsDuplicateBinsRemoved: u32,
 
+	// Rust-only extension (topi_ext_target_phase.rs): the number of rephases, of updates of the target phases and of decisions, which took the target phase
+	pub m_ExtRephases: u64,
+	pub m_ExtTargetPhaseUpdates: u64,
+	pub m_ExtTargetPhaseDecisions: u64,
+
 	pub(crate) m_OverallTime: CTimeMeasure,
 	pub(crate) m_TimeSinceLastSolveStart: CTimeMeasure,
 	pub(crate) m_ShortStartInv: u8,
@@ -185,6 +190,9 @@ impl TToporStatistics
 			m_AllUipSucceeded: 0,
 			m_Ings: 0,
 			m_IngsDuplicateBinsRemoved: 0,
+			m_ExtRephases: 0,
+			m_ExtTargetPhaseUpdates: 0,
+			m_ExtTargetPhaseDecisions: 0,
 			m_OverallTime: CTimeMeasure::new(false, 1000),
 			m_TimeSinceLastSolveStart: CTimeMeasure::new(false, 1000),
 			m_ShortStartInv: 0,

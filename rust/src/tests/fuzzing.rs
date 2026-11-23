@@ -111,7 +111,9 @@ fn IsParamExcluded(name: &str) -> bool
 	// The parameters of the Rust-only extensions: the scenarios are functions of the list of the parameters (a parameter is drawn by its index), and the ones
 	// which were found by a search over the seeds (cov_core.rs) reach their rarely visited code only with the list they were found with.
 	// (The hints have no effect without HintPhase/HintScore, which the scenarios don't invoke; tests/ext_hints.rs fuzzes them.)
-	name == "/phase/hints/on" || name == "/decision/score_hints/mult"
+	name == "/phase/hints/on" || name == "/decision/score_hints/mult" ||
+	// (tests/ext_target_phase.rs fuzzes these)
+	name.starts_with("/phase/target/") || name.starts_with("/phase/rephase/")
 }
 
 // Parses the description of the parameters, which is provided by the solver, into the list of the parameters with a few interesting legal values for each

@@ -573,6 +573,12 @@ topi_params!
 	// Phase and score hints (topi_ext_hints.rs)
 	m_ParamPhaseHintsOn: bool = single("/phase/hints/on", "Rust-only: phase hints: let HintPhase (the lh command, /topor_tool/hints_file) seed the saved polarity of a variable without fixing it", false);
 	m_ParamScoreHintsMult: f64 = single("/decision/score_hints/mult", "Rust-only: score hints: HintScore (the ls command, /topor_tool/hints_file) boosts the decision score of its variable by this value times the hinted score at the next query (0: score hints are ignored)", 0., 0.);
+	// Target/best-phase saving and rephasing (topi_ext_target_phase.rs)
+	m_ParamTargetPhaseOn: u8 = single("/phase/target/on", "Rust-only: target phase: decide a variable, whose polarity isn't forced, to its phase in the largest conflict-free trail since the latest rephase in preference to its saved phase: 0: off; 1: on; 2: on only while the current restart strategy is the numeric one (the stable-mode counterpart)", 0, 0, 2);
+	m_ParamRephaseConfInit: u32 = single("/phase/rephase/conf_init", "Rust-only: rephasing: the number of conflicts before the first rephase, which resets the saved phases to the original, inverted, best or flipped ones (O I (B F B O B I)*) and resets the target phases (0: no rephasing)", 0);
+	m_ParamRephaseConfIncr: u32 = single("/phase/rephase/conf_incr", "Rust-only: rephasing: after every rephase the interval in conflicts till the next one is multiplied by /phase/rephase/conf_mult and incremented by this value", 1000);
+	m_ParamRephaseConfMult: f64 = single("/phase/rephase/conf_mult", "Rust-only: rephasing: the multiplier of the interval between two rephases (see /phase/rephase/conf_incr)", 1., 1.);
+	m_ParamRephaseRandom: bool = single("/phase/rephase/random", "Rust-only: rephasing: random phases instead of the flipped ones (the F of the schedule)", false);
 }
 
 // The state of the C++ CTopiParams class proper (which, unlike here, doesn't hold the parameter values, since they are members of the solver class)

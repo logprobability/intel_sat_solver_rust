@@ -122,7 +122,7 @@ The control flow is the same statement by statement. The differences are confine
 Features without a C++ counterpart live in their own modules (`src/topi_ext_*.rs`) with small, marked hooks in the mirrored files. Each one is gated by a parameter,
 which is off by default, and with the parameters off the solver's behavior, output and proofs are those of the C++ solver (`scripts/diff_vs_cpp.sh`).
 A new parameter must also be listed in `IsParamExcluded` of `src/tests/fuzzing.rs`: the fuzz scenarios draw parameters by index, so a longer list changes all of them, including the ones
-`scripts/coverage.sh` relies on to reach the rare paths. The extension gets its own tests instead (`src/tests/ext_hints.rs`).
+`scripts/coverage.sh` relies on to reach the rare paths. The extension gets its own tests instead (`src/tests/ext_hints.rs`, `src/tests/ext_target_phase.rs`).
 
 **Phase and score hints** (`src/topi_ext_hints.rs`): advice for the search, which is never binding, so a wrong hint can only cost time.
 
@@ -139,10 +139,28 @@ A new parameter must also be listed in `IsParamExcluded` of `src/tests/fuzzing.r
   (the saved phases, which are the model after a satisfiable query, and the ranks of the decision scores), and the commands `lh <Lit>` and `ls <Var> <Score>` give hints inside an instance
   (they are also what `TOPOR_DUMP_NAME` records). A hints file holds `v <Lit> ... 0` lines (phases, as in the model a SAT solver prints; the `v` is optional), `b <Var> <Score>` lines (scores) and comments.
 
-**Search-quality measurements** (`scripts/search_quality_bench.py`, `scripts/phase_oracle_ceiling.py`, `docs/search_quality/`):
+**Target/best-phase saving and rephasing** (`src/topi_ext_target_phase.rs`): the phase oracle the solver generates for itself, as CaDiCaL and Kissat do.
+Only the polarities of decisions change, so the answers, the models and the proofs stay correct.
+
+* `/phase/target/on 1`: the solver records the assignment at the largest conflict-free trail since the latest rephase (the *target* phases) and since the latest rephase
+  to the best phases (the *best* phases), and a decision takes the target phase of its variable in preference to the saved phase.
+  `2`: only while the current restart strategy is the numeric one (arithmetic or Luby), which is this solver's counterpart of a stable mode (under LBD-based restarts the best phases are still tracked for rephasing).
+  There is no alternation of the restart strategies within a query: the solver picks a strategy per query type, and switching in the middle of a query would need the LBD averages to be kept up under both.
+* `/phase/rephase/conf_init N` (0: off): after N conflicts, at the next restart, the saved phases of the unassigned variables are reset: to the original phases (those of the start of the query,
+  which include the phase hints), to their inversion, to the best phases, or they are flipped (`/phase/rephase/random 1`: random instead), in the order O I (B F B O B I)*; the target is reset.
+  After every rephase the interval is multiplied by `/phase/rephase/conf_mult` (1) and incremented by `/phase/rephase/conf_incr` (1000), so the schedule is arithmetic, geometric or both.
+* The existing phase management is in charge: a polarity fixed by `FixPolarity` or forced by `/phase/force_solution` wins over the target phase (but for the restarts, in which the phase stage
+  doesn't force the polarities: `/phase/unforce_restarts_fraction_*`), and a rephase leaves the saved phase of such a variable alone. The target, best and original phases live in spare bits of `m_PolarityInfo`
+  (`FixPolarity` on a variable drops them for that variable). Every query starts without a target, from the saved phases, that is, from the latest model or the hints.
+* Statistics: `m_ExtRephases`, `m_ExtTargetPhaseUpdates` and `m_ExtTargetPhaseDecisions` of `GetStatistics()`; if the extension is on, the statistics lines are followed by
+  `c ToporExt Rephases <N> TargetUpds <N> TargetDecs <N>`.
+* Measurements and the recommended setting (`/phase/target/on 1 /phase/rephase/conf_init 1000` for hard satisfiable queries; off for refutations): `docs/search_quality/target_phase.md`.
+
+**Search-quality measurements** (`scripts/search_quality_bench.py`, `scripts/phase_oracle_ceiling.py`, `scripts/target_phase_bench.py`, `docs/search_quality/`):
 
     scripts/search_quality_bench.py --config base= --config hinted="/phase/hints/on 1 /topor_tool/hints_file hints/{inst}.hints" [--out PREFIX] <instance.cnf>...
     scripts/phase_oracle_ceiling.py          # the oracle-ceiling experiment; writes docs/search_quality/ceiling_tables.md (the reading is in ceiling.md)
+    scripts/target_phase_bench.py            # target phases and rephasing versus the baseline; writes docs/search_quality/target_phase_tables.md (the reading is in target_phase.md)
 
 `search_quality_bench.py` runs the release executable under named configurations (sets of parameters, the first one being the baseline) and tabulates the status, the conflicts,
 the decisions, the restarts and the CPU time per instance and configuration, with the geometric means of the ratios to the baseline; it fails, if two configurations give contradicting answers.
