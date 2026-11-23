@@ -1045,6 +1045,7 @@ impl Db
 			return Err(Error::InstantBackwards { previous: self.instant, got: instant });
 		}
 		db.instant = instant;
+		// The transaction's entity is the first id it allocates (before its tempids): `as_of` relies on it for the next entity id of a past basis
 		let tx_eid = db.next_eid;
 		db.next_eid += 1;
 		db.txs = db.txs.insert(db.basis_t, tx_eid);
