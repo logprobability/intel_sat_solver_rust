@@ -330,6 +330,8 @@ pub struct CTopi<Ind: TUInd, const Compress: bool>
 	*/
 
 	pub(crate) m_OpenedDratFile: Option<Box<dyn std::io::Write>>,
+	// The bytes of the latest DRAT line (reused, so that writing a line doesn't allocate)
+	pub(crate) m_DratBuf: Vec<u8>,
 	pub(crate) m_IsDratBinary: bool,
 	pub(crate) m_DratSortEveryClause: bool,
 
@@ -501,6 +503,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			m_PhaseStage: TPhaseStage::PHASE_STAGE_STANDARD,
 			m_PhaseInitStage: TPhaseStage::PHASE_STAGE_STANDARD,
 			m_OpenedDratFile: None,
+			m_DratBuf: Vec::new(),
 			m_IsDratBinary: true,
 			m_DratSortEveryClause: false,
 			M_CbStopNow: None,
