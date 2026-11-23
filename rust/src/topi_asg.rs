@@ -30,7 +30,7 @@ fn OstreamDouble(v: f64) -> String
 		if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s.to_string() }
 	};
 
-	if exp < -4 || exp >= 6
+	if !(-4..6).contains(&exp)
 	{
 		format!("{}e{}{:02}", strip(mantissa), if exp < 0 { '-' } else { '+' }, exp.abs())
 	}
@@ -93,7 +93,10 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		{
 			let externalLit = self.GetExternalLit(l);
 			let threadId = self.m_ThreadId;
-			(self.M_ReportUnitCls.as_mut().unwrap())(threadId, externalLit);
+			if let Some(ReportUnitCls) = self.M_ReportUnitCls.as_mut()
+			{
+				ReportUnitCls(threadId, externalLit);
+			}
 		}
 
 		// It is either that: (1) The trail is empty, or (2) The level is 0, or (3) A new level is started, or (4) The level is non-empty

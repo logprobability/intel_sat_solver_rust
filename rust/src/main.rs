@@ -9,8 +9,9 @@
 // plain text files are read directly, whereas archive files (including .gz) are read through a pipe from the corresponding decompression command
 
 // The fork retains the C++ identifiers and layout conventions
-#![allow(non_snake_case, non_upper_case_globals, non_camel_case_types)]
-#![allow(clippy::all)]
+#![allow(non_snake_case, non_upper_case_globals, non_camel_case_types, clippy::upper_case_acronyms)]
+// The control flow is translated statement by statement (see PORTING.md), so the lints, whose fix would restructure a C++ statement, are off
+#![allow(clippy::collapsible_if, clippy::collapsible_else_if, clippy::if_same_then_else, clippy::needless_range_loop, clippy::explicit_counter_loop, clippy::too_many_arguments)]
 
 use intel_sat_solver::color_print::{ansi_color_code, print_as_color};
 use intel_sat_solver::std_string::{stod, stoi, stoll, stoul, stoull};
@@ -322,12 +323,12 @@ impl Write for CFailedOfstream
 {
 	fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize>
 	{
-		Err(std::io::Error::new(std::io::ErrorKind::Other, "the DRAT file couldn't be opened"))
+		Err(std::io::Error::other("the DRAT file couldn't be opened"))
 	}
 
 	fn flush(&mut self) -> std::io::Result<()>
 	{
-		Err(std::io::Error::new(std::io::ErrorKind::Other, "the DRAT file couldn't be opened"))
+		Err(std::io::Error::other("the DRAT file couldn't be opened"))
 	}
 }
 
@@ -1170,7 +1171,7 @@ impl<'a> CToporTool<'a>
 					None => return Err("c topor_tool ERROR: couldn't convert <IsCpuTimeOut> to int at line number ".to_string() + &lineNum.to_string()),
 				};
 
-				if isCpuTimeOut < 0 || isCpuTimeOut > 1
+				if !(0..=1).contains(&isCpuTimeOut)
 				{
 					return Err("c topor_tool ERROR: couldn't convert <IsCpuTimeOut> to 0 or 1 at line number ".to_string() + &lineNum.to_string());
 				}
@@ -1224,7 +1225,7 @@ impl<'a> CToporTool<'a>
 					None => return Err("c topor_tool ERROR: couldn't convert <FixPolarityLit> to int at line number ".to_string() + &lineNum.to_string()),
 				};
 
-				if isOnlyOnce < 0 || isOnlyOnce > 1
+				if !(0..=1).contains(&isOnlyOnce)
 				{
 					return Err("c topor_tool ERROR: couldn't convert <FixPolarityLit> to 0 or 1 at line number ".to_string() + &lineNum.to_string());
 				}

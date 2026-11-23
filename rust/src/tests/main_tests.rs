@@ -713,6 +713,7 @@ struct CMockTopor
 
 impl CMockTopor
 {
+	#[allow(clippy::new_ret_no_self)] // The mock is only ever used as a solver instance
 	fn new(rets: &[TToporReturnVal], vals: &[TToporLitVal]) -> Box<dyn TToporInst>
 	{
 		Box::new(CMockTopor { m_Rets: rets.to_vec(), m_Vals: vals.to_vec(), m_Solves: 0, m_Clss: 0 })

@@ -221,7 +221,7 @@ impl<T: Copy> Span<T>
 	}
 
 	#[inline(always)]
-	pub fn to_vec(&self) -> Vec<T>
+	pub fn to_vec(self) -> Vec<T>
 	{
 		self.as_slice().to_vec()
 	}
@@ -721,7 +721,7 @@ impl<T: Copy> IndexMut<usize> for CDynArray<T>
 // CDynArray<T>::RemoveGarbage
 // The C++ version is a member, which is provided lambdas capturing the solver; here the solver (or any other context) is passed explicitly as ctx,
 // where arr projects the array out of the context
-#[allow(clippy::too_many_arguments)]
+
 pub fn RemoveGarbage<C, T: Copy>(ctx: &mut C, arr: fn(&mut C) -> &mut CDynArray<T>, start_ind: usize, end_ind: &mut usize, is_chunk_deleted: &mut dyn FnMut(&mut C, usize) -> bool,
 	chunk_end: &mut dyn FnMut(&mut C, usize) -> usize, mut notify_about_remaining_chunk_move: Option<&mut dyn FnMut(&mut C, usize, usize)>)
 {

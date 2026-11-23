@@ -173,6 +173,7 @@ fn cls_views()
 	c.swap(0, 3);
 	assert_eq!(c.span().to_vec(), vec![13, 11, 12, 20]);
 	assert_eq!(c.find(12), 2);
+	#[allow(clippy::clone_on_copy)] // Covers the Clone impl
 	let c2 = c.clone();
 	assert_eq!(c2.lits().sum::<u32>(), 56);
 

@@ -703,7 +703,7 @@ pub fn RunScenario(s: &TFuzzScenario, solverMode: u8, failAllocsAfter: Option<u6
 	let mut solver = NewFuzzSolver(solverMode, s.m_VarsNumHint);
 	if s.m_Drat != 0
 	{
-		solver.FDumpDrat(Box::new(drat.clone()), s.m_Drat % 2 == 0, s.m_Drat > 2);
+		solver.FDumpDrat(Box::new(drat.clone()), s.m_Drat.is_multiple_of(2), s.m_Drat > 2);
 	}
 	if s.m_CbLearnt
 	{
@@ -793,14 +793,14 @@ pub fn RunScenario(s: &TFuzzScenario, solverMode: u8, failAllocsAfter: Option<u6
 					}
 					TToporReturnVal::RET_UNSAT =>
 					{
-						assert!(oracle.as_ref().map_or(true, |o| !o.IsSatUnder(assumps)), "The solver returned UNSAT for a satisfiable query; assumptions: {:?}", assumps);
+						assert!(oracle.as_ref().is_none_or(|o| !o.IsSatUnder(assumps)), "The solver returned UNSAT for a satisfiable query; assumptions: {:?}", assumps);
 						if !solver.FIsError()
 						{
 							outcome.m_RequiredAssumps = (0..assumps.len()).map(|i| solver.FIsAssumptionRequired(i)).collect();
 							if !solver.FIsError()
 							{
 								let core: Vec<TLit> = assumps.iter().zip(&outcome.m_RequiredAssumps).filter(|(_, r)| **r).map(|(a, _)| *a).collect();
-								assert!(oracle.as_ref().map_or(true, |o| !o.IsSatUnder(&core)), "The formula is satisfiable under the reported core {:?} of {:?}", core, assumps);
+								assert!(oracle.as_ref().is_none_or(|o| !o.IsSatUnder(&core)), "The formula is satisfiable under the reported core {:?} of {:?}", core, assumps);
 							}
 						}
 					}

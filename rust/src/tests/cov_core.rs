@@ -87,6 +87,7 @@ fn IsChild() -> bool
 */
 
 #[test]
+#[allow(clippy::approx_constant)] // 3.14159265 is a rounding case, not pi
 fn double_to_ostream_str()
 {
 	assert_eq!(DoubleToOstreamStr(f64::NAN), "nan");

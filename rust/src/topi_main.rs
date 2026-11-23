@@ -190,9 +190,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 		fn HandleContextParam(paramName: &str, newVal: f64, contextParamPrefix: &str, paramVals: &mut Vec<(String, f64)>) -> bool
 		{
-			if paramName.starts_with(contextParamPrefix)
+			if let Some(paramNameInContext) = paramName.strip_prefix(contextParamPrefix)
 			{
-				paramVals.push((paramName[contextParamPrefix.len()..].to_string(), newVal));
+				paramVals.push((paramNameInContext.to_string(), newVal));
 				return true;
 			}
 			false
@@ -1061,7 +1061,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	{
 		let solveInvs = self.m_Stat.m_SolveInvs;
 		// Invoked only if the DRAT file exists
-		let isGood = write!(self.m_OpenedDratFile.as_mut().unwrap(), "c query completed {}\n", solveInvs).is_ok();
+		let isGood = writeln!(self.m_OpenedDratFile.as_mut().unwrap(), "c query completed {}", solveInvs).is_ok();
 		if !isGood
 		{
 			self.OnBadDratFile();
@@ -1220,7 +1220,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		}
 
 		ReserveExactly!(self, self.m_E2ILitMap, self.m_Stat.m_MaxUserVar as usize + 1, "m_E2IVarMap in Solve");
-		self.ReserveVarAndLitData(userAssumps.len() - (userAssumps.len() > 0 && *userAssumps.last().unwrap() == 0) as usize);
+		self.ReserveVarAndLitData(userAssumps.len() - (userAssumps.last() == Some(&0)) as usize);
 		self.ClsDeletionInit();
 		self.RestartInit();
 		self.DecisionInit();
@@ -1818,7 +1818,7 @@ c         | |\n");
 		{
 			overallSzInMb += ssPair.1;
 		}
-		name2MbVec.sort_by(|i1, i2| i2.1.cmp(&i1.1));
+		name2MbVec.sort_by_key(|i| std::cmp::Reverse(i.1));
 
 		let mut ss = String::new();
 		ss += &format!("c MEMORY -- all : {} *** ", overallSzInMb);
