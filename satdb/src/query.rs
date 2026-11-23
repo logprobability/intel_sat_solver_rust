@@ -87,6 +87,14 @@ impl From<i64> for Term
 	}
 }
 
+impl From<f64> for Term
+{
+	fn from(f: f64) -> Self
+	{
+		Term::Val(f.into())
+	}
+}
+
 /// A string constant (variables come from `Query::var`)
 impl From<&str> for Term
 {
@@ -118,8 +126,28 @@ pub enum Cmp
 
 impl Cmp
 {
+	/// Values compare by their order (`Value`'s: by type first), except that an Int and a Float compare numerically
+	/// (as f64, IEEE: a comparison with NaN is false, except `!=`)
 	fn holds(self, l: &Value, r: &Value) -> bool
 	{
+		let num = match (l, r)
+		{
+			(Value::Int(a), Value::Float(b)) => Some((*a as f64, *b)),
+			(Value::Float(a), Value::Int(b)) => Some((*a, *b as f64)),
+			_ => None,
+		};
+		if let Some((a, b)) = num
+		{
+			return match self
+			{
+				Cmp::Eq => a == b,
+				Cmp::Ne => a != b,
+				Cmp::Lt => a < b,
+				Cmp::Le => a <= b,
+				Cmp::Gt => a > b,
+				Cmp::Ge => a >= b,
+			};
+		}
 		match self
 		{
 			Cmp::Eq => l == r,
@@ -283,17 +311,19 @@ impl Agg
 	// The aggregate of a group's column (never empty: a group has at least one tuple)
 	fn apply(self, vals: &[&Value]) -> Result<Value, Error>
 	{
-		let ints = || -> Result<i128, Error> {
-			let mut s: i128 = 0;
+		// The exact sum of the Ints, and the sum of the Floats (None: there are none)
+		let sums = || -> Result<(i128, Option<f64>), Error> {
+			let (mut ints, mut floats): (i128, Option<f64>) = (0, None);
 			for v in vals
 			{
 				match v
 				{
-					Value::Int(i) => s += *i as i128,
-					v => return Err(Error::InvalidQuery(format!("{} of the non-integer value {v:?}", self.name()))),
+					Value::Int(i) => ints += *i as i128,
+					Value::Float(f) => *floats.get_or_insert(0.0) += *f,
+					v => return Err(Error::InvalidQuery(format!("{} of the non-numeric value {v:?}", self.name()))),
 				}
 			}
-			Ok(s)
+			Ok((ints, floats))
 		};
 		Ok(match self
 		{
@@ -301,9 +331,17 @@ impl Agg
 			Agg::CountDistinct => Value::Int(vals.iter().collect::<BTreeSet<_>>().len() as i64),
 			Agg::Min => (*vals.iter().min().expect("a group is not empty")).clone(),
 			Agg::Max => (*vals.iter().max().expect("a group is not empty")).clone(),
-			Agg::Sum => Value::Int(i64::try_from(ints()?).map_err(|_| Error::InvalidQuery("the sum overflows an Int".into()))?),
-			// The mean of Ints lies between them, so it fits
-			Agg::Avg => Value::Int(ints()?.div_euclid(vals.len() as i128) as i64),
+			// Ints sum to an Int (exactly, or an error on overflow); any Float makes the sum a Float
+			Agg::Sum => match sums()?
+			{
+				(ints, None) => Value::Int(i64::try_from(ints).map_err(|_| Error::InvalidQuery("the sum overflows an Int".into()))?),
+				(ints, Some(floats)) => Value::Float(ints as f64 + floats),
+			},
+			Agg::Avg =>
+			{
+				let (ints, floats) = sums()?;
+				Value::Float((ints as f64 + floats.unwrap_or(0.0)) / vals.len() as f64)
+			}
 		})
 	}
 }
@@ -1826,7 +1864,8 @@ pub(crate) mod tests
 					let distinct = ns.iter().collect::<BTreeSet<_>>().len() as i64;
 					distinct_count_differs |= distinct != ns.len() as i64;
 					let sum: i64 = ns.iter().sum();
-					[k.clone()].into_iter().chain([ns.len() as i64, distinct, sum, *ns.iter().min().unwrap(), *ns.iter().max().unwrap(), sum.div_euclid(ns.len() as i64)].map(Value::Int)).collect()
+					let ints = [ns.len() as i64, distinct, sum, *ns.iter().min().unwrap(), *ns.iter().max().unwrap()].map(Value::Int);
+					[k.clone()].into_iter().chain(ints).chain([Value::Float(sum as f64 / ns.len() as f64)]).collect()
 				})
 				.collect();
 			assert_eq!(want.len(), 3);
@@ -1841,7 +1880,7 @@ pub(crate) mod tests
 		let x = empty.var("?x");
 		empty.pattern(x.clone(), "n", 999).unwrap();
 		assert!(empty.find(&[Find::Agg(Agg::Count, x.clone())], &[]).unwrap().is_empty());
-		// Aggregates in any position, of any type for min and max; sum and avg take Ints only
+		// Aggregates in any position, of any type for min and max; sum and avg take numbers only
 		let mut q = db.query();
 		let (e, t) = (q.var("?e"), q.var("?t"));
 		q.pattern(e.clone(), "tag", t.clone()).unwrap();
@@ -1856,9 +1895,14 @@ pub(crate) mod tests
 		let want: Vec<Vec<Value>> = sorted(want.into_iter().map(|(k, (m, n))| vec![m, k, Value::Int(n)]));
 		assert_eq!(q.find(&[Find::Agg(Agg::Max, t.clone()), Find::Term(e.clone()), Find::Agg(Agg::Count, t.clone())], &[]).unwrap(), want);
 		assert!(matches!(q.find(&[Find::Agg(Agg::Sum, t.clone())], &[]), Err(Error::InvalidQuery(_))));
-		assert_eq!(Agg::Avg.apply(&[&Value::Int(-1), &Value::Int(0)]), Ok(Value::Int(-1)));
+		assert_eq!(Agg::Avg.apply(&[&Value::Int(-1), &Value::Int(0)]), Ok(Value::Float(-0.5)));
 		assert!(matches!(Agg::Sum.apply(&[&Value::Int(i64::MAX), &Value::Int(1)]), Err(Error::InvalidQuery(_))));
 		assert_eq!(Agg::Sum.apply(&[&Value::Int(i64::MAX), &Value::Int(1), &Value::Int(-2)]), Ok(Value::Int(i64::MAX - 1)));
+		// Floats: a sum with any Float is a Float; Ints and Floats mix
+		assert_eq!(Agg::Sum.apply(&[&Value::Float(0.5), &Value::Int(2)]), Ok(Value::Float(2.5)));
+		assert_eq!(Agg::Avg.apply(&[&Value::Float(1.0), &Value::Float(2.0), &Value::Int(6)]), Ok(Value::Float(3.0)));
+		assert!(matches!(Agg::Avg.apply(&[&Value::Float(1.0), &Value::from("x")]), Err(Error::InvalidQuery(_))));
+		assert_eq!(Agg::Max.apply(&[&Value::Float(1.0), &Value::Float(-2.0)]), Ok(Value::Float(1.0)));
 	}
 
 	fn val(v: impl Into<Value>) -> PullValue

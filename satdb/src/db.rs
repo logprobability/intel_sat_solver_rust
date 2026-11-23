@@ -56,16 +56,21 @@ pub type AttrId = u32;
 /// The basis of a database value: the number of transactions applied to it
 pub type T = u64;
 
-/// The built-in attribute holding the instant of every transaction entity (an Int, in the caller's units)
+/// The built-in attribute holding the instant of every transaction entity (an Instant, milliseconds since the Unix epoch)
 pub const TX_INSTANT: &str = "db/txInstant";
 
-/// Values of different types order by their type (in the declaration order below)
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+/// Values of different types order by their type (in the declaration order below). Floats are totally ordered (`f64::total_cmp`:
+/// -0.0 before 0.0, NaNs at the ends), so that they can be index keys; equality and hashing follow that order (a value equals only itself).
+/// (Comparison predicates compare an Int with a Float numerically, see `query::Cmp`.)
+#[derive(Clone, Debug)]
 pub enum Value
 {
 	Bool(bool),
 	Int(i64),
+	Float(f64),
 	Str(Arc<str>),
+	/// A point in time, in milliseconds since the Unix epoch (`#inst` in text queries)
+	Instant(i64),
 	Ref(Eid),
 }
 
@@ -77,9 +82,75 @@ impl Value
 		{
 			Value::Bool(_) => ValueType::Bool,
 			Value::Int(_) => ValueType::Int,
+			Value::Float(_) => ValueType::Float,
 			Value::Str(_) => ValueType::Str,
+			Value::Instant(_) => ValueType::Instant,
 			Value::Ref(_) => ValueType::Ref,
 		}
+	}
+
+	fn rank(&self) -> u8
+	{
+		self.value_type() as u8
+	}
+}
+
+impl Ord for Value
+{
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering
+	{
+		match (self, other)
+		{
+			(Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+			(Value::Int(a), Value::Int(b)) | (Value::Instant(a), Value::Instant(b)) => a.cmp(b),
+			(Value::Float(a), Value::Float(b)) => a.total_cmp(b),
+			(Value::Str(a), Value::Str(b)) => a.cmp(b),
+			(Value::Ref(a), Value::Ref(b)) => a.cmp(b),
+			_ => self.rank().cmp(&other.rank()),
+		}
+	}
+}
+
+impl PartialOrd for Value
+{
+	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering>
+	{
+		Some(self.cmp(other))
+	}
+}
+
+impl PartialEq for Value
+{
+	fn eq(&self, other: &Self) -> bool
+	{
+		self.cmp(other).is_eq()
+	}
+}
+
+impl Eq for Value {}
+
+impl std::hash::Hash for Value
+{
+	fn hash<H: std::hash::Hasher>(&self, h: &mut H)
+	{
+		self.rank().hash(h);
+		match self
+		{
+			Value::Bool(b) => b.hash(h),
+			Value::Int(i) | Value::Instant(i) => i.hash(h),
+			// total_cmp is equal exactly for equal bits
+			Value::Float(f) => f.to_bits().hash(h),
+			Value::Str(s) => s.hash(h),
+			Value::Ref(r) => r.hash(h),
+		}
+	}
+}
+
+impl From<f64> for Value
+{
+	fn from(f: f64) -> Self
+	{
+		Value::Float(f)
 	}
 }
 
@@ -115,12 +186,15 @@ impl From<String> for Value
 	}
 }
 
+/// The value types, in the order their values sort in
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ValueType
 {
 	Bool,
 	Int,
+	Float,
 	Str,
+	Instant,
 	Ref,
 }
 
@@ -421,6 +495,14 @@ impl From<bool> for TxValue
 	}
 }
 
+impl From<f64> for TxValue
+{
+	fn from(f: f64) -> Self
+	{
+		TxValue::Val(f.into())
+	}
+}
+
 impl From<i64> for TxValue
 {
 	fn from(i: i64) -> Self
@@ -606,7 +688,7 @@ impl TxReport
 		let attrs = (0..after.attrs.len() as AttrId).filter(|&a| before.try_attr(a) != Some(after.attr(a))).map(|a| (a, after.attr(a).clone())).collect();
 		let instant = match self.tx_data[0].v
 		{
-			Value::Int(i) => i,
+			Value::Instant(i) => i,
 			_ => unreachable!("the first datom is the transaction's instant"),
 		};
 		let changes = |added: bool| self.tx_data[1..].iter().filter(|d| d.added == added).map(|d| (d.e, d.a, d.v.clone())).collect();
@@ -744,7 +826,7 @@ impl Db
 			since: 0,
 			upto: None,
 		};
-		db.add_attr(Attr::new(TX_INSTANT, ValueType::Int, Cardinality::One));
+		db.add_attr(Attr::new(TX_INSTANT, ValueType::Instant, Cardinality::One));
 		db
 	}
 
@@ -799,13 +881,47 @@ impl Db
 		}
 		// Transaction t + 1's entity is the first id it allocated (before its tempids)
 		let next_eid = self.txs.get(&(t + 1)).copied().unwrap_or(self.next_eid);
-		let instant_attr = self.attr_id(TX_INSTANT).expect("built in");
-		let instant = match self.heavt.seek(|k| (k.0, k.1) < (upto, instant_attr)).next()
-		{
-			Some(((e, a, Value::Int(i), _, true), _)) if (*e, *a) == (upto, instant_attr) => *i,
-			_ => 0,
-		};
+		let instant = self.instant_of(t);
 		Some(Db { basis_t: t, next_eid, instant, attrs, attr_ids, upto: Some(upto), ..self.clone() })
+	}
+
+	// The `db/txInstant` of basis t's transaction (0 for basis 0), from the history (it is asserted once and never changes)
+	fn instant_of(&self, t: T) -> i64
+	{
+		let Some(tx) = self.tx_of(t) else { return 0 };
+		let a = self.attr_id(TX_INSTANT).expect("built in");
+		match self.heavt.seek(|k| (k.0, k.1) < (tx, a)).next()
+		{
+			Some(((e, b, Value::Instant(i), _, true), _)) if (*e, *b) == (tx, a) => *i,
+			_ => unreachable!("every transaction has its instant"),
+		}
+	}
+
+	/// The basis as of an instant: the last one whose transaction's `db/txInstant` is at or before `instant` (0 if none is),
+	/// for `as_of` and `since` by time. Instants never decrease with the basis, so it is a binary search
+	pub fn basis_of_instant(&self, instant: i64) -> T
+	{
+		// The first basis after the instant, in 1..=basis_t + 1
+		let (mut lo, mut hi) = (1, self.basis_t + 1);
+		while lo < hi
+		{
+			let mid = lo + (hi - lo) / 2;
+			if self.instant_of(mid) <= instant { lo = mid + 1 } else { hi = mid }
+		}
+		lo - 1
+	}
+
+	/// The basis that transaction entity `tx` produced (None if `tx` isn't a transaction of this value's history), for `as_of` and `since`
+	/// by transaction. The transactions' entities increase with the basis, so it is a binary search
+	pub fn basis_of_tx(&self, tx: Eid) -> Option<T>
+	{
+		let (mut lo, mut hi) = (1, self.basis_t + 1);
+		while lo < hi
+		{
+			let mid = lo + (hi - lo) / 2;
+			if self.tx_of(mid).expect("every basis up to this one has a transaction") < tx { lo = mid + 1 } else { hi = mid }
+		}
+		(lo <= self.basis_t && self.tx_of(lo) == Some(tx)).then_some(lo)
 	}
 
 	/// The datoms current as of transaction `upto`, from history entries in index order (each datom's entries together, in transaction order):
@@ -1084,7 +1200,13 @@ impl Db
 				},
 			})
 		};
-		let attr_of = |attr: &str| db.attr_id(attr).ok_or_else(|| Error::UnknownAttr(attr.to_string()));
+		// A `db/` attribute is reserved whatever the value (checked before the value's type)
+		let attr_of = |attr: &str| match db.attr_id(attr)
+		{
+			Some(_) if attr.starts_with("db/") => Err(Error::Reserved(attr.to_string())),
+			Some(a) => Ok(a),
+			None => Err(Error::UnknownAttr(attr.to_string())),
+		};
 		let mut ops = Vec::new();
 		let mut doomed = Vec::new();
 		// The compare-and-swaps' checks: (entity, attribute, expected value), checked once the tempids are allocated
@@ -1264,7 +1386,7 @@ impl Db
 		}
 		let instant_attr = db.attr_id(TX_INSTANT).expect("built in");
 		let datom = |(e, a, v): (Eid, AttrId, Value), added: bool| Datom { e, a, v, tx: tx_eid, added };
-		let mut tx_data = vec![datom((tx_eid, instant_attr, Value::Int(instant)), true)];
+		let mut tx_data = vec![datom((tx_eid, instant_attr, Value::Instant(instant)), true)];
 		tx_data.extend(retracted.into_iter().map(|d| datom(d, false)));
 		tx_data.extend(asserted.into_iter().map(|d| datom(d, true)));
 		Ok(TxReport { db_before: self.clone(), db_after: db, tx: tx_eid, tempids, lookups, tx_data, tx_id: tx.id })
@@ -1363,7 +1485,7 @@ impl Db
 			self.insert(*e, *a, v, tx);
 		}
 		let instant_attr = self.attr_id(TX_INSTANT).expect("built in");
-		self.insert(tx, instant_attr, &Value::Int(instant), tx);
+		self.insert(tx, instant_attr, &Value::Instant(instant), tx);
 	}
 
 	/// Apply a transaction read back from the durable log: the database the transaction that wrote `rec` produced, if `self` is the database before it.
@@ -1884,14 +2006,14 @@ pub(crate) mod tests
 		let r1 = conn.transact(&tx).unwrap();
 		let db = conn.db();
 		let (instant, author) = (db.attr_id(TX_INSTANT).unwrap(), db.attr_id("tx/author").unwrap());
-		assert_eq!(db.values(r1.tx, instant).collect::<Vec<_>>(), vec![&Value::Int(100)]);
+		assert_eq!(db.values(r1.tx, instant).collect::<Vec<_>>(), vec![&Value::Instant(100)]);
 		assert_eq!(db.values(r1.tx, author).collect::<Vec<_>>(), vec![&Value::from("ann")]);
 		assert_eq!(r1.eid(Entity::Tx), r1.tx);
 		// The default instant is the previous one; an earlier one is refused
 		let mut tx = Tx::new();
 		tx.add(Entity::Id(r1.tempids[0]), "doc/title", "b");
 		let r2 = conn.transact(&tx).unwrap();
-		assert_eq!(conn.db().values(r2.tx, instant).collect::<Vec<_>>(), vec![&Value::Int(100)]);
+		assert_eq!(conn.db().values(r2.tx, instant).collect::<Vec<_>>(), vec![&Value::Instant(100)]);
 		tx.with_instant(99);
 		assert_eq!(conn.transact(&tx).err(), Some(Error::InstantBackwards { previous: 100, got: 99 }));
 		tx.with_instant(250);
@@ -1904,7 +2026,7 @@ pub(crate) mod tests
 		q.pattern(t.clone(), TX_INSTANT, i.clone()).unwrap();
 		q.pred(i.clone(), crate::Cmp::Ge, 100).unwrap();
 		let got = q.run(&[t, i]).unwrap();
-		assert_eq!(got, vec![vec![Value::Ref(r1.tx), Value::Int(100)], vec![Value::Ref(r2.tx), Value::Int(100)], vec![Value::Ref(r3.tx), Value::Int(250)]]);
+		assert_eq!(got, vec![vec![Value::Ref(r1.tx), Value::Instant(100)], vec![Value::Ref(r2.tx), Value::Instant(100)], vec![Value::Ref(r3.tx), Value::Instant(250)]]);
 	}
 
 	#[test]
@@ -2781,7 +2903,7 @@ pub(crate) mod tests
 		assert!(matches!(conn.transact(&alter(Attr::new("person/age", ValueType::Str, Cardinality::One))), Err(Error::AlterRefused { .. })));
 		assert!(matches!(conn.transact(&alter(Attr::new("person/age", ValueType::Int, Cardinality::One).component())), Err(Error::InvalidSchema(_))));
 		assert!(matches!(conn.transact(&alter(Attr::new("nope", ValueType::Int, Cardinality::One))), Err(Error::UnknownAttr(_))));
-		assert!(matches!(conn.transact(&alter(Attr::new(TX_INSTANT, ValueType::Int, Cardinality::Many))), Err(Error::Reserved(_))));
+		assert!(matches!(conn.transact(&alter(Attr::new(TX_INSTANT, ValueType::Instant, Cardinality::Many))), Err(Error::Reserved(_))));
 		// An alteration is recorded for the durable log, and replays to the same value
 		let mut tx = Tx::new();
 		tx.alter_attr(Attr::new("person/email", ValueType::Str, Cardinality::One));
@@ -2811,6 +2933,85 @@ pub(crate) mod tests
 		assert_eq!(db.history().tx_range(3, 4), log[2..3].to_vec());
 		assert_eq!(db.since(20).unwrap().tx_range(0, T::MAX), log);
 		assert!(db.tx_range(9, 9).is_empty() && db.tx_range(db.basis_t() + 1, T::MAX).is_empty());
+	}
+
+	// The order of values is total and consistent with equality and hashing, Floats included (NaN, -0.0, infinities)
+	#[test]
+	fn value_order_is_total()
+	{
+		use std::hash::{BuildHasher, BuildHasherDefault};
+		let hash = |v: &Value| BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(v);
+		let vals = [
+			Value::Bool(false),
+			Value::Int(-3),
+			Value::Int(7),
+			Value::Float(f64::NEG_INFINITY),
+			Value::Float(-1.5),
+			Value::Float(-0.0),
+			Value::Float(0.0),
+			Value::Float(2.0),
+			Value::Float(f64::INFINITY),
+			Value::Float(f64::NAN),
+			Value::from("a"),
+			Value::Instant(-5),
+			Value::Instant(5),
+			Value::Ref(1),
+		];
+		// Listed in order: by type, then within it
+		for (i, x) in vals.iter().enumerate()
+		{
+			for (j, y) in vals.iter().enumerate()
+			{
+				assert_eq!(x.cmp(y), i.cmp(&j), "{x:?} vs {y:?}");
+				assert_eq!(x == y, i == j);
+				if i == j
+				{
+					assert_eq!(hash(x), hash(&x.clone()));
+				}
+			}
+		}
+		// In an index: a Float attribute holds NaN and both zeros as distinct values
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		tx.define("x", ValueType::Float, Cardinality::Many);
+		let e = tx.temp();
+		for f in [f64::NAN, 0.0, -0.0, 1.0]
+		{
+			tx.add(e, "x", f);
+		}
+		let r = conn.transact(&tx).unwrap();
+		let x = conn.db().attr_id("x").unwrap();
+		assert_eq!(conn.db().values(r.tempids[0], x).count(), 4);
+		assert!(conn.db().has(r.tempids[0], x, &Value::Float(f64::NAN)));
+	}
+
+	// basis_of_instant and basis_of_tx against a scan of the transactions
+	#[test]
+	fn bases_by_instant_and_transaction()
+	{
+		let (conn, reports) = random_conn(13, 30);
+		let db = conn.db();
+		let instants: Vec<i64> = reports.iter().map(|r| match r.tx_data[0].v
+		{
+			Value::Instant(i) => i,
+			_ => unreachable!(),
+		}).collect();
+		for i in instants[0] - 5..instants.last().unwrap() + 5
+		{
+			let want = instants.iter().filter(|&&x| x <= i).count() as T;
+			assert_eq!(db.basis_of_instant(i), want, "instant {i}");
+		}
+		for (t, r) in reports.iter().enumerate()
+		{
+			assert_eq!(db.basis_of_tx(r.tx), Some(t as T + 1));
+			// An entity that isn't a transaction, and a past view (whose history ends at its basis)
+			assert_eq!(db.basis_of_tx(r.tx + 1).filter(|_| !reports.iter().any(|q| q.tx == r.tx + 1)), None);
+			let past = db.as_of(t as T + 1).unwrap();
+			assert_eq!(past.basis_of_instant(i64::MAX), t as T + 1);
+			assert_eq!(past.basis_of_tx(reports.last().unwrap().tx), if t + 1 == reports.len() { Some(t as T + 1) } else { None });
+		}
+		assert_eq!(db.basis_of_tx(0), None);
+		assert_eq!(Db::new().basis_of_instant(0), 0);
 	}
 
 	// A value rebuilt from its snapshot (every index and statistic derived from the history alone) is the value transact maintained,

@@ -113,7 +113,71 @@ enum Form
 	Symbol(String),
 	Str(String),
 	Int(i64),
+	Float(f64),
+	/// `#inst "..."`, in milliseconds since the Unix epoch
+	Instant(i64),
 	Bool(bool),
+}
+
+/// The instant of an RFC 3339 timestamp (`2024-02-29T13:45:00Z`, `...:00.25+02:00`; also a date alone, at midnight UTC),
+/// in milliseconds since the Unix epoch (fractions beyond milliseconds are truncated); None if it isn't one
+pub(crate) fn parse_instant(s: &str) -> Option<i64>
+{
+	let num = |s: &str| -> Option<i64> { (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok()).flatten() };
+	let (date, time) = s.split_once(['T', 't']).unwrap_or((s, "00:00:00Z"));
+	let mut d = date.split('-');
+	let (y, m, day) = (d.next().filter(|x| x.len() == 4).and_then(num)?, d.next().filter(|x| x.len() == 2).and_then(num)?, d.next().filter(|x| x.len() == 2).and_then(num)?);
+	if d.next().is_some() || !(1..=12).contains(&m)
+	{
+		return None;
+	}
+	let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+	let days_in_month = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m as usize - 1];
+	if !(1..=days_in_month).contains(&day)
+	{
+		return None;
+	}
+	// The offset: Z, or +hh:mm / -hh:mm
+	let (clock, offset) = if let Some(c) = time.strip_suffix(['Z', 'z'])
+	{
+		(c, 0)
+	}
+	else
+	{
+		let at = time.rfind(['+', '-'])?;
+		let (h, mi) = time[at + 1..].split_once(':')?;
+		let (h, mi) = (Some(h).filter(|x| x.len() == 2).and_then(num)?, Some(mi).filter(|x| x.len() == 2).and_then(num)?);
+		if h > 23 || mi > 59
+		{
+			return None;
+		}
+		let sign = if &time[at..at + 1] == "-" { -1 } else { 1 };
+		(&time[..at], sign * (h * 60 + mi))
+	};
+	let (hms, frac) = clock.split_once('.').map_or((clock, None), |(a, b)| (a, Some(b)));
+	let mut c = hms.split(':');
+	let (hh, mm, ss) = (c.next().filter(|x| x.len() == 2).and_then(num)?, c.next().filter(|x| x.len() == 2).and_then(num)?, c.next().filter(|x| x.len() == 2).and_then(num)?);
+	if c.next().is_some() || hh > 23 || mm > 59 || ss > 60
+	{
+		return None;
+	}
+	let millis = match frac
+	{
+		None => 0,
+		Some(f) =>
+		{
+			num(f)?;
+			format!("{:0<3}", &f[..f.len().min(3)]).parse::<i64>().ok()?
+		}
+	};
+	// Days since the epoch of the civil date (the proleptic Gregorian calendar)
+	let (yy, mm_) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+	let era = yy.div_euclid(400);
+	let yoe = yy - era * 400;
+	let doy = (153 * mm_ + 2) / 5 + day - 1;
+	let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	let days = era * 146_097 + doe - 719_468;
+	Some(((days * 24 + hh) * 60 + mm - offset) * 60_000 + ss * 1000 + millis)
 }
 
 /// A form and its byte offset in the text
@@ -209,7 +273,19 @@ impl<'a> Reader<'a>
 			}
 			']' | ')' => return Err(error_at(self.text, pos, format!("unexpected {c}"))),
 			'"' => Form::Str(self.string()?),
-			'{' | '}' | '#' | '\'' | '`' | '~' | '^' | '@' | '\\' => return Err(error_at(self.text, pos, format!("{c} is not supported in queries (no maps, sets, tags, quotes or characters)"))),
+			'#' if self.text[pos..].starts_with("#inst") && self.text[pos + 5..].starts_with(|c: char| c.is_whitespace() || c == '"') =>
+			{
+				self.pos += 5;
+				self.skip_space();
+				if self.peek() != Some('"')
+				{
+					return Err(error_at(self.text, self.pos, "#inst takes a string (an RFC 3339 timestamp)"));
+				}
+				let at = self.pos;
+				let s = self.string()?;
+				Form::Instant(parse_instant(&s).ok_or_else(|| error_at(self.text, at, format!("{s:?} is not an RFC 3339 timestamp (e.g. \"2024-02-29T13:45:00Z\")")))?)
+			}
+			'{' | '}' | '#' | '\'' | '`' | '~' | '^' | '@' | '\\' => return Err(error_at(self.text, pos, format!("{c} is not supported in queries (no maps, sets, tags other than #inst, quotes or characters)"))),
 			_ =>
 			{
 				let token = self.token();
@@ -223,11 +299,20 @@ impl<'a> Reader<'a>
 				}
 				else if token.strip_prefix(['+', '-']).unwrap_or(token).starts_with(|d: char| d.is_ascii_digit())
 				{
-					if !token.strip_prefix(['+', '-']).unwrap_or(token).chars().all(|d| d.is_ascii_digit())
+					let digits = token.strip_prefix(['+', '-']).unwrap_or(token);
+					if digits.chars().all(|d| d.is_ascii_digit())
 					{
-						return Err(error_at(self.text, pos, format!("invalid number {token} (only integers are supported)")));
+						Form::Int(token.parse().map_err(|_| error_at(self.text, pos, format!("the integer {token} is out of range")))?)
 					}
-					Form::Int(token.parse().map_err(|_| error_at(self.text, pos, format!("the integer {token} is out of range")))?)
+					// A float: digits with a fraction and/or an exponent (Rust's syntax for f64 is a superset of EDN's, so check the characters first)
+					else if digits.chars().all(|d| d.is_ascii_digit() || ".eE+-".contains(d)) && digits.contains(['.', 'e', 'E'])
+					{
+						Form::Float(token.parse().map_err(|_| error_at(self.text, pos, format!("invalid number {token}")))?)
+					}
+					else
+					{
+						return Err(error_at(self.text, pos, format!("invalid number {token}")));
+					}
 				}
 				else
 				{
@@ -483,6 +568,8 @@ impl<'a> Parser<'a>
 			Form::Symbol(s) => Err(self.err(node, format!("expected a variable or a constant, found the symbol {s}"))),
 			Form::Str(s) => Ok(Term::Val(s.as_str().into())),
 			Form::Int(i) => Ok(Term::Val((*i).into())),
+			Form::Float(f) => Ok(Term::Val((*f).into())),
+			Form::Instant(i) => Ok(Term::Val(Value::Instant(*i))),
 			Form::Bool(b) => Ok(Term::Val((*b).into())),
 			Form::Keyword(k) => Err(self.err(node, format!("the keyword :{k} is not a value (keywords only name attributes)"))),
 			Form::Vector(_) | Form::List(_) => Err(self.err(node, "expected a variable or a constant")),
@@ -820,7 +907,7 @@ mod tests
 {
 	use super::*;
 	use crate::db::tests::{random_conn, replay};
-	use crate::db::{AttrId, Eid};
+	use crate::db::{AttrId, Cardinality, Conn, Eid, Tx, ValueType};
 	use std::collections::BTreeSet;
 
 	fn parse_error(db: &Db, text: &str) -> (usize, usize, String)
@@ -1140,5 +1227,73 @@ mod tests
 		assert!(matches!(run("[[(r ?x) [?x :n _] (not (r ?x))]]"), Some(Error::InvalidQuery(m)) if m.contains("stratification")));
 		// A rule's _ is a variable of its own, like the query's
 		assert!(run("[[(r ?x) [?x :n _] [_ :ref ?x]]]").is_none());
+	}
+
+	// RFC 3339 timestamps against a naive count of days, and the forms that aren't timestamps
+	#[test]
+	fn instants()
+	{
+		fn naive(y: i64, m: i64, d: i64) -> i64
+		{
+			let leap = |y: i64| y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+			let mut days = 0;
+			for yy in 1970.min(y)..1970.max(y)
+			{
+				days += if leap(yy) { 366 } else { 365 };
+			}
+			if y < 1970
+			{
+				days = -days;
+			}
+			let months = [31, if leap(y) { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+			days + months[..m as usize - 1].iter().sum::<i64>() + d - 1
+		}
+		for (y, m, d) in [(1970, 1, 1), (1969, 12, 31), (2000, 2, 29), (1900, 3, 1), (2024, 12, 31), (1600, 2, 29), (2100, 2, 28), (1, 1, 1)]
+		{
+			let s = format!("{y:04}-{m:02}-{d:02}");
+			assert_eq!(parse_instant(&s), Some(naive(y, m, d) * 86_400_000), "{s}");
+			assert_eq!(parse_instant(&format!("{s}T13:45:07.25Z")), Some(naive(y, m, d) * 86_400_000 + ((13 * 60 + 45) * 60 + 7) * 1000 + 250), "{s}");
+		}
+		assert_eq!(parse_instant("1970-01-01T02:00:00+02:00"), Some(0));
+		assert_eq!(parse_instant("1969-12-31T19:30:00-04:30"), Some(0));
+		assert_eq!(parse_instant("1970-01-01T00:00:00.123456789Z"), Some(123));
+		for bad in ["", "2024-02-30", "2023-02-29", "2024-13-01", "2024-1-01", "24-01-01", "2024-01-01T25:00:00Z", "2024-01-01T10:00:00", "2024-01-01T10:00Z", "2024-01-01T10:00:00+2:00", "2024-01-01T10:00:00.Z", "x"]
+		{
+			assert_eq!(parse_instant(bad), None, "{bad}");
+		}
+	}
+
+	// Floats and instants in text queries: literals, numeric comparison of Ints and Floats, and aggregates
+	#[test]
+	fn floats_and_instants_in_text()
+	{
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		tx.define("item/price", ValueType::Float, Cardinality::One).define("item/n", ValueType::Int, Cardinality::One).define("item/at", ValueType::Instant, Cardinality::One);
+		let jan = parse_instant("2024-01-15T00:00:00Z").unwrap();
+		let mar = parse_instant("2024-03-01T12:00:00Z").unwrap();
+		for (i, (price, at)) in [(1.5, jan), (2.25, jan), (-0.5, mar), (10.0, mar)].into_iter().enumerate()
+		{
+			let e = tx.temp();
+			tx.add(e, "item/price", price).add(e, "item/n", i as i64).add(e, "item/at", Value::Instant(at));
+		}
+		conn.transact(&tx).unwrap();
+		let db = conn.db();
+		let q = |text: &str| db.q(text, &[]).unwrap();
+		assert_eq!(q("[:find ?p :where [?e :item/price 2.25] [?e :item/price ?p]]"), vec![vec![Value::Float(2.25)]]);
+		// An Int compares with a Float numerically (and the Float attribute refuses an Int constant in a pattern)
+		assert_eq!(q("[:find ?p :where [?e :item/price ?p] [(> ?p 2)]]"), vec![vec![Value::Float(2.25)], vec![Value::Float(10.0)]]);
+		assert_eq!(q("[:find ?n :where [?e :item/price ?p] [?e :item/n ?n] [(= ?p ?n)]]"), Vec::<Vec<Value>>::new());
+		assert!(matches!(db.q("[:find ?e :where [?e :item/price 2]]", &[]), Err(Error::TypeMismatch { .. })));
+		assert_eq!(q("[:find (sum ?p) (avg ?p) (min ?p) (max ?p) :where [?e :item/price ?p]]"), vec![vec![Value::Float(13.25), Value::Float(3.3125), Value::Float(-0.5), Value::Float(10.0)]]);
+		assert_eq!(q("[:find (avg ?n) :where [_ :item/n ?n]]"), vec![vec![Value::Float(1.5)]]);
+		// Instants: literals, comparisons, and grouping
+		assert_eq!(q("[:find (count ?e) :where [?e :item/at #inst \"2024-01-15\"]]"), vec![vec![Value::Int(2)]]);
+		assert_eq!(q("[:find ?n :where [?e :item/at ?t] [(>= ?t #inst \"2024-02-01T00:00:00+01:00\")] [?e :item/n ?n]]"), vec![vec![Value::Int(2)], vec![Value::Int(3)]]);
+		assert_eq!(q("[:find ?t (count ?e) :where [?e :item/at ?t]]"), vec![vec![Value::Instant(jan), Value::Int(2)], vec![Value::Instant(mar), Value::Int(2)]]);
+		for bad in ["[:find ?e :where [?e :item/at #inst 5]]", "[:find ?e :where [?e :item/at #inst \"tomorrow\"]]", "[:find ?e :where [?e :item/price 1.5.5]]", "[:find ?e :where [?e :item/price 1e]]", "[:find ?e :where #{}]"]
+		{
+			assert!(matches!(db.q(bad, &[]), Err(Error::Parse { .. })), "{bad}");
+		}
 	}
 }

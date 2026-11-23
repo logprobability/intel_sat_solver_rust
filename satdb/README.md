@@ -2,9 +2,12 @@
 
 A Datomic-inspired immutable database whose query planner runs on the Rust fork of the Intel(R) SAT Solver (`../rust`).
 
-* **Database values** (`src/db.rs`). A `Db` is an immutable value: the current datoms `[e a v]` in four indexes (EAVT, AEVT, AVET, and VAET for refs; the history has three more, see below),
+* **Database values** (`src/db.rs`). A `Db` is an immutable value: the current datoms `[e a v]` in four indexes (EAVT, AEVT, AVET, and VAET for refs; the history has more, see below),
   the schema (value type, cardinality one/many, `Unique::Identity`/`Unique::Value`, component refs) and per-attribute statistics
-  (datoms, distinct entities, distinct values). `Db::transact` returns a new value; `Conn` keeps every past one, so `as_of(t)` is a lookup.
+  (datoms, distinct entities, distinct values). `Db::transact` returns a new value.
+  * Value types: `Bool`, `Int` (i64), `Float` (f64), `Str`, `Instant` (milliseconds since the Unix epoch) and `Ref`. Values order by type,
+    then within it; Floats are totally ordered (`f64::total_cmp`: -0.0 before 0.0, NaN at the ends), so that they can be index keys, and
+    equality follows that order (NaN equals NaN, -0.0 doesn't equal 0.0). Comparison predicates compare an Int with a Float numerically.
 * **Transactions** (`src/db.rs`). As in Datomic, a transaction is a *set* of assertions and retractions against the database before it,
   so the order of its operations doesn't matter:
   * a tempid asserting an existing `:db.unique/identity` value upserts to that entity, and tempids asserting the same new identity value
@@ -17,7 +20,7 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   * `retract_entity` retracts an entity's datoms and the refs to it (through VAET), and cascades to the entities it owns through component attributes;
   * conflicting operations are errors: a datom both asserted and retracted, two values of a cardinality-one attribute, and a unique value
     that would belong to two entities after the transaction (checked on the result, so handing a value over in one transaction is fine);
-  * every transaction is an entity with a `db/txInstant` supplied by the caller (`Tx::with_instant`; by default the previous instant;
+  * every transaction is an entity with a `db/txInstant`, an Instant supplied by the caller (`Tx::with_instant`; by default the previous instant;
     it may not go backwards), which `Datom::tx` refers to and the transaction itself can annotate (`Entity::Tx`). `db/` names are reserved;
   * compare-and-swap (`Tx::cas(e, attr, expected, new)`, a cardinality-one attribute; `expected` None means no value) checks the value
     before the transaction and fails the whole transaction with `Error::CasFailed` otherwise;
@@ -36,6 +39,9 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
 
   The views compose (`as_of(t).since(s)`, `history().as_of(t)`, ...); transacting against one is an error. `Db::datoms(e, a, v)` scans a view.
   `Db::tx_range(from, to)` reads the log: each transaction of the bases `from..to` with its entity and datoms (as Datomic's `tx-range`).
+  The views take a basis; `Db::basis_of_instant(i)` (the last basis whose transaction is at or before instant `i`) and `Db::basis_of_tx(tx)`
+  give the basis of a time or a transaction entity, so `db.as_of(db.basis_of_instant(i))` is the database at time `i` (binary searches,
+  as instants never decrease and transaction entities increase with the basis).
 * **Durability** (`src/log.rs`). `Conn::open(path)` backs a connection with an append-only log file (created if missing); `Conn::new()` stays in memory.
   * Each committed transaction is one record holding its *effect*: basis, transaction entity, the next entity id after it (tempids that
     unified away or only appear in `retract_entity` still use up ids), instant, the attributes it defined (with their ids), and the datoms
@@ -86,11 +92,12 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     Each run plans the bodies once (with the SAT planner, within a budget), counting the join variables bound where they run as constants,
     and runs them in an environment of their own.
   * Find specs (`Query::find`) take plain terms and the aggregates `count`, `count-distinct`, `sum`, `min`, `max` and `avg`, grouped by the plain terms,
-    over the distinct tuples of the find and `with` variables, as in Datomic. There is no floating-point type, so `avg` is the integer mean rounded down.
+    over the distinct tuples of the find and `with` variables, as in Datomic. `sum` of Ints is an exact Int (an error on overflow), and a Float
+    once any value is a Float; `avg` is a Float; both take only numbers.
 * **Text queries** (`src/parse.rs`). `Db::q(text, inputs)` reads a subset of Datomic's Datalog in EDN into the builder, clause by clause (so it is planned
   as it is read): `[:find ?a (count ?b) :with ?c :in $ ?x :where [?e :attr ?v] [(> ?v ?x)] (not ...) (or-join [?e] ... (and ...))]`, with `_`
   (a variable of its own at each occurrence, as is each missing position of a short pattern, and never a join variable of an implicit `not` or `or`,
-  so `(not [?p :person/friend _])` keeps the people without friends, as in Datomic), 2- to 5-element patterns, lookup refs `[:attr value]`, string, integer and boolean constants, and scalar inputs, which become constants of the query.
+  so `(not [?p :person/friend _])` keeps the people without friends, as in Datomic), 2- to 5-element patterns, lookup refs `[:attr value]`, string, integer, float (`1.5`, `-2e3`), boolean and instant (`#inst "2024-02-29T13:45:00Z"`, RFC 3339, or a date alone) constants, and scalar inputs, which become constants of the query.
   Syntax errors carry their line and column; keywords only name attributes (there is no keyword value type).
   `Db::q_rules(text, rules, inputs)` takes a rule set as `%`, written as in Datomic: `[[(reach ?a ?b) [?a :edge ?b]] [(reach ?a ?b) [?a :edge ?c] (reach ?c ?b)]]`.
 * **Rules** (`src/rules.rs`). `Query::rule(name, head, body)` defines a rule (several definitions are a union) and `Query::call`/`call_clause`
@@ -182,14 +189,14 @@ This is a start. What is missing, roughly in order of value:
   encoding would have to support: a binder's boundness justified only when its own requirements hold, pending computed as a fixpoint, and the
   brute-force test extended to such clauses); attribute variables in patterns; function and binding expressions (`[(f ?x) ?y]`);
   collection, tuple and relation inputs; scalar/collection find specs (`.`, `...`) and pull in the find spec;
-  a floating-point value type (for a true `avg`, and `median`/`variance`). The cost model doesn't see inside `not` and `or`
+  the aggregates `median`, `variance` and `stddev`. The cost model doesn't see inside `not` and `or`
   (a `not` has a fixed selectivity, a binding `or` the cost of its branches with nothing bound).
-* Time: `as_of` by transaction entity or instant (it takes a basis), and the planner's estimates for `since` and `as_of` views
+* Time: the planner's estimates for `since` and `as_of` views
   (they use the latest value's statistics). An as-of view derives each read from the history, so it costs more than a read of the current value.
   In a history view, the current-state accessors (`values`, `lookup`, ...) still read the current datoms; only scans and queries see the history.
 * Pull: recursion limits (`...`), attribute options (defaults, limits, renaming) and pulling from a query's find spec.
 * Schema: renaming attributes, altering the value type, and attribute retirement; user-defined transaction functions
-  (CAS is the only built-in); an Instant value type.
+  (CAS is the only built-in); a keyword value type.
 * Planner scale beyond 16 clauses: the DP covers up to 16 clauses (20 would take up to 120 ms per refinement), and above that SAT
   ends 1-13% above the optimum after 200k conflicts and rarely proves it. The online refinement doesn't help there yet: on random
   24-clause queries (`cargo test --release online_refinement_budgets -- --ignored --nocapture`), no refinement after clauses 17 to 24
