@@ -101,7 +101,7 @@ impl<Ind: TUInd, const Compress: bool> CTopor<Ind, Compress>
 		self.m_Topi.GetValue(l)
 	}
 
-	// Get the decision level of the given literal (which must be assigned!)
+	// Get the decision level of the given literal (which must be assigned!); 0 for a literal beyond the solver's literal map
 	pub fn GetLitDecLevel(&self, l: TLit) -> TLit
 	{
 		self.m_Topi.GetLitDecLevel(l)

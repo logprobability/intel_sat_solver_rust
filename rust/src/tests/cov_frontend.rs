@@ -155,7 +155,12 @@ fn ToporApi<Ind: TUInd, const Compress: bool>()
 	assert_eq!(topor.GetLitValue(-2), TToporLitVal::VAL_UNSATISFIED);
 	assert_eq!(topor.GetLitValue(4), TToporLitVal::VAL_SATISFIED);
 	assert_eq!(topor.GetLitValue(100), TToporLitVal::VAL_DONT_CARE);
+	// TLit::MIN has no positive counterpart; it used to index the literal map with a huge index
+	assert_eq!(topor.GetLitValue(TLit::MIN), TToporLitVal::VAL_DONT_CARE);
 	assert!(topor.GetLitDecLevel(2) >= 0);
+	// Literals beyond the literal map used to be read out of bounds
+	assert_eq!(topor.GetLitDecLevel(TLit::MAX), 0);
+	assert_eq!(topor.GetLitDecLevel(TLit::MIN), 0);
 	let model = topor.GetModel();
 	assert_eq!(model.len(), 5);
 	assert_eq!(model[2], TToporLitVal::VAL_SATISFIED);
