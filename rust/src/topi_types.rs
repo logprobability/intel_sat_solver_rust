@@ -798,7 +798,7 @@ impl TCompressedClss
 			let p = unsafe { std::alloc::alloc(layout) } as *mut CBitArray;
 			if p.is_null()
 			{
-				return std::ptr::null_mut();
+				return std::ptr::null_mut(); // COVERAGE-NOT-REACHED: a real allocation failure (the injected one returns above)
 			}
 			// SAFETY: p is a fresh allocation, which is suitably sized and aligned for a CBitArray
 			unsafe { p.write(CBitArray::new()) };

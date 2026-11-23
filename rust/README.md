@@ -35,9 +35,10 @@ The library is used through `intel_sat_solver::topor::CTopor<Ind, Compress>`, wh
 ## Coverage
 
 `scripts/coverage.sh` runs all the tests under LLVM source-based coverage and fails if any line is neither executed nor explicitly marked in the sources.
-All the 9360 lines are executed by the tests (100%). The rarest paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
-while another assumption is falsified) are driven by tests on crafted solver states, which the fuzzer never produces. The script also supports the marks
-`COVERAGE-UNREACHABLE` and `COVERAGE-NOT-REACHED` for lines, which aren't executed for a documented reason; no line carries them.
+Of the 9293 lines, all but 10 are executed by the tests. The rarest paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
+while another assumption is falsified) are driven by tests on crafted solver states, which the fuzzer never produces. The 10 lines carry the marks
+`COVERAGE-UNREACHABLE` (3: `BitsInd`, which only compile-time asserts call) and `COVERAGE-NOT-REACHED` (7: the responses to real allocation failures, which the
+fault injection doesn't reach, of `handle_alloc_error`, a `Vec::try_reserve` and the box of a bit-compressed buffer, and a decompressor that is on the PATH but can't be run).
 
 The script fails on a stale mark too (a marked line which is executed). It has a second pass, which builds with the debug assertions off and runs only the `nda_*` tests:
 the statement following a failing assertion (the C++ `assert(0); return false;` idiom) can execute only in such a build.

@@ -1530,8 +1530,8 @@ fn ToporToolMain(argv: &[String], out: &mut dyn Write) -> Result<i32, String>
 			}
 			Err(_) =>
 			{
-				coutln!(out, "c topor_tool ERROR: couldn't open the input file");
-				return Ok(BadRetVal);
+				coutln!(out, "c topor_tool ERROR: couldn't open the input file"); // COVERAGE-NOT-REACHED: the decompressor is on the PATH, but can't be run (e.g., not executable)
+				return Ok(BadRetVal); // COVERAGE-NOT-REACHED: as above
 			}
 		}
 	};

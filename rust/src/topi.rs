@@ -1235,7 +1235,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			tmpCls.reserve_exactly_unchecked_by_user(maxSpanElems as usize);
 			if maxSpanElems != 0 && tmpCls.uninitialized_or_erroneous()
 			{
-				std::alloc::handle_alloc_error(std::alloc::Layout::array::<TULit>(maxSpanElems as usize).unwrap_or(std::alloc::Layout::new::<TULit>()));
+				std::alloc::handle_alloc_error(std::alloc::Layout::array::<TULit>(maxSpanElems as usize).unwrap_or(std::alloc::Layout::new::<TULit>())); // COVERAGE-NOT-REACHED: a real allocation failure, which aborts the process
 			}
 			for i in 0..maxSpanElems as usize
 			{

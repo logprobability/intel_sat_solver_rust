@@ -115,10 +115,12 @@ pub(crate) fn BuildCMasksByBitAtRunTime() -> [[TCInfo; 64]; MAX_BITS_NUM as usiz
 const cMasksByBitConst: [[TCInfo; 64]; MAX_BITS_NUM as usize] = build_c_masks_by_bit();
 
 // The table is indexed by the number of bits minus 1
+// COVERAGE-UNREACHABLE-BEGIN: only the compile-time asserts below call it, so it never runs
 const fn BitsInd(bits: usize) -> usize
 {
 	bits - 1
 }
+// COVERAGE-UNREACHABLE-END
 
 // 1 bits starting from bit 0
 const _: () = assert!(cMasksByBitConst[BitsInd(1)][0].w0ReadMask == 1);

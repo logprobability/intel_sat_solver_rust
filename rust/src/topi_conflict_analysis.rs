@@ -831,9 +831,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 									self.m_VarsParentSubsumed.push(parentSubsumed);
 								}
 								else
-								{
-									self.SetStatus(TToporStatus::STATUS_ALLOC_FAILED, "m_VarsParentSubsumed.push_back allocation failure".to_string());
-								}
+								{ // COVERAGE-NOT-REACHED: a real allocation failure of a Vec, which the fault injection doesn't reach
+									self.SetStatus(TToporStatus::STATUS_ALLOC_FAILED, "m_VarsParentSubsumed.push_back allocation failure".to_string()); // COVERAGE-NOT-REACHED: as above
+								} // COVERAGE-NOT-REACHED: as above
 
 								if self.IsUnrecoverable()
 								{
