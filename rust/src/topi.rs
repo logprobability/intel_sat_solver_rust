@@ -1909,6 +1909,23 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		self.IsVisitedVar(GetVar(l))
 	}
 
+	// Is the consistency testing of the given level on? (the C++ version spells out
+	// m_ParamAssertConsistency >= level && m_Stat.m_Conflicts >= m_ParamAssertConsistencyStartConf in each assertion)
+	#[inline]
+	pub(crate) fn AssertConsistencyOn(&self, level: u8) -> bool
+	{
+		self.m_Params.m_ParamAssertConsistency.get() >= level && self.m_Stat.m_Conflicts >= self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64
+	}
+
+	// The binary watches of a watch-info: they follow its long watches in m_W
+	#[inline]
+	pub(crate) fn WLBinWatchesSpan(&self, wi: &TWatchInfo<Ind>) -> TSpanTULit
+	{
+		let start = wi.m_WBInd.as_usize() + wi.GetLongEntries();
+		debug_assert!(wi.m_BinaryWatches == Ind::ZERO || start + wi.m_BinaryWatches.as_usize() <= self.m_W.cap());
+		TSpanTULit::new(self.m_W.get_ptr_no_assert(start), wi.m_BinaryWatches.as_usize())
+	}
+
 	#[inline(always)]
 	pub(crate) fn VisitedPopBack(&mut self) -> TUVar
 	{

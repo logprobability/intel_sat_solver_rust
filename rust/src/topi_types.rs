@@ -95,6 +95,23 @@ pub const fn ExternalLit2ExternalVar(l: TLit) -> TLit
 	if l > 0 { l } else { l.wrapping_neg() }
 }
 
+// The C library's pseudo-random generator, which the C++ version uses: kept, so that the fork makes the very same random choices
+// (as in C++, its state is process-wide, shared by all the solver instances)
+mod c_rand
+{
+	extern "C"
+	{
+		pub fn rand() -> std::ffi::c_int;
+	}
+}
+
+#[inline]
+pub fn rand() -> std::ffi::c_int
+{
+	// SAFETY: rand has no preconditions
+	unsafe { c_rand::rand() }
+}
+
 // Initialization-related: the initial number of entries in the fused buffer: set the original size to 4Mb
 pub const InitEntriesInB: usize = 0x400000 / std::mem::size_of::<TULit>();
 

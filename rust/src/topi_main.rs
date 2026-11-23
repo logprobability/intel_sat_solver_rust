@@ -7,12 +7,6 @@ use crate::{ReserveExactly};
 use std::io::Write;
 use std::sync::atomic::Ordering;
 
-extern "C"
-{
-	// The C library's pseudo-random generator, used by the C++ version
-	fn rand() -> std::ffi::c_int;
-}
-
 // time_t is long on the supported Unix platforms (glibc and macOS)
 #[cfg(unix)]
 type time_t = std::ffi::c_long;
@@ -1237,7 +1231,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		{
 			ReturnTrv!(self.UnrecStatusToRetVal());
 		}
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(false));
+		debug_assert!(!self.AssertConsistencyOn(2) || self.WLAssertConsistency(false));
 
 		let mut pi = self.BCP();
 		if self.IsUnrecoverable()
@@ -1313,7 +1307,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			{
 				if !currAi.m_IsAssigned()
 				{
-					currAi.set_m_IsNegated(if self.m_Params.m_ParamInitPolarityStrat.get() == 0 { true } else { (unsafe { rand() }) % 2 != 0 });
+					currAi.set_m_IsNegated(if self.m_Params.m_ParamInitPolarityStrat.get() == 0 { true } else { rand() % 2 != 0 });
 				}
 			}
 			self.m_PrevAiCap = self.m_AssignmentInfo.cap();
@@ -1355,11 +1349,11 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			debug_assert!(l != BadULit);
 			debug_assert!(self.NV(2) || self.P(&("***** Decision at level ".to_string() + &self.m_DecLevel.to_string() + ": " + &self.SLit(l) + "\n")));
 
-			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
+			debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
 			let isContraditory = self.Assign(l, Self::BadClsInd, BadULit, self.m_DecLevel, true, false);
 			debug_assert!(!isContraditory);
 			let _ = isContraditory;
-			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
+			debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
 
 			let mut contradictionInfo = self.BCP();
 			let isContradictionBeforeConflictAnalysis = contradictionInfo.IsContradiction();

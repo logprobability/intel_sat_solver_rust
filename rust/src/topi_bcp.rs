@@ -180,8 +180,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	pub(crate) fn BCP(&mut self) -> TContradictionInfo<Ind>
 	{
 		// Returns true iff BCP should stop propagating the current literal
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(false));
+		debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
+		debug_assert!(!self.AssertConsistencyOn(2) || self.WLAssertConsistency(false));
 
 		let res = self.BCPBody();
 
@@ -189,8 +189,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		self.ToPropagateClear();
 		self.CleanVisited();
 		self.m_CurrentlyPropagatedLit = BadULit;
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(self.m_Cis.empty()));
+		debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
+		debug_assert!(!self.AssertConsistencyOn(2) || self.WLAssertConsistency(self.m_Cis.empty()));
 		self.m_Cis.clear();
 
 		res
@@ -543,7 +543,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		debug_assert!(self.NV(2) || self.P(&("************************ ProcessDelayedImplication finish: l=".to_string() +
 			&self.SLit(diL) + "; otherWatch = " + &(if otherWatch == BadULit { "BAD".to_string() } else { self.SLit(otherWatch) }) + "; parent = " + &(if parentClsInd == Self::BadClsInd { "BAD".to_string() } else { self.SLits(self.Cls(parentClsInd), false) }) + "\n" + &self.STrail() + "\n")));
 		//assert(m_ParamAssertConsistency < 2 || m_Stat.m_Conflicts < (uint64_t)m_ParamAssertConsistencyStartConf || WLAssertConsistency(false));
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
+		debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
 		self.m_Dis.clear();
 		debug_assert!(decLevelStart == self.m_DecLevel || self.GetAssignedDecLevelVar(self.m_TrailEnd) != decLevelStart);
 		let _ = decLevelStart;
@@ -582,7 +582,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		debug_assert!(self.NV(2) || self.P(&("***** ProcessDelayedImplication start: diL=".to_string() +
 			&self.SLit(diL) + "; otherWatch = " + &(if otherWatch == BadULit { "BAD".to_string() } else { self.SLit(otherWatch) }) + "; parent = " + &(if parentClsInd == Self::BadClsInd { "BAD".to_string() } else { self.SLits(self.Cls(parentClsInd), false) }) + "\n" + &self.STrail() + "\n")));
 
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
+		debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
 
 		debug_assert!(self.IsSatisfied(diL) && ((otherWatch == BadULit && self.GetAssignedDecLevel(diL) > 0) || (self.IsFalsified(otherWatch) && self.GetAssignedDecLevel(diL) > self.GetAssignedDecLevel(otherWatch))));
 

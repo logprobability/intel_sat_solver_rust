@@ -168,7 +168,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		let wi = self.m_Watches[cls[0] as usize];
 		if wi.m_BinaryWatches != Ind::ZERO
 		{
-			let binWatches: TSpanTULit = self.m_W.get_span_cap_sz(wi.m_WBInd.as_usize() + wi.GetLongEntries(), wi.m_BinaryWatches.as_usize());
+			let binWatches: TSpanTULit = self.WLBinWatchesSpan(&wi);
 			let mut someMarked = false;
 			for l in binWatches
 			{
@@ -963,7 +963,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				clsStart = self.AddClsToBufferAndWatch(visitedNegLitsPrevDecLevels!().get_span(), !addInitCls, true);
 			}
 
-			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(false));
+			debug_assert!(!self.AssertConsistencyOn(2) || self.WLAssertConsistency(false));
 
 			if self.m_Params.m_ParamVarActivityUseMapleLevelBreaker.get()
 			{

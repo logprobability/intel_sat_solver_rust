@@ -267,9 +267,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		debug_assert!(self.NV(1) || self.P("Clause deletion started for priority\n"));
 		debug_assert!(self.NV(2) || self.P(&("The trail: ".to_string() + &self.STrail() + "\n")));
 
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(true));
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.DebugAssertWaste());
+		debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
+		debug_assert!(!self.AssertConsistencyOn(2) || self.WLAssertConsistency(true));
+		debug_assert!(!self.AssertConsistencyOn(2) || self.DebugAssertWaste());
 
 		// The body of the function; the on-exit code follows the block
 		'body:
@@ -446,9 +446,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			debug_assert!(self.NV(1) || self.P("Clause deletion finished for priority\n"));
 			debug_assert!(self.NV(2) || self.P(&("The trail: ".to_string() + &self.STrail() + "\n")));
 
-			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
-			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(true));
-			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.DebugAssertWaste());
+			debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
+			debug_assert!(!self.AssertConsistencyOn(2) || self.WLAssertConsistency(true));
+			debug_assert!(!self.AssertConsistencyOn(2) || self.DebugAssertWaste());
 		}
 	}
 
@@ -473,7 +473,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		debug_assert!(!self.IsGloballyAssignedVar(GetVar(l)));
 
 		let wi = self.m_Watches[l as usize];
-		let binWatches = TSpanTULit::new(unsafe { self.m_W.get_ptr(wi.m_WBInd.as_usize()).add(wi.GetLongEntries()) }, wi.m_BinaryWatches.as_usize());
+		let binWatches = self.WLBinWatchesSpan(&wi);
 
 		let itEndRemaining = remove_if(binWatches, 0, binWatches.size(), |otherLit| self.IsGloballySatisfied(otherLit));
 		debug_assert!(binWatches.size() - itEndRemaining != 0);
@@ -524,7 +524,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	fn SimplifySiftLitsInWatches(&mut self, newLastExistingVar: TUVar, l: TULit)
 	{
 		let wi = self.m_Watches[l as usize];
-		let binWatches = TSpanTULit::new(unsafe { self.m_W.get_ptr(wi.m_WBInd.as_usize()).add(wi.GetLongEntries()) }, wi.m_BinaryWatches.as_usize());
+		let binWatches = self.WLBinWatchesSpan(&wi);
 		for i in 0..binWatches.size()
 		{
 			binWatches.set(i, self.SimplifyRetSiftedLit(newLastExistingVar, binWatches.get(i)));
@@ -554,9 +554,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		debug_assert!(self.NV(1) || self.P("Simplification started\n"));
 		debug_assert!(self.NV(2) || self.P(&("The trail: ".to_string() + &self.STrail() + "\n")));
 
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(true));
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.DebugAssertWaste());
+		debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
+		debug_assert!(!self.AssertConsistencyOn(2) || self.WLAssertConsistency(true));
+		debug_assert!(!self.AssertConsistencyOn(2) || self.DebugAssertWaste());
 
 		// The body of the function; the on-exit code follows the block
 		'body:
@@ -960,7 +960,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				{
 					// There should be no long watches for the globally satisfied literal
 					debug_assert!(wi.m_LongWatches == Ind::ZERO);
-					let binWatches = TSpanTULit::new(unsafe { self.m_W.get_ptr(wi.m_WBInd.as_usize()).add(wi.GetLongEntries()) }, wi.m_BinaryWatches.as_usize());
+					let binWatches = self.WLBinWatchesSpan(&wi);
 					for secondLit in binWatches
 					{
 						if !self.IsGloballyAssignedVar(GetVar(secondLit))
@@ -1108,7 +1108,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 						{
 							continue;
 						}
-						let binWatches = TSpanTULit::new(unsafe { self.m_W.get_ptr(wi.m_WBInd.as_usize()).add(wi.GetLongEntries()) }, wi.m_BinaryWatches.as_usize());
+						let binWatches = self.WLBinWatchesSpan(&wi);
 						for secondLit in binWatches
 						{
 							if IsNeg(secondLit)
@@ -1234,9 +1234,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			debug_assert!(self.NV(1) || self.P("Simplification finished\n"));
 			debug_assert!(self.NV(2) || self.P(&("The trail: ".to_string() + &self.STrail() + "\n")));
 
-			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
-			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(true));
-			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.DebugAssertWaste());
+			debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
+			debug_assert!(!self.AssertConsistencyOn(2) || self.WLAssertConsistency(true));
+			debug_assert!(!self.AssertConsistencyOn(2) || self.DebugAssertWaste());
 		}
 	}
 
@@ -1451,9 +1451,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		debug_assert!(self.NV(1) || self.P(&("Compression started: wasted fraction is ".to_string() + &format!("{:.6}", self.m_BWasted.as_u64() as f64 / nextBitOverall) + " > " + &format!("{:.6}", self.m_Params.m_ParamWastedFractionThrToDelete.get()) + "\n")));
 		debug_assert!(self.NV(2) || self.P(&("The trail: ".to_string() + &self.STrail() + "\n")));
 
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(true));
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.DebugAssertWaste());
+		debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
+		debug_assert!(!self.AssertConsistencyOn(2) || self.WLAssertConsistency(true));
+		debug_assert!(!self.AssertConsistencyOn(2) || self.DebugAssertWaste());
 
 		// ************************************
 		// Compress the clause buffer
@@ -1528,9 +1528,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 		self.CompressWLs();
 
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(true));
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.DebugAssertWaste());
+		debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
+		debug_assert!(!self.AssertConsistencyOn(2) || self.WLAssertConsistency(true));
+		debug_assert!(!self.AssertConsistencyOn(2) || self.DebugAssertWaste());
 
 		debug_assert!(self.NV(1) || self.P("Compression finished\n"));
 		debug_assert!(self.NV(2) || self.P(&("The trail: ".to_string() + &self.STrail() + "\n")));

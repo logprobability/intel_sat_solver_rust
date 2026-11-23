@@ -233,7 +233,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 			if wi.m_BinaryWatches != Ind::ZERO
 			{
-				let binWatches = self.m_W.get_span_cap_sz(wi.m_WBInd.as_usize() + wi.GetLongEntries(), wi.m_BinaryWatches.as_usize());
+				let binWatches = self.WLBinWatchesSpan(&wi);
 				for secondLit in binWatches
 				{
 					let expectedValSecondLit = ExpectedVal(&internalVarVals, secondLit);

@@ -3,11 +3,6 @@
 
 use crate::topi::*;
 
-extern "C"
-{
-	fn rand() -> std::ffi::c_int;
-}
-
 impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 {
 	pub(crate) fn Restart(&mut self) -> bool
@@ -183,7 +178,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			else if currUnforceRestartsFraction == 1. { TPhaseStage::PHASE_STAGE_DONT_FORCE }
 			else if self.m_Params.m_ParamPhaseMngStartInvStrat.get() == 0 { TPhaseStage::PHASE_STAGE_STANDARD }
 			else if self.m_Params.m_ParamPhaseMngStartInvStrat.get() == 1 { TPhaseStage::PHASE_STAGE_DONT_FORCE }
-			else if unsafe { rand() } as f64 / std::ffi::c_int::MAX as f64 <= currUnforceRestartsFraction { TPhaseStage::PHASE_STAGE_DONT_FORCE }
+			else if rand() as f64 / std::ffi::c_int::MAX as f64 <= currUnforceRestartsFraction { TPhaseStage::PHASE_STAGE_DONT_FORCE }
 			else { TPhaseStage::PHASE_STAGE_STANDARD };
 		self.m_PhaseInitStage = self.m_PhaseStage;
 

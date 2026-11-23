@@ -5,11 +5,6 @@ use crate::topi::*;
 use crate::ReserveExactlyInit;
 use std::io::Write;
 
-extern "C"
-{
-	fn rand() -> std::ffi::c_int;
-}
-
 impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 {
 	// Get the decision literal
@@ -67,7 +62,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		debug_assert!(!self.IsAssignedVar(v));
 		let res = if self.IsNotForced(v)
 		{
-			if self.m_Params.m_ParamPolarityStrat.get() == 1 { (unsafe { rand() } % 2) != 0 } else { self.m_AssignmentInfo[v as usize].m_IsNegated() }
+			if self.m_Params.m_ParamPolarityStrat.get() == 1 { (rand() % 2) != 0 } else { self.m_AssignmentInfo[v as usize].m_IsNegated() }
 		}
 		else
 		{
@@ -152,7 +147,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			let mut v: TUVar = 1;
 			while v < self.GetNextVar()
 			{
-				self.FixPolarityInternal(GetLit(v, (unsafe { rand() } % 2) != 0), true);
+				self.FixPolarityInternal(GetLit(v, (rand() % 2) != 0), true);
 				v += 1;
 			}
 		}

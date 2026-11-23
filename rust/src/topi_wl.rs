@@ -15,7 +15,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		{
 			return false;
 		}
-		let binWatches = TSpanTULit::new(self.m_W.get_ptr(wi.m_WBInd.as_usize()).wrapping_add(wi.GetLongEntries()), wi.m_BinaryWatches.as_usize());
+		let binWatches = self.WLBinWatchesSpan(wi);
 		binWatches.find(otherWatch) != binWatches.size()
 	}
 
@@ -23,11 +23,11 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	{
 		debug_assert!(self.WLBinaryWatchExists(l, otherWatch));
 
-		let wi = &mut self.m_Watches[l as usize];
-		let binWatches = TSpanTULit::new(self.m_W.get_ptr(wi.m_WBInd.as_usize()).wrapping_add(wi.GetLongEntries()), wi.m_BinaryWatches.as_usize());
+		let binWatches = self.WLBinWatchesSpan(&self.m_Watches[l as usize]);
 		let it = binWatches.find(otherWatch);
 		binWatches.set(it, binWatches.back());
 
+		let wi = &mut self.m_Watches[l as usize];
 		debug_assert!(wi.m_BinaryWatches > Ind::ZERO);
 		wi.m_BinaryWatches -= Ind::ONE;
 	}
@@ -74,48 +74,35 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		usize::MAX
 	}
 
-	pub(crate) fn WLSetCached(&mut self, l: TULit, clsInd: Ind, cachedLit: TULit)
+	// The long watch #longWatchInd of l: [cached literal, clause index]
+	#[inline]
+	fn WLLongWatchPtr(&self, l: TULit, longWatchInd: usize) -> *mut TULit
 	{
-		// Go over the long watches
-		let wi = &self.m_Watches[l as usize];
-		let longWatches = wi.m_LongWatches.as_usize();
-		let mut currLongWatchInd: usize = 0;
-		let mut currLongWatchPtr = self.m_W.get_ptr(wi.m_WBInd.as_usize());
-		while currLongWatchInd < longWatches
-		{
-			let currClsInd = unsafe { Ind::read(currLongWatchPtr.add(1)) };
-			if currClsInd == clsInd
-			{
-				unsafe { *currLongWatchPtr = cachedLit };
-				return;
-			}
-			currLongWatchInd += 1;
-			currLongWatchPtr = currLongWatchPtr.wrapping_add(TWatchInfo::<Ind>::BinsInLong);
-		}
-
-		debug_assert!(false);
+		self.m_W.get_ptr(self.m_Watches[l as usize].m_WBInd.as_usize() + longWatchInd * TWatchInfo::<Ind>::BinsInLong)
 	}
 
+	// The C++ version repeats the search loop of WLGetLongWatchInd here
+	pub(crate) fn WLSetCached(&mut self, l: TULit, clsInd: Ind, cachedLit: TULit)
+	{
+		let longWatchInd = self.WLGetLongWatchInd(l, clsInd);
+		debug_assert!(longWatchInd != usize::MAX);
+		if longWatchInd != usize::MAX
+		{
+			// SAFETY: the long watch exists, so its entries are inside m_W
+			unsafe { *self.WLLongWatchPtr(l, longWatchInd) = cachedLit };
+		}
+	}
+
+	// The C++ version repeats the search loop of WLGetLongWatchInd here
 	pub(crate) fn WLReplaceInd(&mut self, l: TULit, clsInd: Ind, newClsInd: Ind)
 	{
-		// Go over the long watches
-		let wi = &self.m_Watches[l as usize];
-		let longWatches = wi.m_LongWatches.as_usize();
-		let mut currLongWatchInd: usize = 0;
-		let mut currLongWatchPtr = self.m_W.get_ptr(wi.m_WBInd.as_usize());
-		while currLongWatchInd < longWatches
+		let longWatchInd = self.WLGetLongWatchInd(l, clsInd);
+		debug_assert!(longWatchInd != usize::MAX);
+		if longWatchInd != usize::MAX
 		{
-			let currClsInd = unsafe { Ind::read(currLongWatchPtr.add(1)) };
-			if currClsInd == clsInd
-			{
-				unsafe { newClsInd.write(currLongWatchPtr.add(1)) };
-				return;
-			}
-			currLongWatchInd += 1;
-			currLongWatchPtr = currLongWatchPtr.wrapping_add(TWatchInfo::<Ind>::BinsInLong);
+			// SAFETY: as in WLSetCached
+			unsafe { newClsInd.write(self.WLLongWatchPtr(l, longWatchInd).add(1)) };
 		}
-
-		debug_assert!(false);
 	}
 
 	pub(crate) fn WLRemoveLongWatch(&mut self, l: TULit, longWatchInd: usize)
@@ -395,7 +382,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 			if binaryWatches != Ind::ZERO
 			{
-				let binWatches = self.m_W.get_span_cap_sz(wi.m_WBInd.as_usize() + wi.GetLongEntries(), wi.m_BinaryWatches.as_usize());
+				let binWatches = self.WLBinWatchesSpan(&wi);
 				for secondLit in binWatches
 				{
 					debug_assert!(secondLit != 0);
@@ -483,7 +470,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 			if binaryWatches != Ind::ZERO
 			{
-				let binWatches = self.m_W.get_span_cap_sz(wi.m_WBInd.as_usize() + wi.GetLongEntries(), wi.m_BinaryWatches.as_usize());
+				let binWatches = self.WLBinWatchesSpan(&wi);
 				for secondLit in binWatches
 				{
 					debug_assert!(secondLit != 0);
