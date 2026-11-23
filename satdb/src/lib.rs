@@ -59,7 +59,7 @@ pub mod pmap;
 pub mod query;
 pub mod rules;
 
-pub use db::{Attr, AttrId, AttrStats, Cardinality, Conn, Datom, Db, Eid, Entity, Error, Tx, TxReport, TxValue, Unique, Value, ValueType, T, TX_INSTANT};
+pub use db::{Attr, AttrId, AttrStats, Cardinality, Conn, Datom, Db, Eid, Entity, Error, Tx, TxLogEntry, TxReport, TxValue, Unique, Value, ValueType, T, TX_INSTANT};
 pub use parse::TextQuery;
 pub use planner::{Plan, PlanSource};
 pub use query::{Agg, Clause, Cmp, Find, Pull, PullValue, Pulled, Query, Term};

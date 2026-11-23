@@ -18,12 +18,19 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   * conflicting operations are errors: a datom both asserted and retracted, two values of a cardinality-one attribute, and a unique value
     that would belong to two entities after the transaction (checked on the result, so handing a value over in one transaction is fine);
   * every transaction is an entity with a `db/txInstant` supplied by the caller (`Tx::with_instant`; by default the previous instant;
-    it may not go backwards), which `Datom::tx` refers to and the transaction itself can annotate (`Entity::Tx`). `db/` names are reserved.
-* **History and time** (`src/db.rs`). The current indexes map each datom to the transaction that asserted it, and three append-only
-  history indexes (EAVT/AEVT/AVET order, keys ending in `(tx, added)`) keep every assertion and retraction, all persistent, so a past value
-  holds exactly the history up to its basis. Two views, each a cheap clone with a marker, filter the reads: `Db::history()` (every change, with
+    it may not go backwards), which `Datom::tx` refers to and the transaction itself can annotate (`Entity::Tx`). `db/` names are reserved;
+  * compare-and-swap (`Tx::cas(e, attr, expected, new)`, a cardinality-one attribute; `expected` None means no value) checks the value
+    before the transaction and fails the whole transaction with `Error::CasFailed` otherwise;
+  * schema alteration (`Tx::alter_attr`): an attribute's cardinality, uniqueness and component flag may change, not its value type.
+    The change is validated against the attribute's data before the transaction (cardinality one: no entity with two values; unique: no value
+    held by two entities), else `Error::AlterRefused`; the transaction's own data is then checked under the new schema. Past values keep their
+    schema, and the durable log records alterations like definitions.
+* **History and time** (`src/db.rs`). The current indexes map each datom to the transaction that asserted it, and four append-only
+  history indexes (EAVT/AEVT/AVET order with keys ending in `(tx, added)`, and the log in transaction order) keep every assertion and retraction,
+  all persistent, so a past value holds exactly the history up to its basis. Two views, each a cheap clone with a marker, filter the reads: `Db::history()` (every change, with
   its `added` flag; history statistics for the planner) and `Db::since(t)` (only the datoms of transactions after basis `t`, for every read,
   pull included); they compose. `Db::datoms(e, a, v)` scans a view; transacting against a view is an error.
+  `Db::tx_range(from, to)` reads the log: each transaction of the bases `from..to` with its entity and datoms (as Datomic's `tx-range`).
 * **Durability** (`src/log.rs`). `Conn::open(path)` backs a connection with an append-only log file (created if missing); `Conn::new()` stays in memory.
   * Each committed transaction is one record holding its *effect*: basis, transaction entity, the next entity id after it (tempids that
     unified away or only appear in `retract_entity` still use up ids), instant, the attributes it defined (with their ids), and the datoms
@@ -157,11 +164,11 @@ This is a start. What is missing, roughly in order of value:
   a floating-point value type (for a true `avg`, and `median`/`variance`). The cost model doesn't see inside `not` and `or`
   (a `not` has a fixed selectivity, a binding `or` the cost of its branches with nothing bound).
 * Time: `as_of` on a `Db` (today `Conn` keeps every past value; the history indexes would allow a filter instead) and by transaction
-  entity or instant, a transaction-log API (Datomic's `tx-range`), and the planner's estimates for a `since` view (it uses the whole database's).
+  entity or instant, and the planner's estimates for a `since` view (it uses the whole database's).
   In a history view, the current-state accessors (`values`, `lookup`, ...) still read the current datoms; only scans and queries see the history.
 * Pull: recursion limits (`...`), attribute options (defaults, limits, renaming) and pulling from a query's find spec.
-* Schema evolution (altering an attribute's cardinality or uniqueness, which needs validating the existing datoms); today a definition
-  that differs from the existing one is an `AttrConflict`. Also: transaction functions (e.g. CAS), and an Instant value type.
+* Schema: renaming attributes, altering the value type, and attribute retirement; user-defined transaction functions
+  (CAS is the only built-in); an Instant value type.
 * Planner scale beyond 16 clauses: the DP covers up to 16 clauses (20 would take up to 120 ms per refinement), and above that SAT
   ends 1-13% above the optimum after 200k conflicts and rarely proves it. The online refinement doesn't help there yet: on random
   24-clause queries (`cargo test --release online_refinement_budgets -- --ignored --nocapture`), no refinement after clauses 17 to 24
@@ -177,5 +184,5 @@ This is a start. What is missing, roughly in order of value:
 * Cost model: independence assumptions and fixed predicate selectivities; no histograms.
 * Storage: the transaction log is durable (`Conn::open`), but everything else is in memory. Opening replays the whole log, and `Conn`
   keeps every past value. Missing: index segments on disk (so opening doesn't replay everything and memory isn't bounded by the database),
-  checkpoints and compaction, Datomic's `tx-range` over the log, access by several processes (today one connection holds the file's lock),
+  checkpoints and compaction, access by several processes (today one connection holds the file's lock),
   and group commit (each transaction syncs on its own).

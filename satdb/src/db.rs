@@ -7,12 +7,14 @@
 //! A transaction is a *set* of assertions and retractions, all of them against the database before it (as in Datomic):
 //! their order doesn't matter, and operations that contradict each other are an error instead of "the last one wins".
 //! `transact` runs in phases:
-//! 1. The attribute definitions are applied.
+//! 1. The attribute definitions are applied, then the alterations (`Tx::alter_attr`: cardinality, uniqueness and the component flag may change,
+//!    validated against the attribute's current data).
 //! 2. Lookup refs (`[attr value]` of a unique attribute) resolve against the database before the transaction;
 //!    one that doesn't resolve is an error, even if the transaction itself asserts the value.
 //! 3. Tempids resolve: a tempid asserting a `Unique::Identity` value that some entity already has *upserts* to that entity,
 //!    and tempids asserting the same new identity value unify into one new entity (to a fixed point, as identity values may be refs to tempids).
-//!    The tempids that remain are allocated, after the transaction's own entity.
+//!    The tempids that remain are allocated, after the transaction's own entity. Then each compare-and-swap (`Tx::cas`) checks its entity's
+//!    value before the transaction against the expected one.
 //! 4. `retract_entity` expands into the entity's datoms, the datoms referring to it (through the VAET index) and, recursively,
 //!    the entities it owns through component attributes.
 //! 5. The conflicts are checked: a datom both asserted and retracted, two values of a cardinality-one attribute of an entity,
@@ -28,6 +30,7 @@
 //! * `since(t)`: every read sees only the datoms of the transactions after basis t (the transactions' entities increase with t).
 //!
 //! A view is the same value with a marker (a clone of a few `Arc`s); transacting against a view is an error.
+//! One more history index in transaction order is the log (`tx_range`).
 //!
 //! # Durability
 //! `Conn::open` backs a connection with a log file (see `log`): each committed transaction's effect (`TxRecord`: its entity, the next entity id,
@@ -189,6 +192,18 @@ pub struct Datom
 	pub added: bool,
 }
 
+/// One transaction of the log (`Db::tx_range`)
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct TxLogEntry
+{
+	/// The basis the transaction produced
+	pub t: T,
+	/// The transaction's entity
+	pub tx: Eid,
+	/// Its datoms (its `db/txInstant` included), in EAV order
+	pub data: Vec<Datom>,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Error
 {
@@ -217,6 +232,10 @@ pub enum Error
 	CardinalityConflict { e: Eid, attr: String, values: (Value, Value) },
 	/// A transaction instant before the previous transaction's
 	InstantBackwards { previous: i64, got: i64 },
+	/// A schema alteration (`Tx::alter_attr`) that the attribute or its current data don't allow, with the reason
+	AlterRefused { attr: String, reason: String },
+	/// A compare-and-swap (`Tx::cas`) whose entity's value of the attribute before the transaction isn't the expected one (None: no value)
+	CasFailed { e: Eid, attr: String, expected: Option<Value>, found: Option<Value> },
 	/// A transaction against a history or `since` view, or a pull from a history view
 	FilteredDb,
 	/// A variable that must be bound (by a predicate, a `not`, a filtering `or`, or the find list) but that no clause binds before it is needed
@@ -258,6 +277,8 @@ impl fmt::Display for Error
 			Error::AddRetractConflict { e, attr, value } => write!(f, "[{e} {attr} {value:?}] is both asserted and retracted"),
 			Error::CardinalityConflict { e, attr, values } => write!(f, "entity {e} gets two values of {attr}: {:?} and {:?}", values.0, values.1),
 			Error::InstantBackwards { previous, got } => write!(f, "transaction instant {got} is before the previous one, {previous}"),
+			Error::AlterRefused { attr, reason } => write!(f, "attribute {attr} can't be altered: {reason}"),
+			Error::CasFailed { e, attr, expected, found } => write!(f, "compare-and-swap of {attr} of entity {e}: expected {expected:?}, found {found:?}"),
 			Error::FilteredDb => write!(f, "a history or since view can't be transacted against, and a history view can't be pulled from"),
 			Error::Unbound(v) => write!(f, "variable {v} is not bound where it is needed"),
 			Error::Planner(m) => write!(f, "planner error: {m}"),
@@ -298,6 +319,8 @@ pub struct Db
 	heavt: PSet<(Eid, AttrId, Value, Eid, bool)>,
 	haevt: PSet<(AttrId, Eid, Value, Eid, bool)>,
 	havet: PSet<(AttrId, Value, Eid, Eid, bool)>,
+	/// The log: the history in transaction order, (tx, e, a, v, added)
+	tlog: PSet<(Eid, Eid, AttrId, Value, bool)>,
 	/// The statistics of the history (distinct entities and values ever)
 	hstats: PMap<AttrId, AttrStats>,
 	/// The transaction entity of each basis t
@@ -387,6 +410,8 @@ enum Op
 	/// (asserted, entity, attribute, value)
 	Datom(bool, Entity, Arc<str>, TxValue),
 	RetractEntity(Entity),
+	/// (entity, attribute, expected value before the transaction, new value)
+	Cas(Entity, Arc<str>, Option<TxValue>, TxValue),
 }
 
 /// A transaction: attribute definitions (applied first), then a set of assertions and retractions (see the module documentation)
@@ -397,6 +422,7 @@ pub struct Tx
 	temps: u32,
 	lookups: Vec<(Arc<str>, Value)>,
 	defs: Vec<Attr>,
+	alters: Vec<Attr>,
 	ops: Vec<Op>,
 	instant: Option<i64>,
 }
@@ -406,7 +432,7 @@ impl Default for Tx
 	fn default() -> Self
 	{
 		static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-		Tx { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), temps: 0, lookups: Vec::new(), defs: Vec::new(), ops: Vec::new(), instant: None }
+		Tx { id: NEXT_ID.fetch_add(1, Ordering::Relaxed), temps: 0, lookups: Vec::new(), defs: Vec::new(), alters: Vec::new(), ops: Vec::new(), instant: None }
 	}
 }
 
@@ -440,6 +466,23 @@ impl Tx
 	pub fn define_attr(&mut self, attr: Attr) -> &mut Self
 	{
 		self.defs.push(attr);
+		self
+	}
+
+	/// Alter an existing attribute (named by `attr.name`) to `attr`: its cardinality, uniqueness and component flag may change, its value type may not.
+	/// The change is validated against the attribute's data before the transaction (applied after the definitions, before the data):
+	/// cardinality one needs at most one value per entity, uniqueness at most one entity per value
+	pub fn alter_attr(&mut self, attr: Attr) -> &mut Self
+	{
+		self.alters.push(attr);
+		self
+	}
+
+	/// Compare-and-swap: assert `new` as the value of the cardinality-one attribute `attr` of `e`, provided that its value before the transaction
+	/// is `expected` (None: no value), else the transaction fails with `Error::CasFailed`
+	pub fn cas(&mut self, e: Entity, attr: &str, expected: Option<TxValue>, new: impl Into<TxValue>) -> &mut Self
+	{
+		self.ops.push(Op::Cas(e, attr.into(), expected, new.into()));
 		self
 	}
 
@@ -527,7 +570,8 @@ impl TxReport
 	pub(crate) fn record(&self) -> TxRecord
 	{
 		let (before, after) = (&self.db_before, &self.db_after);
-		let attrs = (before.attrs.len()..after.attrs.len()).map(|a| (a as AttrId, after.attr(a as AttrId).clone())).collect();
+		// The attributes the transaction defined or altered
+		let attrs = (0..after.attrs.len() as AttrId).filter(|&a| before.try_attr(a) != Some(after.attr(a))).map(|a| (a, after.attr(a).clone())).collect();
 		let instant = match self.tx_data[0].v
 		{
 			Value::Int(i) => i,
@@ -644,6 +688,7 @@ impl Db
 			heavt: PMap::new(),
 			haevt: PMap::new(),
 			havet: PMap::new(),
+			tlog: PMap::new(),
 			hstats: PMap::new(),
 			txs: PMap::new(),
 			history: false,
@@ -678,6 +723,19 @@ impl Db
 	pub fn tx_of(&self, t: T) -> Option<Eid>
 	{
 		self.txs.get(&t).copied()
+	}
+
+	/// The log: the transactions that produced the bases `from..to` (clipped to this value's history), each with its datoms.
+	/// It reads the whole history up to this value's basis, whatever the view
+	pub fn tx_range(&self, from: T, to: T) -> Vec<TxLogEntry>
+	{
+		(from.max(1)..to.min(self.basis_t + 1))
+			.map(|t| {
+				let tx = self.tx_of(t).expect("every basis up to this one has a transaction");
+				let data = self.tlog.seek(|k| k.0 < tx).take_while(|(k, _)| k.0 == tx).map(|(k, _)| Datom { e: k.1, a: k.2, v: k.3.clone(), tx, added: k.4 }).collect();
+				TxLogEntry { t, tx, data }
+			})
+			.collect()
 	}
 
 	/// The history view of this database: queries (and `datoms`) see every assertion and retraction up to its basis, with their `added` flags.
@@ -802,6 +860,10 @@ impl Db
 		{
 			db.define(def)?;
 		}
+		for def in &tx.alters
+		{
+			db.alter(def)?;
+		}
 		let instant = tx.instant.unwrap_or(self.instant);
 		if instant < self.instant
 		{
@@ -829,23 +891,11 @@ impl Db
 				_ => Err(Error::ForeignEntity(e)),
 			}
 		};
-		let mut ops = Vec::new();
-		let mut doomed = Vec::new();
-		for op in &tx.ops
+		let val = |a: AttrId, v: &TxValue| -> Result<ResVal, Error>
 		{
-			let (added, e, attr, v) = match op
-			{
-				Op::Datom(added, e, attr, v) => (*added, e, attr, v),
-				Op::RetractEntity(e) =>
-				{
-					doomed.push(ent(*e)?);
-					continue;
-				}
-			};
-			let a = db.attr_id(attr).ok_or_else(|| Error::UnknownAttr(attr.to_string()))?;
 			let def = db.attr(a);
-			let mismatch = |got: ValueType| Error::TypeMismatch { attr: attr.to_string(), expected: def.value_type, got };
-			let v = match v
+			let mismatch = |got: ValueType| Error::TypeMismatch { attr: def.name.to_string(), expected: def.value_type, got };
+			Ok(match v
 			{
 				TxValue::Val(v) if v.value_type() != def.value_type => return Err(mismatch(v.value_type())),
 				TxValue::Val(Value::Ref(r)) => ResVal::Val(Value::Ref(self.check_eid(*r)?)),
@@ -856,8 +906,35 @@ impl Db
 					Res::Eid(x) => ResVal::Val(Value::Ref(x)),
 					Res::Temp(t) => ResVal::Temp(t),
 				},
-			};
-			ops.push(ResOp { added, e: ent(*e)?, a, v });
+			})
+		};
+		let attr_of = |attr: &str| db.attr_id(attr).ok_or_else(|| Error::UnknownAttr(attr.to_string()));
+		let mut ops = Vec::new();
+		let mut doomed = Vec::new();
+		// The compare-and-swaps' checks: (entity, attribute, expected value), checked once the tempids are allocated
+		let mut checks = Vec::new();
+		for op in &tx.ops
+		{
+			match op
+			{
+				Op::Datom(added, e, attr, v) =>
+				{
+					let a = attr_of(attr)?;
+					ops.push(ResOp { added: *added, e: ent(*e)?, a, v: val(a, v)? });
+				}
+				Op::RetractEntity(e) => doomed.push(ent(*e)?),
+				Op::Cas(e, attr, expected, new) =>
+				{
+					let a = attr_of(attr)?;
+					if db.attr(a).cardinality != Cardinality::One
+					{
+						return Err(Error::InvalidSchema(format!("{attr} (compare-and-swap needs a cardinality-one attribute)")));
+					}
+					let e = ent(*e)?;
+					checks.push((e, a, expected.as_ref().map(|x| val(a, x)).transpose()?));
+					ops.push(ResOp { added: true, e, a, v: val(a, new)? });
+				}
+			}
 		}
 
 		// Phase 3: upserts and tempid unification, to a fixed point (every round only merges classes or upserts one)
@@ -921,6 +998,21 @@ impl Db
 			Res::Eid(x) => x,
 			Res::Temp(t) => tempids[t as usize],
 		};
+		// The compare-and-swaps, against the data before the transaction (a new entity has no values)
+		for (e, a, expected) in checks
+		{
+			let e = eid(e);
+			let expected = expected.map(|v| match v
+			{
+				ResVal::Val(v) => v,
+				ResVal::Temp(t) => Value::Ref(tempids[t as usize]),
+			});
+			let found = self.values(e, a).next().cloned();
+			if found != expected
+			{
+				return Err(Error::CasFailed { e, attr: db.attr_name(a), expected, found });
+			}
+		}
 
 		let mut adds = BTreeSet::new();
 		let mut rets = BTreeSet::new();
@@ -1017,6 +1109,53 @@ impl Db
 		}
 	}
 
+	// Alter an existing attribute, validated against its current data
+	fn alter(&mut self, def: &Attr) -> Result<(), Error>
+	{
+		let a = self.attr_id(&def.name).ok_or_else(|| Error::UnknownAttr(def.name.to_string()))?;
+		let refuse = |reason: String| Err(Error::AlterRefused { attr: def.name.to_string(), reason });
+		let old = self.attr(a);
+		if def.name.starts_with("db/")
+		{
+			return Err(Error::Reserved(def.name.to_string()));
+		}
+		if def.value_type != old.value_type
+		{
+			return refuse(format!("its value type is {:?} and can't change", old.value_type));
+		}
+		if def.component && def.value_type != ValueType::Ref
+		{
+			return Err(Error::InvalidSchema(def.name.to_string()));
+		}
+		if def.cardinality == Cardinality::One && old.cardinality == Cardinality::Many
+		{
+			// The AEVT order puts an entity's values together
+			let mut prev: Option<(Eid, &Value)> = None;
+			for (e, v) in self.attr_datoms(a)
+			{
+				if let Some((p, pv)) = prev.filter(|p| p.0 == e)
+				{
+					return refuse(format!("entity {p} has two values, {pv:?} and {v:?}"));
+				}
+				prev = Some((e, v));
+			}
+		}
+		if def.unique.is_some() && old.unique.is_none()
+		{
+			let mut prev: Option<(&Value, Eid)> = None;
+			for ((_, v, e), _) in self.avet.seek(|k| k.0 < a).take_while(|(k, _)| k.0 == a)
+			{
+				if let Some((pv, p)) = prev.filter(|p| p.0 == v)
+				{
+					return refuse(format!("entities {p} and {e} have the same value {pv:?}"));
+				}
+				prev = Some((v, *e));
+			}
+		}
+		self.attrs = self.attrs.insert(a, def.clone());
+		Ok(())
+	}
+
 	fn add_attr(&mut self, def: Attr)
 	{
 		let a = self.attrs.len() as AttrId;
@@ -1068,8 +1207,19 @@ impl Db
 			return Err(format!("instant {} before {}", rec.instant, self.instant));
 		}
 		let mut db = self.clone();
+		if rec.attrs.windows(2).any(|w| w[0].0 >= w[1].0)
+		{
+			return Err("the attributes are not in strictly increasing id order".into());
+		}
 		for (a, def) in &rec.attrs
 		{
+			// An existing id under its own name is an alteration, the next id under a new name a definition
+			let altered = db.try_attr(*a).is_some_and(|old| old.name == def.name && old != def);
+			if altered
+			{
+				db.alter(def).map_err(|e| e.to_string())?;
+				continue;
+			}
 			if *a as usize != db.attrs.len() || db.attr_id(&def.name).is_some()
 			{
 				return Err(format!("attribute {} defined as id {a}, when the next id is {}", def.name, db.attrs.len()));
@@ -1170,6 +1320,7 @@ impl Db
 		self.heavt = self.heavt.insert((e, a, v.clone(), tx, added), ());
 		self.haevt = self.haevt.insert((a, e, v.clone(), tx, added), ());
 		self.havet = self.havet.insert((a, v.clone(), e, tx, added), ());
+		self.tlog = self.tlog.insert((tx, e, a, v.clone(), added), ());
 	}
 }
 
@@ -2051,6 +2202,7 @@ pub(crate) mod tests
 		assert_eq!(all(&x.heavt), all(&y.heavt), "{what}");
 		assert_eq!(all(&x.haevt), all(&y.haevt), "{what}");
 		assert_eq!(all(&x.havet), all(&y.havet), "{what}");
+		assert_eq!(all(&x.tlog), all(&y.tlog), "{what}");
 	}
 
 	/// The current datoms that a transaction log leaves, with the transaction that asserted each
@@ -2151,5 +2303,131 @@ pub(crate) mod tests
 		{
 			assert!(log.iter().filter(|d| d.a == *a && !d.added).count() >= 3, "too few retractions of {}", last.attr(*a).name);
 		}
+	}
+
+	#[test]
+	fn cas_compares_against_the_database_before_the_transaction()
+	{
+		let (mut conn, r) = people();
+		let (alice, bob) = (Entity::Id(r.tempids[0]), Entity::Id(r.tempids[1]));
+		let age = conn.db().attr_id("person/age").unwrap();
+		let cas = |e: Entity, expected: Option<i64>, new: i64| {
+			let mut tx = Tx::new();
+			tx.cas(e, "person/age", expected.map(TxValue::from), new);
+			tx
+		};
+		conn.transact(&cas(alice, Some(30), 31)).unwrap();
+		assert_eq!(conn.db().values(r.tempids[0], age).collect::<Vec<_>>(), vec![&Value::Int(31)]);
+		let failed = Error::CasFailed { e: r.tempids[0], attr: "person/age".into(), expected: Some(Value::Int(30)), found: Some(Value::Int(31)) };
+		assert_eq!(conn.transact(&cas(alice, Some(30), 32)).err(), Some(failed));
+		// No value expected: an entity without one, and a new entity
+		conn.transact(&cas(bob, None, 20)).unwrap();
+		assert!(matches!(conn.transact(&cas(bob, None, 21)), Err(Error::CasFailed { found: Some(Value::Int(20)), .. })));
+		let mut tx = Tx::new();
+		let t = tx.temp();
+		tx.cas(t, "person/age", None, 5);
+		let r2 = conn.transact(&tx).unwrap();
+		assert_eq!(conn.db().values(r2.tempids[0], age).next(), Some(&Value::Int(5)));
+		// Two swaps of one value in one transaction are two values of a cardinality-one attribute
+		let mut tx = cas(alice, Some(31), 40);
+		tx.add(alice, "person/age", 41);
+		assert!(matches!(conn.transact(&tx), Err(Error::CardinalityConflict { .. })));
+		// The attribute must be cardinality-one, and the values of its type
+		let mut tx = Tx::new();
+		tx.cas(alice, "person/friend", None, bob);
+		assert!(matches!(conn.transact(&tx), Err(Error::InvalidSchema(_))));
+		let mut tx = Tx::new();
+		tx.cas(alice, "person/age", Some("old".into()), 1);
+		assert!(matches!(conn.transact(&tx), Err(Error::TypeMismatch { .. })));
+		assert_eq!(conn.db().values(r.tempids[0], age).collect::<Vec<_>>(), vec![&Value::Int(31)]);
+	}
+
+	#[test]
+	fn alter_attr_validates_against_the_data()
+	{
+		let (mut conn, r) = people();
+		let (alice, bob) = (Entity::Id(r.tempids[0]), Entity::Id(r.tempids[1]));
+		let alter = |attr: Attr| {
+			let mut tx = Tx::new();
+			tx.alter_attr(attr);
+			tx
+		};
+		let friend_one = Attr::new("person/friend", ValueType::Ref, Cardinality::One);
+		// Cardinality one: refused while an entity has two values
+		let mut tx = Tx::new();
+		tx.add(alice, "person/friend", alice);
+		conn.transact(&tx).unwrap();
+		assert!(matches!(conn.transact(&alter(friend_one.clone())), Err(Error::AlterRefused { .. })));
+		let mut tx = Tx::new();
+		tx.retract(alice, "person/friend", alice);
+		conn.transact(&tx).unwrap();
+		let before = conn.db().basis_t();
+		conn.transact(&alter(friend_one.clone())).unwrap();
+		let friend = conn.db().attr_id("person/friend").unwrap();
+		assert_eq!(conn.db().attr(friend).cardinality, Cardinality::One);
+		assert_eq!(conn.as_of(before).unwrap().attr(friend).cardinality, Cardinality::Many);
+		// ... and from then on a new value replaces the old one
+		let mut tx = Tx::new();
+		tx.add(alice, "person/friend", alice);
+		conn.transact(&tx).unwrap();
+		assert_eq!(conn.db().values(r.tempids[0], friend).collect::<Vec<_>>(), vec![&Value::Ref(r.tempids[0])]);
+
+		// Uniqueness: refused while two entities share a value; then upserts and lookups work
+		let age_unique = Attr::new("person/age", ValueType::Int, Cardinality::One).unique(Unique::Identity);
+		let mut tx = Tx::new();
+		tx.add(bob, "person/age", 30);
+		conn.transact(&tx).unwrap();
+		assert!(matches!(conn.transact(&alter(age_unique.clone())), Err(Error::AlterRefused { .. })));
+		let mut tx = Tx::new();
+		tx.add(bob, "person/age", 40);
+		conn.transact(&tx).unwrap();
+		conn.transact(&alter(age_unique.clone())).unwrap();
+		let mut tx = Tx::new();
+		let t = tx.temp();
+		tx.add(t, "person/age", 30).add(t, "person/name", "Alice A.");
+		assert_eq!(conn.transact(&tx).unwrap().tempids[0], r.tempids[0]);
+		assert_eq!(conn.db().lookup("person/age", &Value::Int(40)).unwrap(), Some(r.tempids[1]));
+		// An alteration and data in one transaction: the data is checked under the new schema
+		let badge_plain = Attr::new("person/badge", ValueType::Int, Cardinality::One);
+		let mut tx = Tx::new();
+		tx.alter_attr(badge_plain).add(bob, "person/badge", 1);
+		conn.transact(&tx).unwrap();
+		let badge = conn.db().attr_id("person/badge").unwrap();
+		assert_eq!(conn.db().entities(badge, &Value::Int(1)).count(), 2);
+
+		// What can't change
+		assert!(matches!(conn.transact(&alter(Attr::new("person/age", ValueType::Str, Cardinality::One))), Err(Error::AlterRefused { .. })));
+		assert!(matches!(conn.transact(&alter(Attr::new("person/age", ValueType::Int, Cardinality::One).component())), Err(Error::InvalidSchema(_))));
+		assert!(matches!(conn.transact(&alter(Attr::new("nope", ValueType::Int, Cardinality::One))), Err(Error::UnknownAttr(_))));
+		assert!(matches!(conn.transact(&alter(Attr::new(TX_INSTANT, ValueType::Int, Cardinality::Many))), Err(Error::Reserved(_))));
+		// An alteration is recorded for the durable log, and replays to the same value
+		let mut tx = Tx::new();
+		tx.alter_attr(Attr::new("person/email", ValueType::Str, Cardinality::One));
+		let rep = conn.transact(&tx).unwrap();
+		let email = conn.db().attr_id("person/email").unwrap();
+		assert_eq!(rep.record().attrs, vec![(email, Attr::new("person/email", ValueType::Str, Cardinality::One))]);
+		assert_same_db(&rep.db_before.replay(&rep.record()).unwrap(), &rep.db_after, "replayed alteration");
+	}
+
+	#[test]
+	fn tx_range_matches_the_reports()
+	{
+		let (conn, reports) = random_conn(31, 40);
+		let db = conn.db();
+		let log = db.tx_range(0, T::MAX);
+		assert_eq!(log.len(), reports.len());
+		for (entry, r) in log.iter().zip(&reports)
+		{
+			assert_eq!((entry.t, entry.tx), (r.db_after.basis_t(), r.tx));
+			let mut want = r.tx_data.clone();
+			want.sort_by(|x, y| (x.e, x.a, &x.v, x.added).cmp(&(y.e, y.a, &y.v, y.added)));
+			assert_eq!(entry.data, want);
+		}
+		// A range, a past value's log, and the views
+		assert_eq!(db.tx_range(5, 8), log[4..7].to_vec());
+		assert_eq!(conn.as_of(10).unwrap().tx_range(0, T::MAX), log[..10].to_vec());
+		assert_eq!(db.history().tx_range(3, 4), log[2..3].to_vec());
+		assert_eq!(db.since(20).unwrap().tx_range(0, T::MAX), log);
+		assert!(db.tx_range(9, 9).is_empty() && db.tx_range(db.basis_t() + 1, T::MAX).is_empty());
 	}
 }

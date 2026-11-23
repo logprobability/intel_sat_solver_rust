@@ -474,6 +474,10 @@ mod tests
 		let (gone, target) = (tx.temp(), tx.temp());
 		tx.retract_entity(gone).add(Entity::Tx, "note", "défini \"ici\"\n").add(Entity::Tx, "ref", target).with_instant(5000);
 		out.push(conn.transact(&tx).unwrap());
+		// A schema alteration and a compare-and-swap
+		let mut tx = Tx::new();
+		tx.alter_attr(Attr::new("note", ValueType::Str, Cardinality::One)).cas(Entity::Tx, "n", None, 3);
+		out.push(conn.transact(&tx).unwrap());
 		out.push(conn.transact(&Tx::new()).unwrap());
 		let mut tx = Tx::new();
 		tx.add(Entity::Tx, "n", 1).add(Entity::Tx, "n", 2);
