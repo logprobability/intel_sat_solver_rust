@@ -25,3 +25,10 @@ Run any script without parameters to see its usage instructions.
 
 - **`fuzz_and_verify_parallel.csh`**  
   Fuzzes incremental instances and verifies IntelSAT in parallel.  
+
+- **`queue.sh`**  
+  Runs a command (a build, a test run, a solver run) as the only heavy job on the machine, waiting its turn first; see `CLAUDE.md`.  
+  Requires task-spooler (`brew install task-spooler`).  
+
+- **`queue_status.sh`**  
+  Shows what is running and what is waiting in that queue.  
