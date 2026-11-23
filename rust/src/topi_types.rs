@@ -771,7 +771,17 @@ impl TCompressedClss
 			{
 				return std::ptr::null_mut();
 			}
-			self.m_Table[i as usize] = Box::into_raw(Box::new(CBitArray::new()));
+			// Box::new would abort on an allocation failure, so the box is allocated by hand (erase releases it with Box::from_raw, which expects this very layout)
+			let layout = std::alloc::Layout::new::<CBitArray>();
+			// SAFETY: CBitArray isn't zero-sized, so the layout is valid for alloc
+			let p = unsafe { std::alloc::alloc(layout) } as *mut CBitArray;
+			if p.is_null()
+			{
+				return std::ptr::null_mut();
+			}
+			// SAFETY: p is a fresh allocation, which is suitably sized and aligned for a CBitArray
+			unsafe { p.write(CBitArray::new()) };
+			self.m_Table[i as usize] = p;
 			self.m_Size += 1;
 		}
 		self.m_Table[i as usize]

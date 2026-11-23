@@ -822,9 +822,16 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 									}
 								}
 
-								// A failure to allocate inside a standard vector aborts in Rust, hence there is no counterpart to the C++ catch block, which sets STATUS_ALLOC_FAILED
+								// try_reserve is the counterpart of the C++ catch block (a plain push would abort on an allocation failure)
 								let parentSubsumed = TParentSubsumed::new(self.GetAssignedLitForVar(v), self.m_AssignmentInfo[v as usize].IsAssignedBinary(), self.m_VarInfo[v as usize].m_ParentClsInd);
-								self.m_VarsParentSubsumed.push(parentSubsumed);
+								if self.m_VarsParentSubsumed.try_reserve(1).is_ok()
+								{
+									self.m_VarsParentSubsumed.push(parentSubsumed);
+								}
+								else
+								{
+									self.SetStatus(TToporStatus::STATUS_ALLOC_FAILED, "m_VarsParentSubsumed.push_back allocation failure".to_string());
+								}
 
 								if self.IsUnrecoverable()
 								{
