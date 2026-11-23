@@ -4,6 +4,7 @@
 use crate::topor_dyn_array::{CDynArray, Span};
 use std::ops::{Deref, DerefMut};
 
+#[derive(Clone)]
 pub struct CVector<T: Copy>
 {
 	m_par: CDynArray<T>,
@@ -34,14 +35,6 @@ impl<T: Copy> Default for CVector<T>
 	fn default() -> Self
 	{
 		CVector::new(0, 0)
-	}
-}
-
-impl<T: Copy> Clone for CVector<T>
-{
-	fn clone(&self) -> Self
-	{
-		CVector { m_par: self.m_par.clone(), m_Next: self.m_Next }
 	}
 }
 

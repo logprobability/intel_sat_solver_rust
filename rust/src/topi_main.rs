@@ -7,18 +7,17 @@ use crate::{ReserveExactly};
 use std::io::Write;
 use std::sync::atomic::Ordering;
 
-extern "C"
-{
-	// The C library's pseudo-random generator, used by the C++ version
-	fn rand() -> std::ffi::c_int;
-}
+// time_t is long on the supported Unix platforms (glibc and macOS)
+#[cfg(unix)]
+type time_t = std::ffi::c_long;
 
 #[cfg(unix)]
 extern "C"
 {
-	fn time(tloc: *mut i64) -> i64;
-	// Returns struct tm*, which starts with the int fields: tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year
-	fn localtime(timep: *const i64) -> *const std::ffi::c_int;
+	fn time(tloc: *mut time_t) -> time_t;
+	// Fills result (a struct tm, which starts with the int fields: tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year) and returns it, or null on failure;
+	// unlike localtime, it doesn't share a static buffer, so solvers in different threads don't race
+	fn localtime_r(timep: *const time_t, result: *mut std::ffi::c_int) -> *mut std::ffi::c_int;
 }
 
 // operator<< for a double with the default ostream formatting (that is, %g with 6 significant digits)
@@ -89,11 +88,13 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		ss += &format!("{:p}_{}_", self as *const Self, std::process::id());
 
 		#[cfg(unix)]
+		// SAFETY: tmBuf is larger than struct tm (56 bytes on the supported platforms) and as aligned; localtime_r only writes into it
 		unsafe
 		{
-			let mut now: i64 = 0;
+			let mut now: time_t = 0;
 			time(&mut now);
-			let current = localtime(&now);
+			let mut tmBuf = [0i64; 8];
+			let current: *const std::ffi::c_int = localtime_r(&now, tmBuf.as_mut_ptr().cast());
 			if !current.is_null()
 			{
 				let (tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year) = (*current, *current.add(1), *current.add(2), *current.add(3), *current.add(4), *current.add(5));
@@ -124,14 +125,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		};
 
 		// getline: the lines are separated by '\n'; there is no line after the last '\n'
-		let mut lines: Vec<&str> = tcf.split('\n').collect();
-		if lines.last() == Some(&"")
-		{
-			lines.pop();
-		}
-
 		let mut lineNum: u32 = 1;
-		for paramSetting in lines
+		for paramSetting in tcf.split_terminator('\n')
 		{
 			let SetErrStatus = |topi: &Self, reason: &str|
 			{
@@ -190,9 +185,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 		fn HandleContextParam(paramName: &str, newVal: f64, contextParamPrefix: &str, paramVals: &mut Vec<(String, f64)>) -> bool
 		{
-			if paramName.starts_with(contextParamPrefix)
+			if let Some(paramNameInContext) = paramName.strip_prefix(contextParamPrefix)
 			{
-				paramVals.push((paramName[contextParamPrefix.len()..].to_string(), newVal));
+				paramVals.push((paramNameInContext.to_string(), newVal));
 				return true;
 			}
 			false
@@ -465,10 +460,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	// ProcessDelayedImplication(diL, otherWatch, parentClsInd, cis), where cis is a local empty vector (rather than m_Cis)
 	fn ProcessDelayedImplicationLocalCis(&mut self, diL: TULit, otherWatch: TULit, parentClsInd: Ind)
 	{
-		let mut cis: CVector<TContradictionInfo<Ind>> = CVector::new(0, 0);
-		std::mem::swap(&mut self.m_Cis, &mut cis);
+		let savedCis = std::mem::take(&mut self.m_Cis);
 		self.ProcessDelayedImplication(diL, otherWatch, parentClsInd);
-		std::mem::swap(&mut self.m_Cis, &mut cis);
+		self.m_Cis = savedCis;
 	}
 
 	fn AddUserClauseBody(&mut self, c: &[TLit], lastExistingVarStart: TUVar, isSuccess: &mut bool, boostScores: &mut bool)
@@ -1017,11 +1011,11 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			if !self.m_AxePrinted
 			{
 				self.PrintAxe();
-				println!("{}{}{}{}{}{}", print_as_color("c Literal bit-width= ", ansi_color_code::blue), print_as_color((std::mem::size_of::<TLit>() << 3).to_string(), ansi_color_code::blue),
+				stdout_println!("{}{}{}{}{}{}", print_as_color("c Literal bit-width= ", ansi_color_code::blue), print_as_color((std::mem::size_of::<TLit>() << 3).to_string(), ansi_color_code::blue),
 					print_as_color("; Clause-index bit-width= ", ansi_color_code::blue), print_as_color((Ind::DIGITS as usize).to_string(), ansi_color_code::blue),
 					print_as_color("; Compress = ", ansi_color_code::blue), print_as_color(if Compress { "1" } else { "0" }, ansi_color_code::blue));
 			}
-			print!("{}", self.m_Params.GetAllParamsCurrValues());
+			stdout_print!("{}", self.m_Params.GetAllParamsCurrValues());
 		}
 
 		self.m_Stat.NewSolveInvocation(self.m_QueryCurr == TQueryType::QUERY_INC_SHORT);
@@ -1061,7 +1055,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	{
 		let solveInvs = self.m_Stat.m_SolveInvs;
 		// Invoked only if the DRAT file exists
-		let isGood = write!(self.m_OpenedDratFile.as_mut().unwrap(), "c query completed {}\n", solveInvs).is_ok();
+		let isGood = writeln!(self.m_OpenedDratFile.as_mut().unwrap(), "c query completed {}", solveInvs).is_ok();
 		if !isGood
 		{
 			self.OnBadDratFile();
@@ -1092,7 +1086,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 		if self.m_Params.m_ParamVerbosity.get() > 0
 		{
-			print!("{}", self.StatStrShort(false));
+			stdout_print!("{}", self.StatStrShort(false));
 		}
 
 		if self.m_Stat.m_SolveInvs == self.m_Params.m_ParamPrintDebugModelInvocation.get() as u64
@@ -1220,7 +1214,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		}
 
 		ReserveExactly!(self, self.m_E2ILitMap, self.m_Stat.m_MaxUserVar as usize + 1, "m_E2IVarMap in Solve");
-		self.ReserveVarAndLitData(userAssumps.len() - (userAssumps.len() > 0 && *userAssumps.last().unwrap() == 0) as usize);
+		self.ReserveVarAndLitData(userAssumps.len() - (userAssumps.last() == Some(&0)) as usize);
 		self.ClsDeletionInit();
 		self.RestartInit();
 		self.DecisionInit();
@@ -1230,7 +1224,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		{
 			ReturnTrv!(self.UnrecStatusToRetVal());
 		}
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(false));
+		debug_assert!(!self.AssertConsistencyOn(2) || self.WLAssertConsistency(false));
 
 		let mut pi = self.BCP();
 		if self.IsUnrecoverable()
@@ -1286,7 +1280,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 		if self.m_Params.m_ParamVerbosity.get() > 0
 		{
-			print!("{}", self.StatStrShort(false));
+			stdout_print!("{}", self.StatStrShort(false));
 		}
 
 		self.m_DecLevelOfLastAssignedAssumption = if self.m_Assumps.cap() == 0
@@ -1306,7 +1300,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			{
 				if !currAi.m_IsAssigned()
 				{
-					currAi.set_m_IsNegated(if self.m_Params.m_ParamInitPolarityStrat.get() == 0 { true } else { (unsafe { rand() }) % 2 != 0 });
+					currAi.set_m_IsNegated(if self.m_Params.m_ParamInitPolarityStrat.get() == 0 { true } else { rand() % 2 != 0 });
 				}
 			}
 			self.m_PrevAiCap = self.m_AssignmentInfo.cap();
@@ -1348,11 +1342,11 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			debug_assert!(l != BadULit);
 			debug_assert!(self.NV(2) || self.P(&("***** Decision at level ".to_string() + &self.m_DecLevel.to_string() + ": " + &self.SLit(l) + "\n")));
 
-			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
+			debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
 			let isContraditory = self.Assign(l, Self::BadClsInd, BadULit, self.m_DecLevel, true, false);
 			debug_assert!(!isContraditory);
 			let _ = isContraditory;
-			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 1 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.TrailAssertConsistency());
+			debug_assert!(!self.AssertConsistencyOn(1) || self.TrailAssertConsistency());
 
 			let mut contradictionInfo = self.BCP();
 			let isContradictionBeforeConflictAnalysis = contradictionInfo.IsContradiction();
@@ -1491,7 +1485,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		// This is in order not to crash when the user asks for a value beyond m_MaxUserVar,
 		// which can legally happen (e.g., consider the input {4 0} {4 5 6 7 0})
 
-		if ExternalLit2ExternalVar(l) > self.m_Stat.m_MaxUserVar
+		if ExternalLit2ExternalVar(l) > self.m_Stat.m_MaxUserVar || !self.IsE2IInBounds(l)
 		{
 			return TToporLitVal::VAL_DONT_CARE;
 		}
@@ -1520,6 +1514,12 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 	pub fn GetLitDecLevel(&self, l: TLit) -> TLit
 	{
+		// The C++ version reads beyond the literal map for an unknown literal; 0 is returned instead
+		if !self.IsE2IInBounds(l)
+		{
+			return 0;
+		}
+
 		let litInternal = self.E2I(l);
 		debug_assert!(litInternal < self.GetNextLit());
 
@@ -1614,7 +1614,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 	pub(crate) fn PrintAxe(&mut self)
 	{
-		print!("\
+		stdout_print!("\
 c Intel(R) SAT Solver by Alexander Nadel\n\
 c          A\n\
 c         /!\\\n\
@@ -1812,7 +1812,7 @@ c         | |\n");
 		{
 			overallSzInMb += ssPair.1;
 		}
-		name2MbVec.sort_by(|i1, i2| i2.1.cmp(&i1.1));
+		name2MbVec.sort_by_key(|i| std::cmp::Reverse(i.1));
 
 		let mut ss = String::new();
 		ss += &format!("c MEMORY -- all : {} *** ", overallSzInMb);

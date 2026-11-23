@@ -16,8 +16,9 @@ The library is used through `intel_sat_solver::topor::CTopor<Ind, Compress>`, wh
 
 ## Testing
 
-    cargo test                               # the unit tests and the fuzz tests
+    cargo test                               # the unit tests and the fuzz tests (they need debug assertions, so not --release)
     TOPOR_FUZZ_ITERS=200000 cargo test fuzz  # more fuzzing (the default is 2000 scenarios)
+    cargo clippy --all-targets               # clean: the lints the C++ conventions conflict with are allowed by name in lib.rs and main.rs
     scripts/coverage.sh                      # line coverage with LLVM source-based coverage (see "Coverage" below)
     scripts/diff_vs_cpp.sh [dir with .cnf]   # differential testing against the C++ solver (outputs and DRAT proofs must be byte-identical)
 

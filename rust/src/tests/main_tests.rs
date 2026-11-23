@@ -321,6 +321,11 @@ fn incremental_command_errors()
 
 	// The commands, which don't require the solver, are legal before the header too
 	ExpectErr("incremental_err_first.cnf", "ot 1 1\noc 5\nox\n", &[], "c topor_tool ERROR: The 2nd character must be either t or c at line number 3");
+	// The commands, which require the solver, are not (the C++ version dereferences a null pointer)
+	for cmd in ["b 0", "n 1", "lc 1", "r /mode/value 1"]
+	{
+		ExpectErr("incremental_err_before_header.cnf", &(cmd.to_string() + "\np cnf 1 1\n1 0\n"), &[], "c topor_tool ERROR: a solver command appears before the p-line and the first clause at line number 1");
+	}
 }
 
 #[test]
@@ -538,7 +543,7 @@ fn on_finishing_solving()
 	assert_eq!(OnFinishingSolving(&mut out, &mut topor, ret, true, false, &[], None), 10);
 	assert_eq!(String::from_utf8_lossy(&out), "s SATISFIABLE\nv -1 2 3 0\n");
 	let mut out: Vec<u8> = vec![];
-	assert_eq!(OnFinishingSolving(&mut out, &mut topor, ret, true, false, &[], Some(&vec![3, 1])), 10);
+	assert_eq!(OnFinishingSolving(&mut out, &mut topor, ret, true, false, &[], Some(&[3, 1])), 10);
 	assert_eq!(String::from_utf8_lossy(&out), "s SATISFIABLE\nv 3 -1 0\n");
 	let mut out: Vec<u8> = vec![];
 	assert_eq!(OnFinishingSolving(&mut out, &mut topor, ret, false, true, &[], None), 10);
@@ -588,27 +593,22 @@ fn string_stream_and_var_list()
 	assert_eq!(ss.getline(b','), b"987");
 	assert!(!ss.good());
 
-	let R = |s: &str| -> (Vec<TLit>, String)
-	{
-		let mut errMsg = "garbage".to_string();
-		let varList = ReadCommaSeparatedVarList(&mut errMsg, s.as_bytes());
-		(varList, errMsg)
-	};
-	assert_eq!(R("1,4,15"), (vec![1, 4, 15], String::new()));
-	assert_eq!(R("7"), (vec![7], String::new()));
-	assert_eq!(R("7\n"), (vec![7], String::new()));
+	let R = |s: &str| ReadCommaSeparatedVarList(s.as_bytes());
+	assert_eq!(R("1,4,15"), Ok(vec![1, 4, 15]));
+	assert_eq!(R("7"), Ok(vec![7]));
+	assert_eq!(R("7\n"), Ok(vec![7]));
 	// A trailing comma is an error: there is nothing to convert after it
-	assert_eq!(R("7,8,"), (vec![7, 8], "c ERROR: couldn't convert 7,8, to a variable list\n".to_string()));
-	assert_eq!(R(""), (vec![], "c ERROR: couldn't convert  to a variable list\n".to_string()));
-	assert_eq!(R("1,x,3"), (vec![1], "c ERROR: couldn't convert 1,x,3 to a variable list\n".to_string()));
-	assert_eq!(R("1,,3"), (vec![1], "c ERROR: couldn't convert 1,,3 to a variable list\n".to_string()));
-	assert_eq!(R("99999999999999999999"), (vec![], "c ERROR: couldn't convert 99999999999999999999 to a variable list\n".to_string()));
+	assert_eq!(R("7,8,"), Err("c ERROR: couldn't convert 7,8, to a variable list\n".to_string()));
+	assert_eq!(R(""), Err("c ERROR: couldn't convert  to a variable list\n".to_string()));
+	assert_eq!(R("1,x,3"), Err("c ERROR: couldn't convert 1,x,3 to a variable list\n".to_string()));
+	assert_eq!(R("1,,3"), Err("c ERROR: couldn't convert 1,,3 to a variable list\n".to_string()));
+	assert_eq!(R("99999999999999999999"), Err("c ERROR: couldn't convert 99999999999999999999 to a variable list\n".to_string()));
 	// A non-positive variable at the end of the list: precisely as in the C++ version, the error message is lost, since the stream isn't good anymore
-	assert_eq!(R("1,0"), (vec![1, 0], String::new()));
-	assert_eq!(R("1,-2"), (vec![1, -2], String::new()));
+	assert_eq!(R("1,0"), Ok(vec![1, 0]));
+	assert_eq!(R("1,-2"), Ok(vec![1, -2]));
 	// A non-positive variable in the middle of the list: precisely as in the C++ version, the error message goes into the stream the variables are read from, so reading the next variable fails
-	assert_eq!(R("-2,3"), (vec![-2], "c ERROR: couldn't convert -2,3 to a variable list\n".to_string()));
-	assert_eq!(R("0,5"), (vec![0], "c ERROR: couldn't convert 0,5 to a variable list\n".to_string()));
+	assert_eq!(R("-2,3"), Err("c ERROR: couldn't convert -2,3 to a variable list\n".to_string()));
+	assert_eq!(R("0,5"), Err("c ERROR: couldn't convert 0,5 to a variable list\n".to_string()));
 }
 
 #[test]
@@ -668,31 +668,26 @@ fn line_parsing()
 #[test]
 fn param_readers()
 {
-	let mut errMsg = String::new();
-	assert!(!CToporTool::ReadBoolParam(&mut errMsg, "0") && errMsg.is_empty());
-	assert!(CToporTool::ReadBoolParam(&mut errMsg, "1") && errMsg.is_empty());
-	assert!(CToporTool::ReadBoolParam(&mut errMsg, "5"));
-	assert_eq!(errMsg, "c ERROR: 5 must be 0 or 1\n");
-	assert!(!CToporTool::ReadBoolParam(&mut errMsg, "y"));
-	assert_eq!(errMsg, "c ERROR: couldn't convert y to an integer\n");
+	fn E<T>(s: &str) -> Result<T, String>
+	{
+		Err(s.to_string())
+	}
+	assert_eq!(CToporTool::ReadBoolParam("0"), Ok(false));
+	assert_eq!(CToporTool::ReadBoolParam("1"), Ok(true));
+	assert_eq!(CToporTool::ReadBoolParam("5"), E("c ERROR: 5 must be 0 or 1\n"));
+	assert_eq!(CToporTool::ReadBoolParam("y"), E("c ERROR: couldn't convert y to an integer\n"));
 	// Out of the range of int
-	assert!(!CToporTool::ReadBoolParam(&mut errMsg, "99999999999"));
-	assert_eq!(errMsg, "c ERROR: couldn't convert 99999999999 to an integer\n");
+	assert_eq!(CToporTool::ReadBoolParam("99999999999"), E("c ERROR: couldn't convert 99999999999 to an integer\n"));
 
 	for (s, v) in [("0", 0), ("1", 1), ("2", 2)]
 	{
-		assert_eq!(CToporTool::Read0to2Param(&mut errMsg, s), v);
-		assert!(errMsg.is_empty());
+		assert_eq!(CToporTool::Read0to2Param(s), Ok(v));
 	}
-	assert_eq!(CToporTool::Read0to2Param(&mut errMsg, "3"), 3);
-	assert_eq!(errMsg, "c ERROR: 3 must be 0 or 1 or 2\n");
-	assert_eq!(CToporTool::Read0to2Param(&mut errMsg, "two"), 0);
-	assert_eq!(errMsg, "c ERROR: couldn't convert two to an integer\n");
+	assert_eq!(CToporTool::Read0to2Param("3"), E("c ERROR: 3 must be 0 or 1 or 2\n"));
+	assert_eq!(CToporTool::Read0to2Param("two"), E("c ERROR: couldn't convert two to an integer\n"));
 
-	assert_eq!(CToporTool::ReadULongParam(&mut errMsg, "18446744073709551615"), u64::MAX);
-	assert!(errMsg.is_empty());
-	assert_eq!(CToporTool::ReadULongParam(&mut errMsg, "many"), 0);
-	assert_eq!(errMsg, "c ERROR: couldn't convert many to an unsigned long\n");
+	assert_eq!(CToporTool::ReadULongParam("18446744073709551615"), Ok(u64::MAX));
+	assert_eq!(CToporTool::ReadULongParam("many"), E("c ERROR: couldn't convert many to an unsigned long\n"));
 }
 
 // A solver, which answers as told: for the paths of the tool, which a correct solver never triggers (wrong models and wrong unsatisfiable cores)
@@ -708,6 +703,7 @@ struct CMockTopor
 
 impl CMockTopor
 {
+	#[allow(clippy::new_ret_no_self)] // The mock is only ever used as a solver instance
 	fn new(rets: &[TToporReturnVal], vals: &[TToporLitVal]) -> Box<dyn TToporInst>
 	{
 		Box::new(CMockTopor { m_Rets: rets.to_vec(), m_Vals: vals.to_vec(), m_Solves: 0, m_Clss: 0 })
@@ -820,7 +816,7 @@ fn tool_with_wrong_solver_answers()
 		assert_eq!(tool.Topor().ToporGetLitDecLevel(1), 0);
 		tool.Topor().ToporDumpDrat(Box::new(CFailedOfstream), true, false);
 		tool.verifyModel = true;
-		tool.Solve(Some(&vec![1, -2, 0]))
+		tool.Solve(Some(&[1, -2, 0]))
 	});
 	assert_eq!(r, BadRetVal);
 	// The second assumption is falsified by the "model"
@@ -854,7 +850,7 @@ fn tool_with_wrong_solver_answers()
 		tool.topor = Some(CMockTopor::new(&[RET_SAT], &[VAL_DONT_CARE]));
 		tool.verifyModel = true;
 		tool.vmClss = vec![vec![1, 0]];
-		tool.Solve(Some(&vec![1]))
+		tool.Solve(Some(&[1]))
 	});
 	assert_eq!(r, 10);
 	assert!(out.ends_with("c topor_tool: assumptions verified!\nc topor_tool: clauses verified!\n"), "{}", out);
@@ -865,7 +861,7 @@ fn tool_with_wrong_solver_answers()
 		tool.topor = Some(CMockTopor::new(&[RET_UNSAT, RET_SAT], &[VAL_SATISFIED]));
 		tool.verifyUcore = true;
 		tool.printUcore = true;
-		tool.Solve(Some(&vec![1, -2, 0, 3]))
+		tool.Solve(Some(&[1, -2, 0, 3]))
 	});
 	assert_eq!(r, BadRetVal);
 	assert_eq!(out, "s UNSATISFIABLE\nv 1 -2 0 3 0\nc mock: 0 clauses\nAssumption #0 -- 1 : 1\nAssumption #1 -- -2 : 1\ns SATISFIABLE\nv 1 0\nc mock: 0 clauses\nret == 10: UNSAT CORE BUG!!!!!\n");
@@ -931,7 +927,7 @@ fn identify_archive_file_type()
 {
 	// The compile-time test of the signatures
 	assert!(AllSigsDifferByFirstInt());
-	assert_eq!(commandStringBeforeAndAfter.len(), fileSig.len());
+	assert_eq!(archiveCommands.len(), fileSig.len());
 
 	let I = |bytes: &[u8]| -> (TArchiveFileType, usize)
 	{
@@ -1110,13 +1106,15 @@ fn main_in_child_process()
 	assert!(String::from_utf8_lossy(&output.stdout).contains("c topor_tool ERROR: could not convert --nocapture to double\n"));
 	let _ = std::fs::remove_file(&f);
 
-	// An archive, where the shell to run the decompression command cannot be found
+	// An archive, where the decompression program cannot be found: as with popen, the shell reports it and the input is empty
 	let f = TmpFile("main_child_archive.cnf.gz");
 	std::fs::write(&f, [0x1F, 0x8B, 0x08, 0x00]).unwrap();
 	let output = MainChildCommand(&f).env("PATH", TmpFile("no_such_dir")).args([MainChildTest, "--nocapture"]).output().unwrap();
 	let out = String::from_utf8_lossy(&output.stdout).into_owned();
 	assert_eq!(output.status.code(), Some(BadRetVal & 0xFF), "{}", out);
-	assert!(out.contains(&format!("The following command will be used to read it through a pipe : gzip -c -d {} \nc topor_tool ERROR: couldn't open the input file\n", f)), "{}", out);
+	assert!(out.contains(&format!("The following command will be used to read it through a pipe : gzip -c -d {} \n", f)), "{}", out);
+	assert!(!out.contains("couldn't open the input file"), "{}", out);
+	assert!(String::from_utf8_lossy(&output.stderr).contains("sh: gzip: command not found\n"));
 	let _ = std::fs::remove_file(&f);
 
 	// An error, which the C++ version reports by throwing an exception out of main: the process is aborted

@@ -196,7 +196,7 @@ impl TToporStatistics
 	{
 		let mut ss_head = String::new();
 		let mut ss_stat = String::new();
-		let print_head = force_printing_head || self.m_ShortStartInv % 50 == 0;
+		let print_head = force_printing_head || self.m_ShortStartInv.is_multiple_of(50);
 		if print_head
 		{
 			ss_head += "c ToporStt ";
@@ -326,7 +326,7 @@ impl TToporStatistics
 		if total == 0 { 0. } else { 100. * fraction as f64 / total as f64 }
 	}
 
-	#[inline(always)]
+	#[inline]
 	pub(crate) fn NewClause(&mut self, cls_len: usize, is_learnt: bool)
 	{
 		if cls_len >= 2
@@ -351,7 +351,7 @@ impl TToporStatistics
 		}
 	}
 
-	#[inline(always)]
+	#[inline]
 	pub(crate) fn DeleteClause(&mut self, cls_len: usize, is_learnt: bool)
 	{
 		if cls_len >= 2

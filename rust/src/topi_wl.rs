@@ -15,7 +15,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		{
 			return false;
 		}
-		let binWatches = TSpanTULit::new(self.m_W.get_ptr(wi.m_WBInd.as_usize()).wrapping_add(wi.GetLongEntries()), wi.m_BinaryWatches.as_usize());
+		let binWatches = self.WLBinWatchesSpan(wi);
 		binWatches.find(otherWatch) != binWatches.size()
 	}
 
@@ -23,11 +23,11 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	{
 		debug_assert!(self.WLBinaryWatchExists(l, otherWatch));
 
-		let wi = &mut self.m_Watches[l as usize];
-		let binWatches = TSpanTULit::new(self.m_W.get_ptr(wi.m_WBInd.as_usize()).wrapping_add(wi.GetLongEntries()), wi.m_BinaryWatches.as_usize());
+		let binWatches = self.WLBinWatchesSpan(&self.m_Watches[l as usize]);
 		let it = binWatches.find(otherWatch);
 		binWatches.set(it, binWatches.back());
 
+		let wi = &mut self.m_Watches[l as usize];
 		debug_assert!(wi.m_BinaryWatches > Ind::ZERO);
 		wi.m_BinaryWatches -= Ind::ONE;
 	}
@@ -74,48 +74,35 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		usize::MAX
 	}
 
-	pub(crate) fn WLSetCached(&mut self, l: TULit, clsInd: Ind, cachedLit: TULit)
+	// The long watch #longWatchInd of l: [cached literal, clause index]
+	#[inline]
+	fn WLLongWatchPtr(&self, l: TULit, longWatchInd: usize) -> *mut TULit
 	{
-		// Go over the long watches
-		let wi = &self.m_Watches[l as usize];
-		let longWatches = wi.m_LongWatches.as_usize();
-		let mut currLongWatchInd: usize = 0;
-		let mut currLongWatchPtr = self.m_W.get_ptr(wi.m_WBInd.as_usize());
-		while currLongWatchInd < longWatches
-		{
-			let currClsInd = unsafe { Ind::read(currLongWatchPtr.add(1)) };
-			if currClsInd == clsInd
-			{
-				unsafe { *currLongWatchPtr = cachedLit };
-				return;
-			}
-			currLongWatchInd += 1;
-			currLongWatchPtr = currLongWatchPtr.wrapping_add(TWatchInfo::<Ind>::BinsInLong);
-		}
-
-		debug_assert!(false);
+		self.m_W.get_ptr(self.m_Watches[l as usize].m_WBInd.as_usize() + longWatchInd * TWatchInfo::<Ind>::BinsInLong)
 	}
 
+	// The C++ version repeats the search loop of WLGetLongWatchInd here
+	pub(crate) fn WLSetCached(&mut self, l: TULit, clsInd: Ind, cachedLit: TULit)
+	{
+		let longWatchInd = self.WLGetLongWatchInd(l, clsInd);
+		debug_assert!(longWatchInd != usize::MAX);
+		if longWatchInd != usize::MAX
+		{
+			// SAFETY: the long watch exists, so its entries are inside m_W
+			unsafe { *self.WLLongWatchPtr(l, longWatchInd) = cachedLit };
+		}
+	}
+
+	// The C++ version repeats the search loop of WLGetLongWatchInd here
 	pub(crate) fn WLReplaceInd(&mut self, l: TULit, clsInd: Ind, newClsInd: Ind)
 	{
-		// Go over the long watches
-		let wi = &self.m_Watches[l as usize];
-		let longWatches = wi.m_LongWatches.as_usize();
-		let mut currLongWatchInd: usize = 0;
-		let mut currLongWatchPtr = self.m_W.get_ptr(wi.m_WBInd.as_usize());
-		while currLongWatchInd < longWatches
+		let longWatchInd = self.WLGetLongWatchInd(l, clsInd);
+		debug_assert!(longWatchInd != usize::MAX);
+		if longWatchInd != usize::MAX
 		{
-			let currClsInd = unsafe { Ind::read(currLongWatchPtr.add(1)) };
-			if currClsInd == clsInd
-			{
-				unsafe { newClsInd.write(currLongWatchPtr.add(1)) };
-				return;
-			}
-			currLongWatchInd += 1;
-			currLongWatchPtr = currLongWatchPtr.wrapping_add(TWatchInfo::<Ind>::BinsInLong);
+			// SAFETY: as in WLSetCached
+			unsafe { newClsInd.write(self.WLLongWatchPtr(l, longWatchInd).add(1)) };
 		}
-
-		debug_assert!(false);
 	}
 
 	pub(crate) fn WLRemoveLongWatch(&mut self, l: TULit, longWatchInd: usize)
@@ -217,7 +204,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	}
 
 	// The AllocateNewArenaAndCopyOldArenaIfAny lambda of WLPrepareArena
-	fn WLPrepareArenaAllocateNewArenaAndCopyOldArenaIfAny(&mut self, wi: *mut TWatchInfo<Ind>, sz: Ind) -> *mut TULit
+	// The lambda captures the watch-info of l by reference; here it is re-read by index, since CompressWLs rewrites it
+	fn WLPrepareArenaAllocateNewArenaAndCopyOldArenaIfAny(&mut self, l: TULit, sz: Ind) -> *mut TULit
 	{
 		let mut allocatedWordsRequired = self.m_WNext + sz;
 		if allocatedWordsRequired < self.m_WNext || ((self.m_WWasted + self.m_WNext).as_u64() as f64 > self.m_WNext.as_u64() as f64 * self.m_Params.m_ParamMultWasteWatches.get())
@@ -238,61 +226,59 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			return std::ptr::null_mut();
 		}
 
-		unsafe
+		// MarkWatchBufferChunkDeleted only touches m_W, so the watch-info is updated in a copy, which is then stored back
+		let mut wi = self.m_Watches[l as usize];
+		if !wi.IsEmpty()
 		{
-			if !(*wi).IsEmpty()
-			{
-				self.m_W.memcpy(self.m_WNext.as_usize(), (*wi).m_WBInd.as_usize(), (*wi).GetUsedEntries());
-				self.MarkWatchBufferChunkDeleted(&mut *wi);
-			}
-			(*wi).PointToNewArena(self.m_WNext, sz);
-			self.m_WNext += (*wi).m_AllocatedEntries;
-			self.m_W.get_ptr((self.m_WNext - (*wi).m_AllocatedEntries).as_usize())
+			self.m_W.memcpy(self.m_WNext.as_usize(), wi.m_WBInd.as_usize(), wi.GetUsedEntries());
+			self.MarkWatchBufferChunkDeleted(&mut wi);
 		}
+		wi.PointToNewArena(self.m_WNext, sz);
+		self.m_WNext += wi.m_AllocatedEntries;
+		self.m_Watches[l as usize] = wi;
+		self.m_W.get_ptr((self.m_WNext - wi.m_AllocatedEntries).as_usize())
 	}
 
 	pub(crate) fn WLPrepareArena(&mut self, l: TULit, allowNewBinaryWatch: bool, allowNewLongWatch: bool) -> *mut TULit
 	{
-		let wi: *mut TWatchInfo<Ind> = self.m_Watches.get_ptr(l as usize);
+		// The watch-info is only read here (the lambda re-reads and updates it), so a copy is used
+		let wi = self.m_Watches[l as usize];
 
-		unsafe
+		let currRequiredEntries = Ind::from_usize(allowNewBinaryWatch as usize + (allowNewLongWatch as usize * TWatchInfo::<Ind>::BinsInLong));
+		if wi.IsEmpty()
 		{
-			let currRequiredEntries = Ind::from_usize(allowNewBinaryWatch as usize + (allowNewLongWatch as usize * TWatchInfo::<Ind>::BinsInLong));
-			if (*wi).IsEmpty()
-			{
-				let initEntriesPerWL = Ind::from_usize(self.m_Params.m_ParamInitEntriesPerWL.get() as usize);
-				return self.WLPrepareArenaAllocateNewArenaAndCopyOldArenaIfAny(wi, if initEntriesPerWL < currRequiredEntries { Ind::from_usize(currRequiredEntries.as_usize().next_power_of_two()) } else { initEntriesPerWL });
-			}
-
-			debug_assert!(!(*wi).IsEmpty());
-
-			let usedEntries = Ind::from_usize((*wi).GetUsedEntries());
-			let requiredEntries = usedEntries + currRequiredEntries;
-
-			if requiredEntries <= (*wi).m_AllocatedEntries
-			{
-				return self.m_W.get_ptr((*wi).m_WBInd.as_usize());
-			}
-
-			if requiredEntries < usedEntries
-			{
-				// Overflow
-				self.SetStatus(TToporStatus::STATUS_INDEX_TOO_NARROW, "The actual number of entries for one literal doesn't fit into the buffer".to_string());
-				return std::ptr::null_mut();
-			}
-
-			// Re-allocation is required
-
-			if (*wi).m_AllocatedEntries == TWatchInfo::<Ind>::MaxWatchInfoAlloc()
-			{
-				// Reached the maximum allocation!
-				self.SetStatus(TToporStatus::STATUS_INDEX_TOO_NARROW, "The watch list for one literal doesn't fit into the buffer".to_string());
-				return std::ptr::null_mut();
-			}
-
-			self.m_WWasted += (*wi).m_AllocatedEntries;
-			self.WLPrepareArenaAllocateNewArenaAndCopyOldArenaIfAny(wi, Ind::from_u64((*wi).m_AllocatedEntries.as_u64() << 1))
+			let initEntriesPerWL = Ind::from_usize(self.m_Params.m_ParamInitEntriesPerWL.get() as usize);
+			return self.WLPrepareArenaAllocateNewArenaAndCopyOldArenaIfAny(l, if initEntriesPerWL < currRequiredEntries { Ind::from_usize(currRequiredEntries.as_usize().next_power_of_two()) } else { initEntriesPerWL });
 		}
+
+		debug_assert!(!wi.IsEmpty());
+
+		let usedEntries = Ind::from_usize(wi.GetUsedEntries());
+		let requiredEntries = usedEntries + currRequiredEntries;
+
+		if requiredEntries <= wi.m_AllocatedEntries
+		{
+			return self.m_W.get_ptr(wi.m_WBInd.as_usize());
+		}
+
+		if requiredEntries < usedEntries
+		{
+			// Overflow
+			self.SetStatus(TToporStatus::STATUS_INDEX_TOO_NARROW, "The actual number of entries for one literal doesn't fit into the buffer".to_string());
+			return std::ptr::null_mut();
+		}
+
+		// Re-allocation is required
+
+		if wi.m_AllocatedEntries == TWatchInfo::<Ind>::MaxWatchInfoAlloc()
+		{
+			// Reached the maximum allocation!
+			self.SetStatus(TToporStatus::STATUS_INDEX_TOO_NARROW, "The watch list for one literal doesn't fit into the buffer".to_string());
+			return std::ptr::null_mut();
+		}
+
+		self.m_WWasted += wi.m_AllocatedEntries;
+		self.WLPrepareArenaAllocateNewArenaAndCopyOldArenaIfAny(l, Ind::from_u64(wi.m_AllocatedEntries.as_u64() << 1))
 	}
 
 	// The test of one binary clause, shared by WLAssertNoMissedImplications and WLAssertConsistency
@@ -300,13 +286,13 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	{
 		if self.IsFalsified(cls[0]) && self.IsFalsified(cls[1])
 		{
-			println!("***ASSERTION-FAILURE FF-for-binary at {}\n{}", self.SLits(cls, false), self.STrail());
+			stdout_println!("***ASSERTION-FAILURE FF-for-binary at {}\n{}", self.SLits(cls, false), self.STrail());
 		}
 		debug_assert!(!(self.IsFalsified(cls[0]) && self.IsFalsified(cls[1])));
 
 		if !(self.IsSatisfied(cls[0]) || self.IsSatisfied(cls[1]))
 		{
-			println!("***ASSERTION-FAILURE one-falsified-no-satisfied-for-binary at {}\n{}", self.SLits(cls, false), self.STrail());
+			stdout_println!("***ASSERTION-FAILURE one-falsified-no-satisfied-for-binary at {}\n{}", self.SLits(cls, false), self.STrail());
 		}
 		debug_assert!(self.IsSatisfied(cls[0]) || self.IsSatisfied(cls[1]));
 
@@ -316,7 +302,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 		if !(self.GetAssignedDecLevel(satLit) <= self.GetAssignedDecLevel(falseLit))
 		{
-			println!("***ASSERTION-FAILURE one-falsified-satisfied-higherdl-for-binary at {}\n{}", self.SLits(cls, false), self.STrail());
+			stdout_println!("***ASSERTION-FAILURE one-falsified-satisfied-higherdl-for-binary at {}\n{}", self.SLits(cls, false), self.STrail());
 		}
 		debug_assert!(self.GetAssignedDecLevel(satLit) <= self.GetAssignedDecLevel(falseLit));
 	}
@@ -345,7 +331,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			let itFound = found(&|l: TULit| self.IsSatisfied(l) && self.GetAssignedDecLevel(l) <= falseLitDecLevel);
 			if !(otherLitDecLevel <= falseLitDecLevel || itFound)
 			{
-				println!("***ASSERTION-FAILURE FS at {}\n{}", self.SLits(cls, false), self.STrail());
+				stdout_println!("***ASSERTION-FAILURE FS at {}\n{}", self.SLits(cls, false), self.STrail());
 			}
 			debug_assert!(otherLitDecLevel <= falseLitDecLevel || itFound);
 		}
@@ -355,7 +341,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			let itFound = found(&|l: TULit| self.IsSatisfied(l) && self.GetAssignedDecLevel(l) <= falseLitDecLevel);
 			if !itFound
 			{
-				println!("***ASSERTION-FAILURE F- at {}\n{}", self.SLits(cls, false), self.STrail());
+				stdout_println!("***ASSERTION-FAILURE F- at {}\n{}", self.SLits(cls, false), self.STrail());
 			}
 			debug_assert!(itFound);
 		}
@@ -365,7 +351,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			let itFound = found(&|l: TULit| self.IsSatisfied(l) && self.GetAssignedDecLevel(l) <= falseLitDecLevel && self.GetAssignedDecLevel(l) <= otherLitDecLevel);
 			if !itFound
 			{
-				println!("***ASSERTION-FAILURE FF at {}\n{}", self.SLits(cls, false), self.STrail());
+				stdout_println!("***ASSERTION-FAILURE FF at {}\n{}", self.SLits(cls, false), self.STrail());
 			}
 			debug_assert!(itFound);
 		}
@@ -396,7 +382,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 			if binaryWatches != Ind::ZERO
 			{
-				let binWatches = self.m_W.get_span_cap_sz(wi.m_WBInd.as_usize() + wi.GetLongEntries(), wi.m_BinaryWatches.as_usize());
+				let binWatches = self.WLBinWatchesSpan(&wi);
 				for secondLit in binWatches
 				{
 					debug_assert!(secondLit != 0);
@@ -425,7 +411,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				{
 					if !(clsInd >= self.m_FirstLearntClsInd || !self.ClsGetIsLearnt(clsInd))
 					{
-						println!("***ASSERTION-FAILURE First-Learnt at {}\n{}", self.SLits(cls, false), self.STrail());
+						stdout_println!("***ASSERTION-FAILURE First-Learnt at {}\n{}", self.SLits(cls, false), self.STrail());
 					}
 					debug_assert!(clsInd >= self.m_FirstLearntClsInd || !self.ClsGetIsLearnt(clsInd));
 				}
@@ -433,7 +419,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				debug_assert!(cls[0] == l || cls[1] == l);
 				if cls.find(cachedLit) == cls.size()
 				{
-					println!("***ASSERTION-FAILURE CL- at cached {}; cls = {}\n{}", self.SLit(cachedLit), self.SLits(cls, false), self.STrail());
+					stdout_println!("***ASSERTION-FAILURE CL- at cached {}; cls = {}\n{}", self.SLit(cachedLit), self.SLits(cls, false), self.STrail());
 					debug_assert!(false);
 				}
 
@@ -484,7 +470,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 			if binaryWatches != Ind::ZERO
 			{
-				let binWatches = self.m_W.get_span_cap_sz(wi.m_WBInd.as_usize() + wi.GetLongEntries(), wi.m_BinaryWatches.as_usize());
+				let binWatches = self.WLBinWatchesSpan(&wi);
 				for secondLit in binWatches
 				{
 					debug_assert!(secondLit != 0);
@@ -516,7 +502,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				{
 					if !(clsInd >= self.m_FirstLearntClsInd || !self.ClsGetIsLearnt(clsInd))
 					{
-						println!("***ASSERTION-FAILURE First-Learnt at {}\n{}", self.SLits(cls, false), self.STrail());
+						stdout_println!("***ASSERTION-FAILURE First-Learnt at {}\n{}", self.SLits(cls, false), self.STrail());
 					}
 					debug_assert!(clsInd >= self.m_FirstLearntClsInd || !self.ClsGetIsLearnt(clsInd));
 				}
@@ -524,7 +510,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				debug_assert!(cls[0] == l || cls[1] == l);
 				if !(cls.find(cachedLit) != cls.size())
 				{
-					println!("***ASSERTION-FAILURE F- at {}\n{}", self.SLits(cls, false), self.STrail());
+					stdout_println!("***ASSERTION-FAILURE F- at {}\n{}", self.SLits(cls, false), self.STrail());
 				}
 				debug_assert!(cls.find(cachedLit) != cls.size());
 

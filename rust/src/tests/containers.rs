@@ -44,6 +44,7 @@ fn span_basics()
 	assert_eq!(c.size(), 5);
 	let e: Span<u32> = Span::default();
 	assert!(e.is_empty());
+	#[allow(clippy::clone_on_copy)] // Covers the Clone impl
 	let s2 = s.clone();
 	assert_eq!(s2.size(), 5);
 }
@@ -362,7 +363,7 @@ fn bit_array_copy_block()
 {
 	// Compare against a bit-by-bit reference for all the alignment combinations
 	let total: u64 = 64 * 8;
-	let pattern = |i: u64| (i * 2654435761u64 >> 7) & 1;
+	let pattern = |i: u64| ((i * 2654435761u64) >> 7) & 1;
 	for (from, to, width) in [(128u64, 0u64, 40u64), (128, 0, 64), (128, 0, 200), (128, 64, 128), (192, 64, 131), (130, 3, 200), (130, 64, 200), (67, 5, 64 * 3), (64, 3, 65), (200, 190, 150), (192, 128, 300)]
 	{
 		let mut ba = CBitArray::new();

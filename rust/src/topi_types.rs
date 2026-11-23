@@ -95,6 +95,23 @@ pub const fn ExternalLit2ExternalVar(l: TLit) -> TLit
 	if l > 0 { l } else { l.wrapping_neg() }
 }
 
+// The C library's pseudo-random generator, which the C++ version uses: kept, so that the fork makes the very same random choices
+// (as in C++, its state is process-wide, shared by all the solver instances)
+mod c_rand
+{
+	extern "C"
+	{
+		pub fn rand() -> std::ffi::c_int;
+	}
+}
+
+#[inline]
+pub fn rand() -> std::ffi::c_int
+{
+	// SAFETY: rand has no preconditions
+	unsafe { c_rand::rand() }
+}
+
 // Initialization-related: the initial number of entries in the fused buffer: set the original size to 4Mb
 pub const InitEntriesInB: usize = 0x400000 / std::mem::size_of::<TULit>();
 
@@ -110,7 +127,13 @@ const _: () = assert!(LitsInPage <= InitEntriesInB);
 
 // The unsigned index into the clause and watch buffers TUInd
 // The solver is designed to be able to work with any index type as long as sizeof(TUInd) >= sizeof(TLit) and sizeof(TUInd) <= sizeof(size_t)
-pub trait TUInd: Copy + Clone + PartialEq + Eq + PartialOrd + Ord + Hash + Default + Debug + Display + LowerHex + Add<Output = Self> + Sub<Output = Self> + AddAssign + SubAssign + 'static
+// The unsafe code relies on that bound, so the trait is sealed: it is implemented for u32 and u64 only, each checked at compile time in impl_tuind
+mod sealed
+{
+	pub trait Sealed {}
+}
+
+pub trait TUInd: sealed::Sealed + Copy + PartialEq + Eq + PartialOrd + Ord + Hash + Default + Debug + Display + LowerHex + Add<Output = Self> + Sub<Output = Self> + AddAssign + SubAssign + 'static
 {
 	const DIGITS: u32;
 	// The number of literal-entries in an index-entry
@@ -139,6 +162,11 @@ macro_rules! impl_tuind
 {
 	($t:ty) =>
 	{
+		// TUInd must be at least as wide as TLit (since the clause and watch buffers will store literals, amongst others) and must not be wider than size_t
+		const _: () = assert!(<$t>::BITS >= TULit::BITS && <$t>::BITS <= usize::BITS);
+
+		impl sealed::Sealed for $t {}
+
 		impl TUInd for $t
 		{
 			const DIGITS: u32 = <$t>::BITS;
@@ -167,7 +195,6 @@ macro_rules! impl_tuind
 
 impl_tuind!(u32);
 impl_tuind!(u64);
-const _: () = assert!(std::mem::size_of::<u64>() <= std::mem::size_of::<usize>());
 
 // A sequence of literals with random access: implemented by spans and by (potentially compressed) clauses
 // This is the equivalent of the TULitSpan template parameter in the C++ version
@@ -198,12 +225,7 @@ pub trait TULitSpan: Copy
 	#[inline(always)]
 	fn find(&self, l: TULit) -> usize
 	{
-		let mut i = 0;
-		while i < self.size() && self.get(i) != l
-		{
-			i += 1;
-		}
-		i
+		self.lits().position(|x| x == l).unwrap_or(self.size())
 	}
 	#[inline(always)]
 	fn lits(&self) -> TULitSpanIter<Self>
@@ -235,7 +257,16 @@ impl<S: TULitSpan> Iterator for TULitSpanIter<S>
 			None
 		}
 	}
+
+	#[inline(always)]
+	fn size_hint(&self) -> (usize, Option<usize>)
+	{
+		let remaining = self.m_s.size() - self.m_i;
+		(remaining, Some(remaining))
+	}
 }
+
+impl<S: TULitSpan> ExactSizeIterator for TULitSpanIter<S> {}
 
 impl TULitSpan for Span<TULit>
 {
@@ -257,7 +288,7 @@ impl TULitSpan for Span<TULit>
 }
 
 // The custom min_element of the solver: the index of the first element in [first, last) with the minimal value (or last, if the range is empty)
-#[inline(always)]
+#[inline]
 pub fn min_element<S: TULitSpan, V: PartialOrd>(lits: S, mut first: usize, last: usize, mut get_val: impl FnMut(TULit) -> V) -> usize
 {
 	if first == last
@@ -282,7 +313,7 @@ pub fn min_element<S: TULitSpan, V: PartialOrd>(lits: S, mut first: usize, last:
 }
 
 // The custom max_element of the solver: the index of the first element in [first, last) with the maximal value (or last, if the range is empty)
-#[inline(always)]
+#[inline]
 pub fn max_element<S: TULitSpan, V: PartialOrd>(lits: S, mut first: usize, last: usize, mut get_val: impl FnMut(TULit) -> V) -> usize
 {
 	if first == last
@@ -307,7 +338,7 @@ pub fn max_element<S: TULitSpan, V: PartialOrd>(lits: S, mut first: usize, last:
 }
 
 // std::min_element with a "less" comparator: the index of the first minimal element in [first, last) (or last, if the range is empty)
-#[inline(always)]
+#[inline]
 pub fn std_min_element<S: TULitSpan>(lits: S, mut first: usize, last: usize, mut less: impl FnMut(TULit, TULit) -> bool) -> usize
 {
 	if first == last
@@ -329,7 +360,7 @@ pub fn std_min_element<S: TULitSpan>(lits: S, mut first: usize, last: usize, mut
 }
 
 // Moves the elements in [first, last), for which p doesn't hold, to the beginning of the range by swapping; returns the index of the new logical end
-#[inline(always)]
+#[inline]
 pub fn move_if<S: TULitSpan>(lits: S, mut first: usize, last: usize, mut p: impl FnMut(TULit) -> bool) -> usize
 {
 	while first != last && !p(lits.get(first))
@@ -761,7 +792,17 @@ impl TCompressedClss
 			{
 				return std::ptr::null_mut();
 			}
-			self.m_Table[i as usize] = Box::into_raw(Box::new(CBitArray::new()));
+			// Box::new would abort on an allocation failure, so the box is allocated by hand (erase releases it with Box::from_raw, which expects this very layout)
+			let layout = std::alloc::Layout::new::<CBitArray>();
+			// SAFETY: CBitArray isn't zero-sized, so the layout is valid for alloc
+			let p = unsafe { std::alloc::alloc(layout) } as *mut CBitArray;
+			if p.is_null()
+			{
+				return std::ptr::null_mut();
+			}
+			// SAFETY: p is a fresh allocation, which is suitably sized and aligned for a CBitArray
+			unsafe { p.write(CBitArray::new()) };
+			self.m_Table[i as usize] = p;
 			self.m_Size += 1;
 		}
 		self.m_Table[i as usize]
@@ -778,7 +819,7 @@ impl TCompressedClss
 	}
 
 	// The first existing hash-id, which is greater than or equal to i; BCTableSize stands for end()
-	#[inline(always)]
+	#[inline]
 	pub fn lower_bound(&self, mut i: usize) -> usize
 	{
 		while i < BCTableSize && self.m_Table[i].is_null()
@@ -881,6 +922,7 @@ pub const m_TmpClssCountMax: usize = 3;
 // In the standard mode, it's a span into the explicit buffer; in the compressed mode, it simulates a standard span with literals, given a bit-array
 // Exactly as in C++, any access is in fact always by reference to the buffer; the user must invoke Update, if the clause size is changed or the buffer is reallocated
 // The C++ iterators are replaced by indices into the clause
+#[derive(Clone, Copy)]
 pub struct CCls<Ind: TUInd, const Compress: bool>
 {
 	pub(crate) m_ClsInd: Ind,
@@ -892,16 +934,6 @@ pub struct CCls<Ind: TUInd, const Compress: bool>
 	pub(crate) m_BitsForLit: u8,
 	pub(crate) m_ClsSize: usize,
 }
-
-impl<Ind: TUInd, const Compress: bool> Clone for CCls<Ind, Compress>
-{
-	#[inline(always)]
-	fn clone(&self) -> Self
-	{
-		*self
-	}
-}
-impl<Ind: TUInd, const Compress: bool> Copy for CCls<Ind, Compress> {}
 
 impl<Ind: TUInd, const Compress: bool> CCls<Ind, Compress>
 {
@@ -1525,7 +1557,7 @@ impl CHandleNewCls
 		else
 		{
 			let elem_val = self.m_LastAppearenceCounter[new_var as usize];
-			if (elem_val as i64).abs() == (self.m_Counter as i64).abs()
+			if elem_val.unsigned_abs() == self.m_Counter.unsigned_abs()
 			{
 				is_duplicate = (elem_val < 0) == is_negative;
 				is_tau = !is_duplicate;

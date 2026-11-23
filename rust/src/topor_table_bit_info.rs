@@ -110,21 +110,29 @@ pub(crate) fn BuildCMasksByBitAtRunTime() -> [[TCInfo; 64]; MAX_BITS_NUM as usiz
 	build_c_masks_by_bit()
 }
 
+// Only read by the compile-time asserts below, so the copies a large const array implies never materialize
+#[allow(clippy::large_const_arrays)]
 const cMasksByBitConst: [[TCInfo; 64]; MAX_BITS_NUM as usize] = build_c_masks_by_bit();
 
+// The table is indexed by the number of bits minus 1
+const fn BitsInd(bits: usize) -> usize
+{
+	bits - 1
+}
+
 // 1 bits starting from bit 0
-const _: () = assert!(cMasksByBitConst[1 - 1][0].w0ReadMask == 1);
-const _: () = assert!(cMasksByBitConst[1 - 1][0].w0ReadShr == 0);
-const _: () = assert!(cMasksByBitConst[1 - 1][0].w1ReadMask == 0);
-const _: () = assert!(cMasksByBitConst[1 - 1][0].w1ReadShl == 0);
+const _: () = assert!(cMasksByBitConst[BitsInd(1)][0].w0ReadMask == 1);
+const _: () = assert!(cMasksByBitConst[BitsInd(1)][0].w0ReadShr == 0);
+const _: () = assert!(cMasksByBitConst[BitsInd(1)][0].w1ReadMask == 0);
+const _: () = assert!(cMasksByBitConst[BitsInd(1)][0].w1ReadShl == 0);
 
 // 1 bits starting from bit 4
-const _: () = assert!(cMasksByBitConst[1 - 1][4].w0ReadMask == 16);
-const _: () = assert!(cMasksByBitConst[1 - 1][4].w0ReadShr == 4);
-const _: () = assert!(cMasksByBitConst[1 - 1][4].w1ReadMask == 0);
-const _: () = assert!(cMasksByBitConst[1 - 1][4].w1ReadShl == 0);
+const _: () = assert!(cMasksByBitConst[BitsInd(1)][4].w0ReadMask == 16);
+const _: () = assert!(cMasksByBitConst[BitsInd(1)][4].w0ReadShr == 4);
+const _: () = assert!(cMasksByBitConst[BitsInd(1)][4].w1ReadMask == 0);
+const _: () = assert!(cMasksByBitConst[BitsInd(1)][4].w1ReadShl == 0);
 
 // 1 bits starting from bit 63
-const _: () = assert!(cMasksByBitConst[1 - 1][63].w0ReadMask == 1u64 << 63);
-const _: () = assert!(cMasksByBitConst[1 - 1][63].w0ReadShr == 63);
-const _: () = assert!(cMasksByBitConst[1 - 1][63].w1ReadMask == 0);
+const _: () = assert!(cMasksByBitConst[BitsInd(1)][63].w0ReadMask == 1u64 << 63);
+const _: () = assert!(cMasksByBitConst[BitsInd(1)][63].w0ReadShr == 63);
+const _: () = assert!(cMasksByBitConst[BitsInd(1)][63].w1ReadMask == 0);

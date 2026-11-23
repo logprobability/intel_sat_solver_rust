@@ -5,11 +5,6 @@ use crate::topi::*;
 use crate::ReserveExactlyInit;
 use std::io::Write;
 
-extern "C"
-{
-	fn rand() -> std::ffi::c_int;
-}
-
 impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 {
 	// Get the decision literal
@@ -67,7 +62,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		debug_assert!(!self.IsAssignedVar(v));
 		let res = if self.IsNotForced(v)
 		{
-			if self.m_Params.m_ParamPolarityStrat.get() == 1 { (unsafe { rand() } % 2) != 0 } else { self.m_AssignmentInfo[v as usize].m_IsNegated() }
+			if self.m_Params.m_ParamPolarityStrat.get() == 1 { (rand() % 2) != 0 } else { self.m_AssignmentInfo[v as usize].m_IsNegated() }
 		}
 		else
 		{
@@ -77,7 +72,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		if self.m_Params.m_ParamPolarityFlipFactor.get() != 0
 		{
 			self.m_NonForcedPolaritySelectionForFlip += 1;
-			if self.m_NonForcedPolaritySelectionForFlip % self.m_Params.m_ParamPolarityFlipFactor.get() == 0 { !res } else { res }
+			if self.m_NonForcedPolaritySelectionForFlip.is_multiple_of(self.m_Params.m_ParamPolarityFlipFactor.get()) { !res } else { res }
 		}
 		else
 		{
@@ -99,7 +94,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		let varDecayInc: f64 = if self.m_QueryCurr == TQueryType::QUERY_INC_SHORT { self.m_Params.m_ParamVarDecayIncS.get() } else if self.m_QueryCurr == TQueryType::QUERY_INC_NORMAL { self.m_Params.m_ParamVarDecayIncAi.get() } else { self.m_Params.m_ParamVarDecayInc.get() };
 		let varDecayMax: f64 = if self.m_QueryCurr == TQueryType::QUERY_INC_SHORT { self.m_Params.m_ParamVarDecayMaxS.get() } else if self.m_QueryCurr == TQueryType::QUERY_INC_NORMAL { self.m_Params.m_ParamVarDecayMaxAi.get() } else { self.m_Params.m_ParamVarDecayMax.get() };
 
-		if self.m_Params.m_ParamVarDecayUpdateConfRate.get() > 0 && (self.m_Stat.m_Conflicts % self.m_Params.m_ParamVarDecayUpdateConfRate.get() as u64 == 0)
+		if self.m_Params.m_ParamVarDecayUpdateConfRate.get() > 0 && self.m_Stat.m_Conflicts.is_multiple_of(self.m_Params.m_ParamVarDecayUpdateConfRate.get() as u64)
 			&& D1LowerOrEqD2UpToPrecision(self.m_Stat.m_VarDecay + varDecayInc, varDecayMax)
 		{
 			self.m_Stat.m_VarDecay += varDecayInc;
@@ -152,7 +147,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			let mut v: TUVar = 1;
 			while v < self.GetNextVar()
 			{
-				self.FixPolarityInternal(GetLit(v, (unsafe { rand() } % 2) != 0), true);
+				self.FixPolarityInternal(GetLit(v, (rand() % 2) != 0), true);
 				v += 1;
 			}
 		}

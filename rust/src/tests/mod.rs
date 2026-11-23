@@ -1,5 +1,8 @@
 // The unit and fuzz tests of the crate
 
+// The fuzz scenarios are assigned field by field, in the order in which they consume the fuzz input
+#![allow(clippy::field_reassign_with_default)]
+
 mod containers;
 mod support;
 mod types;
