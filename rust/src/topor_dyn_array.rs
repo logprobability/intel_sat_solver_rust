@@ -2,7 +2,6 @@
 // SPDX - License - Identifier: MIT
 
 use std::alloc::{alloc, alloc_zeroed, dealloc, realloc, Layout};
-use std::marker::PhantomData;
 use std::ops::{Index, IndexMut};
 
 // Test-only allocation fault injection: makes the n-th allocation request (counting from 0) and all the subsequent ones fail
@@ -217,7 +216,7 @@ impl<T: Copy> Span<T>
 	#[inline(always)]
 	pub fn iter(&self) -> SpanIter<T>
 	{
-		SpanIter { m_Span: *self, m_I: 0, m_marker: PhantomData }
+		SpanIter { m_Span: *self, m_I: 0 }
 	}
 
 	#[inline(always)]
@@ -233,12 +232,7 @@ impl<T: Copy + PartialEq> Span<T>
 	#[inline(always)]
 	pub fn find(&self, v: T) -> usize
 	{
-		let mut i = 0;
-		while i < self.m_len && self.get(i) != v
-		{
-			i += 1;
-		}
-		i
+		self.iter().position(|x| x == v).unwrap_or(self.m_len)
 	}
 
 	#[inline(always)]
@@ -263,7 +257,6 @@ pub struct SpanIter<T>
 {
 	m_Span: Span<T>,
 	m_I: usize,
-	m_marker: PhantomData<T>,
 }
 
 impl<T: Copy> Iterator for SpanIter<T>
@@ -283,7 +276,16 @@ impl<T: Copy> Iterator for SpanIter<T>
 			None
 		}
 	}
+
+	#[inline(always)]
+	fn size_hint(&self) -> (usize, Option<usize>)
+	{
+		let remaining = self.m_Span.m_len - self.m_I;
+		(remaining, Some(remaining))
+	}
 }
+
+impl<T: Copy> ExactSizeIterator for SpanIter<T> {}
 
 impl<T: Copy> IntoIterator for Span<T>
 {

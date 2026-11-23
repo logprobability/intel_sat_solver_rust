@@ -94,7 +94,7 @@ fn params_descriptions_and_values()
 	assert!(!p.IsError());
 	assert_eq!(p.GetErrorDescr(), "");
 	assert_eq!(p.m_ParamInitEntriesPerWL.get(), 4);
-	assert_eq!(*p.m_ParamVerbosity, 0);
+	assert_eq!(p.m_ParamVerbosity.get(), 0);
 	let descr = p.GetAllParamsDescr();
 	assert!(descr.starts_with("\x1b[1;31mc solver library parameters:\x1b[0m\n************************************************************\n"));
 	// A single-default integer, a per-mode Boolean, the special floating-point values

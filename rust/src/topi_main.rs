@@ -125,14 +125,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		};
 
 		// getline: the lines are separated by '\n'; there is no line after the last '\n'
-		let mut lines: Vec<&str> = tcf.split('\n').collect();
-		if lines.last() == Some(&"")
-		{
-			lines.pop();
-		}
-
 		let mut lineNum: u32 = 1;
-		for paramSetting in lines
+		for paramSetting in tcf.split_terminator('\n')
 		{
 			let SetErrStatus = |topi: &Self, reason: &str|
 			{
@@ -466,10 +460,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	// ProcessDelayedImplication(diL, otherWatch, parentClsInd, cis), where cis is a local empty vector (rather than m_Cis)
 	fn ProcessDelayedImplicationLocalCis(&mut self, diL: TULit, otherWatch: TULit, parentClsInd: Ind)
 	{
-		let mut cis: CVector<TContradictionInfo<Ind>> = CVector::new(0, 0);
-		std::mem::swap(&mut self.m_Cis, &mut cis);
+		let savedCis = std::mem::take(&mut self.m_Cis);
 		self.ProcessDelayedImplication(diL, otherWatch, parentClsInd);
-		std::mem::swap(&mut self.m_Cis, &mut cis);
+		self.m_Cis = savedCis;
 	}
 
 	fn AddUserClauseBody(&mut self, c: &[TLit], lastExistingVarStart: TUVar, isSuccess: &mut bool, boostScores: &mut bool)

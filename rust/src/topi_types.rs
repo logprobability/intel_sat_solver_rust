@@ -225,12 +225,7 @@ pub trait TULitSpan: Copy
 	#[inline(always)]
 	fn find(&self, l: TULit) -> usize
 	{
-		let mut i = 0;
-		while i < self.size() && self.get(i) != l
-		{
-			i += 1;
-		}
-		i
+		self.lits().position(|x| x == l).unwrap_or(self.size())
 	}
 	#[inline(always)]
 	fn lits(&self) -> TULitSpanIter<Self>
@@ -262,7 +257,16 @@ impl<S: TULitSpan> Iterator for TULitSpanIter<S>
 			None
 		}
 	}
+
+	#[inline(always)]
+	fn size_hint(&self) -> (usize, Option<usize>)
+	{
+		let remaining = self.m_s.size() - self.m_i;
+		(remaining, Some(remaining))
+	}
 }
+
+impl<S: TULitSpan> ExactSizeIterator for TULitSpanIter<S> {}
 
 impl TULitSpan for Span<TULit>
 {
@@ -918,6 +922,7 @@ pub const m_TmpClssCountMax: usize = 3;
 // In the standard mode, it's a span into the explicit buffer; in the compressed mode, it simulates a standard span with literals, given a bit-array
 // Exactly as in C++, any access is in fact always by reference to the buffer; the user must invoke Update, if the clause size is changed or the buffer is reallocated
 // The C++ iterators are replaced by indices into the clause
+#[derive(Clone, Copy)]
 pub struct CCls<Ind: TUInd, const Compress: bool>
 {
 	pub(crate) m_ClsInd: Ind,
@@ -929,16 +934,6 @@ pub struct CCls<Ind: TUInd, const Compress: bool>
 	pub(crate) m_BitsForLit: u8,
 	pub(crate) m_ClsSize: usize,
 }
-
-impl<Ind: TUInd, const Compress: bool> Clone for CCls<Ind, Compress>
-{
-	#[inline(always)]
-	fn clone(&self) -> Self
-	{
-		*self
-	}
-}
-impl<Ind: TUInd, const Compress: bool> Copy for CCls<Ind, Compress> {}
 
 impl<Ind: TUInd, const Compress: bool> CCls<Ind, Compress>
 {
@@ -1562,7 +1557,7 @@ impl CHandleNewCls
 		else
 		{
 			let elem_val = self.m_LastAppearenceCounter[new_var as usize];
-			if (elem_val as i64).abs() == (self.m_Counter as i64).abs()
+			if elem_val.unsigned_abs() == self.m_Counter.unsigned_abs()
 			{
 				is_duplicate = (elem_val < 0) == is_negative;
 				is_tau = !is_duplicate;

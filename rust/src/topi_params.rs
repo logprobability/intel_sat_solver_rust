@@ -119,16 +119,6 @@ pub struct CTopiParam<T: TParamType>
 	m_InitValsPerMode: Option<[T; m_Modes as usize]>,
 }
 
-impl<T: TParamType> std::ops::Deref for CTopiParam<T>
-{
-	type Target = T;
-	#[inline(always)]
-	fn deref(&self) -> &T
-	{
-		&self.m_Val
-	}
-}
-
 impl<T: TParamType> CTopiParam<T>
 {
 	// The value of the parameter (operator T() in the C++ version)
@@ -615,18 +605,20 @@ impl CTopiParams
 			return;
 		}
 
-		match self.m_Name2DescrUpdateGetval.get(param_name).map(|e| (e.0.clone(), e.1))
+		match self.m_Name2DescrUpdateGetval.get(param_name).map(|e| e.1)
 		{
 			None =>
 			{
 				let descr = "Parameter ".to_string() + param_name + " doesn't exists. See all parameters description below:\n" + &self.GetAllParamsDescr();
 				self.SetError(TErrorType::NAME_DOESNT_EXIST_WHEN_SETTING_PARAMETER, &descr);
 			}
-			Some((descr, update)) =>
+			Some(update) =>
 			{
 				let err_descr = update(self, TValOrMode::Val(param_val));
 				if !err_descr.is_empty()
 				{
+					// The description is only needed for the error message
+					let descr = self.m_Name2DescrUpdateGetval[param_name].0.clone();
 					self.SetError(TErrorType::ERROR_WHEN_SETTING_PARAMETER, &(Self::GetNameDescr(param_name, &descr) + ": couldn't set this parameter : " + &err_descr));
 				}
 				else if param_name == m_ModeParamName

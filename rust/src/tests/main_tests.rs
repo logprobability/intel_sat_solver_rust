@@ -543,7 +543,7 @@ fn on_finishing_solving()
 	assert_eq!(OnFinishingSolving(&mut out, &mut topor, ret, true, false, &[], None), 10);
 	assert_eq!(String::from_utf8_lossy(&out), "s SATISFIABLE\nv -1 2 3 0\n");
 	let mut out: Vec<u8> = vec![];
-	assert_eq!(OnFinishingSolving(&mut out, &mut topor, ret, true, false, &[], Some(&vec![3, 1])), 10);
+	assert_eq!(OnFinishingSolving(&mut out, &mut topor, ret, true, false, &[], Some(&[3, 1])), 10);
 	assert_eq!(String::from_utf8_lossy(&out), "s SATISFIABLE\nv 3 -1 0\n");
 	let mut out: Vec<u8> = vec![];
 	assert_eq!(OnFinishingSolving(&mut out, &mut topor, ret, false, true, &[], None), 10);
@@ -816,7 +816,7 @@ fn tool_with_wrong_solver_answers()
 		assert_eq!(tool.Topor().ToporGetLitDecLevel(1), 0);
 		tool.Topor().ToporDumpDrat(Box::new(CFailedOfstream), true, false);
 		tool.verifyModel = true;
-		tool.Solve(Some(&vec![1, -2, 0]))
+		tool.Solve(Some(&[1, -2, 0]))
 	});
 	assert_eq!(r, BadRetVal);
 	// The second assumption is falsified by the "model"
@@ -850,7 +850,7 @@ fn tool_with_wrong_solver_answers()
 		tool.topor = Some(CMockTopor::new(&[RET_SAT], &[VAL_DONT_CARE]));
 		tool.verifyModel = true;
 		tool.vmClss = vec![vec![1, 0]];
-		tool.Solve(Some(&vec![1]))
+		tool.Solve(Some(&[1]))
 	});
 	assert_eq!(r, 10);
 	assert!(out.ends_with("c topor_tool: assumptions verified!\nc topor_tool: clauses verified!\n"), "{}", out);
@@ -861,7 +861,7 @@ fn tool_with_wrong_solver_answers()
 		tool.topor = Some(CMockTopor::new(&[RET_UNSAT, RET_SAT], &[VAL_SATISFIED]));
 		tool.verifyUcore = true;
 		tool.printUcore = true;
-		tool.Solve(Some(&vec![1, -2, 0, 3]))
+		tool.Solve(Some(&[1, -2, 0, 3]))
 	});
 	assert_eq!(r, BadRetVal);
 	assert_eq!(out, "s UNSATISFIABLE\nv 1 -2 0 3 0\nc mock: 0 clauses\nAssumption #0 -- 1 : 1\nAssumption #1 -- -2 : 1\ns SATISFIABLE\nv 1 0\nc mock: 0 clauses\nret == 10: UNSAT CORE BUG!!!!!\n");
