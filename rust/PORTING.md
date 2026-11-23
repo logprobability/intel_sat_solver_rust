@@ -127,7 +127,9 @@ pub(crate) fn NewLearntClsApplyCbLearntDrat(&mut self, learntCls: TSpanTULit);
 pub(crate) fn CiIsLegal(&mut self, ci: &mut TContradictionInfo<Ind>, assertTwoLitsSameDecLevel: bool) -> bool;
 pub(crate) fn ConflictAnalysisLoop(&mut self, contradictionInfo: &mut TContradictionInfo<Ind>);
 pub(crate) fn MarkDecisionsInConeAsVisited(&mut self, triggeringLit: TULit);
-// (MinimizeClauseBin, GenerateAllUipClause, MinimizeClauseMinisat, LearnAndUpdateHeuristics, RecordFlipped, GetDecLevelsAndMarkInHugeCounter are internal to the module)
+// (MinimizeClauseBin, GenerateAllUipClause, MinimizeClauseMinisat, LearnAndUpdateHeuristics, RecordFlipped, GetDecLevelsAndMarkInHugeCounter are internal to the module;
+//  LearnAndUpdateHeuristics and RecordFlipped move m_HandyLitsClearBefore[0] / [1] into a local with mem::take while in use, and the cls: *mut CVector
+//  parameter of MinimizeClause* / GenerateAllUipClause points at that local, never into the solver)
 
 // topi_debug_printing.rs
 pub(crate) fn SVar(&self, v: TUVar) -> String;  pub(crate) fn SLit(&self, l: TULit) -> String;
@@ -184,6 +186,19 @@ Members already provided by `src/topi.rs` (everything defined inline in `Topi.hp
 * `assert(...)` → `debug_assert!(...)` (compiled out of release builds exactly as with `NDEBUG`), including the printing idiom `assert(NV(2) || P("..."))`.
 * `unlikely(...)`/`likely(...)` hints are dropped.
 * Unsigned arithmetic wraps as in C++ (`overflow-checks` is off in every profile); signed counters that rely on wrap-around use `wrapping_add`.
-* `CApplyFuncOnExitFromScope` / `CSetInScope`: put the body of the function in an inner closure/block and run the exit code right after it on every path (or use a small local guard), preserving the order of the exit actions (C++ destructors run in reverse declaration order).
+* `CApplyFuncOnExitFromScope` / `CSetInScope`: put the body of the function in a `let res = 'body: { .. }` labeled block (every `return x` of the body becomes `break 'body x`) and run the exit code right after it, preserving the order of the exit actions (C++ destructors run in reverse declaration order).
 * Raw views (`Span`, `CCls`, `*mut TULit`) are exactly as fragile as their C++ counterparts: re-derive them wherever the C++ code re-derives them (after a reallocation of `m_B`/`m_W`).
 * Allocation failures never panic: they surface through `uninitialized_or_erroneous()` and `STATUS_ALLOC_FAILED`, as in C++.
+
+## Rust-side conventions
+
+These keep the port sound and lint-clean without changing its behavior; new code follows them too.
+
+* Only the API modules are public (`topor`, `topor_external_types`, `topor_ipasir`, `color_print`, `std_string`); the solver internals are `pub(crate)`, since their raw views are as unchecked as in C++. `TUInd` is sealed (implemented for `u32` and `u64` only) and its width bound is asserted per implementation.
+* A solver member must never be mutated through a raw pointer while `self` is borrowed (e.g., by a closure passed to `erase_if_may_reorder`): move the member out with `std::mem::take` for the duration and restore it afterwards (moving a `CVector`/`CDynArray` doesn't move its buffer, so spans stay valid). A watch-info that the callee may rewrite (e.g., across `CompressWLs`) is re-read by index rather than held as a pointer.
+* `BCGetBitArray(&mut self, i) -> &mut CBitArray` / `BCGetBitArrayConst(&self, i) -> &CBitArray`: readers use the latter.
+* Output to stdout from the library goes through `stdout_print!` / `stdout_println!` (they ignore a failed write, e.g., to a closed pipe, as C++ does), never `print!`.
+* `rand()` is the safe wrapper of the C library's generator in `topi_types.rs` (the same random choices as C++); don't declare it again.
+* Helpers for C++ idioms repeated across modules: `AssertConsistencyOn(level)` for `m_ParamAssertConsistency >= level && m_Stat.m_Conflicts >= m_ParamAssertConsistencyStartConf`, `WLBinWatchesSpan(&wi)` for the binary watches of a watch-info, `IsE2IInBounds(l)` before `E2I` on a literal that comes from the user.
+* Allocations the C++ version doesn't check (and that the callers can't survive) abort through `std::alloc::handle_alloc_error` rather than writing through a null buffer.
+* `cargo clippy --all-targets` is clean: the lints that the C++ naming and the statement-by-statement translation conflict with are allowed by name at the crate roots; anything else is fixed or allowed locally with a reason. `#[inline(always)]` is for one-line accessors; non-trivial functions get `#[inline]` at most. Add a `// SAFETY:` comment to every new or changed `unsafe` block.
