@@ -113,7 +113,7 @@ fn deletion_simplification_compression()
 // A random instance with clauses of lenMin..=lenMax literals, which is satisfied by the planted assignment (variable v is true iff v is even)
 fn Planted(v: usize) -> TLit
 {
-	if v % 2 == 0 { v as TLit } else { -(v as TLit) }
+	if v.is_multiple_of(2) { v as TLit } else { -(v as TLit) }
 }
 
 fn PlantedSat(seed: u64, vars: usize, clssNum: usize, lenMin: usize, lenMax: usize) -> Vec<Vec<TLit>>

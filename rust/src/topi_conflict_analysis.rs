@@ -582,6 +582,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	}
 
 	// The body of LearnAndUpdateHeuristics, after which the onExit code is run on every path
+	// The alias macro yields a mutable reference for reads and writes alike
+	#[allow(clippy::unnecessary_mut_passed)]
 	fn LearnAndUpdateHeuristicsBody(&mut self, contradictionInfo: &mut TContradictionInfo<Ind>, clsBeforeAllUipOrEmptyIfAllUipFailed: &mut CVector<TULit>) -> (TSpanTULit, Ind)
 	{
 		clsBeforeAllUipOrEmptyIfAllUipFailed.clear();
@@ -589,7 +591,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		self.m_ConfsSinceRestart += 1;
 		self.m_ConfsSinceNewInv += 1;
 
-		if self.m_Params.m_ParamVerbosity.get() > 0 && self.m_Stat.m_Conflicts % self.m_Params.m_ParamStatPrintOutConfs.get() as u64 == 0
+		if self.m_Params.m_ParamVerbosity.get() > 0 && self.m_Stat.m_Conflicts.is_multiple_of(self.m_Params.m_ParamStatPrintOutConfs.get() as u64)
 		{
 			stdout_print!("{}", self.StatStrShort(false));
 		}
@@ -1032,6 +1034,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	// Return a flipped clause if:
 	// (1) Flipped recording is on; (2) The current level is flipped; (3) The flipped clause is not subsumed by the main clause
 	// The return span is empty iff the recording is unsuccessful (in which case TUInd is BadParentClsInd too)
+	// The alias macro yields a mutable reference for reads and writes alike
+	#[allow(clippy::unnecessary_mut_passed)]
 	pub(crate) fn RecordFlipped(&mut self, contradictionInfo: &mut TContradictionInfo<Ind>, mainClsBeforeAllUip: TSpanTULit) -> (TSpanTULit, Ind)
 	{
 		// Giving an alias to m_VisitedLits to reflect the current usage for readability

@@ -142,7 +142,7 @@ impl CToporIpasirWrapper
 #[no_mangle]
 pub extern "C" fn ipasir_signature() -> *const c_char
 {
-	b"IntelSatSolver\0".as_ptr() as *const c_char
+	c"IntelSatSolver".as_ptr()
 }
 
 #[no_mangle]

@@ -2,6 +2,8 @@
 name = "intel_sat_solver"
 version = "0.1.0"
 edition = "2021"
+# is_multiple_of
+rust-version = "1.87"
 license = "MIT"
 description = "Rust fork of the Intel(R) SAT Solver (IntelSAT / Topor)"
 

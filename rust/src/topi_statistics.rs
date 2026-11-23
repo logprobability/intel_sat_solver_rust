@@ -196,7 +196,7 @@ impl TToporStatistics
 	{
 		let mut ss_head = String::new();
 		let mut ss_stat = String::new();
-		let print_head = force_printing_head || self.m_ShortStartInv % 50 == 0;
+		let print_head = force_printing_head || self.m_ShortStartInv.is_multiple_of(50);
 		if print_head
 		{
 			ss_head += "c ToporStt ";

@@ -77,7 +77,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		if self.m_Params.m_ParamPolarityFlipFactor.get() != 0
 		{
 			self.m_NonForcedPolaritySelectionForFlip += 1;
-			if self.m_NonForcedPolaritySelectionForFlip % self.m_Params.m_ParamPolarityFlipFactor.get() == 0 { !res } else { res }
+			if self.m_NonForcedPolaritySelectionForFlip.is_multiple_of(self.m_Params.m_ParamPolarityFlipFactor.get()) { !res } else { res }
 		}
 		else
 		{
@@ -99,7 +99,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		let varDecayInc: f64 = if self.m_QueryCurr == TQueryType::QUERY_INC_SHORT { self.m_Params.m_ParamVarDecayIncS.get() } else if self.m_QueryCurr == TQueryType::QUERY_INC_NORMAL { self.m_Params.m_ParamVarDecayIncAi.get() } else { self.m_Params.m_ParamVarDecayInc.get() };
 		let varDecayMax: f64 = if self.m_QueryCurr == TQueryType::QUERY_INC_SHORT { self.m_Params.m_ParamVarDecayMaxS.get() } else if self.m_QueryCurr == TQueryType::QUERY_INC_NORMAL { self.m_Params.m_ParamVarDecayMaxAi.get() } else { self.m_Params.m_ParamVarDecayMax.get() };
 
-		if self.m_Params.m_ParamVarDecayUpdateConfRate.get() > 0 && (self.m_Stat.m_Conflicts % self.m_Params.m_ParamVarDecayUpdateConfRate.get() as u64 == 0)
+		if self.m_Params.m_ParamVarDecayUpdateConfRate.get() > 0 && self.m_Stat.m_Conflicts.is_multiple_of(self.m_Params.m_ParamVarDecayUpdateConfRate.get() as u64)
 			&& D1LowerOrEqD2UpToPrecision(self.m_Stat.m_VarDecay + varDecayInc, varDecayMax)
 		{
 			self.m_Stat.m_VarDecay += varDecayInc;

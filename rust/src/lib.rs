@@ -7,10 +7,21 @@
 //! and the classes, the functions and the data members retain their C++ names.
 
 // The fork retains the C++ identifiers and layout conventions
-#![allow(non_snake_case, non_upper_case_globals, non_camel_case_types)]
-#![allow(clippy::all)]
+#![allow(non_snake_case, non_upper_case_globals, non_camel_case_types, clippy::upper_case_acronyms)]
 // The fork ports every member the C++ solver defines, including the ones the C++ solver never calls
 #![allow(dead_code)]
+// The control flow is translated statement by statement and the signatures follow the C++ ones (see PORTING.md),
+// so the lints, whose fix would restructure a C++ statement, expression or signature, are off
+#![allow(
+	clippy::collapsible_if,
+	clippy::collapsible_else_if,
+	clippy::if_same_then_else,
+	clippy::int_plus_one,
+	clippy::needless_range_loop,
+	clippy::explicit_counter_loop,
+	clippy::too_many_arguments,
+	clippy::type_complexity
+)]
 
 // print!/println! for the library: the C++ version ignores a failure to write to stdout (e.g., a closed pipe), while print! panics on it
 // (the unit tests keep print!, which the test harness captures)

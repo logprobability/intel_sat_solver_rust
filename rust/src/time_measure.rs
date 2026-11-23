@@ -140,7 +140,7 @@ impl CTimeMeasure
 		{
 			self.CpuTimePassedSinceStartOrResetConst()
 		}
-		else if self.m_TimeoutTestCounter % self.m_TimeoutTestModuloFactor == 0
+		else if self.m_TimeoutTestCounter.is_multiple_of(self.m_TimeoutTestModuloFactor)
 		{
 			self.m_TimeoutTestCounter += 1;
 			self.m_LatestResForTestCounter = self.CpuTimePassedSinceStartOrResetConst();
@@ -165,7 +165,7 @@ impl CTimeMeasure
 		{
 			self.WallTimePassedSinceStartOrResetConst()
 		}
-		else if self.m_TimeoutTestCounter % self.m_TimeoutTestModuloFactor == 0
+		else if self.m_TimeoutTestCounter.is_multiple_of(self.m_TimeoutTestModuloFactor)
 		{
 			self.m_TimeoutTestCounter += 1;
 			self.m_LatestResForTestCounter = self.WallTimePassedSinceStartOrResetConst();
