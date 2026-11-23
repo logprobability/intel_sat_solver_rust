@@ -537,7 +537,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	}
 
 	// The VisitCls lambda of LearnAndUpdateHeuristics
-	#[inline(always)]
+	#[inline]
 	fn LearnAndUpdateHeuristicsVisitCls(&mut self, cls: TSpanTULit, longClsInd: Ind, updateClsCounter: bool, varsToVisitCurrDecLevel: &mut TUV, visitedNegLitsPrevDecLevels: *mut CVector<TULit>)
 	{
 		if updateClsCounter
@@ -1022,7 +1022,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	}
 
 	// The VisitCls lambda of RecordFlipped
-	#[inline(always)]
+	#[inline]
 	fn RecordFlippedVisitCls(&mut self, cls: TSpanTULit, _longClsInd: Ind, varsToVisitCurrFlippedLevel: &mut TUV, visitedNegLitsPrevFlippedLevels: *mut CVector<TULit>)
 	{
 		for l in cls

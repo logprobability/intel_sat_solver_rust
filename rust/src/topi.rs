@@ -1199,7 +1199,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		self.ConstClsSpanInternal(clsInd, maxSpanElems, &self.m_TmpClssDebug, &self.m_CurrTmpClssCountDebug)
 	}
 
-	#[inline(always)]
+	#[inline]
 	pub(crate) fn ConstClsSpanInternal(&self, clsInd: Ind, mut maxSpanElems: TUV, tmpClss: &UnsafeCell<[CDynArray<TULit>; m_TmpClssCountMax]>, tmpClssCount: &Cell<u8>) -> TSpanTULit
 	{
 		if !Compress
@@ -1877,7 +1877,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		self.M_CbNewLearntCls.is_some() || self.m_OpenedDratFile.is_some()
 	}
 
-	#[inline(always)]
+	#[inline]
 	pub(crate) fn CleanVisited(&mut self)
 	{
 		let ai = &mut self.m_AssignmentInfo;
@@ -1937,7 +1937,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		self.m_VisitedVars.pop_back()
 	}
 
-	#[inline(always)]
+	#[inline]
 	pub(crate) fn CleanRooted(&mut self)
 	{
 		let ai = &mut self.m_AssignmentInfo;
@@ -2105,7 +2105,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		TBCInd::new(bcHashId, self.m_ClsLoopCurrCompressedBACurrBit)
 	}
 
-	#[inline(always)]
+	#[inline]
 	pub(crate) fn ClsLoopCompressedNewBC(&mut self) -> Ind
 	{
 		while self.m_ClsLoopCurrCompressedBA != self.m_BC.end()

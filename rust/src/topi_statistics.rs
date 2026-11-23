@@ -326,7 +326,7 @@ impl TToporStatistics
 		if total == 0 { 0. } else { 100. * fraction as f64 / total as f64 }
 	}
 
-	#[inline(always)]
+	#[inline]
 	pub(crate) fn NewClause(&mut self, cls_len: usize, is_learnt: bool)
 	{
 		if cls_len >= 2
@@ -351,7 +351,7 @@ impl TToporStatistics
 		}
 	}
 
-	#[inline(always)]
+	#[inline]
 	pub(crate) fn DeleteClause(&mut self, cls_len: usize, is_learnt: bool)
 	{
 		if cls_len >= 2
