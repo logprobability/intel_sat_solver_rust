@@ -24,6 +24,9 @@
 //!
 //! The file is locked (`File::try_lock`) while a connection holds it, so a second connection can't interleave appends.
 //!
+//! The Float and Instant value tags (4 and 5) came after the format's version 1 and keep it: older logs read as before, but a log that
+//! holds such values reads as `CorruptLog` in builds from before them.
+//!
 //! # Checkpoints
 //! `Conn::checkpoint` writes `<log>.ckpt`: a 36-byte header (magic, format version, the length of the log prefix it covers, the CRC-32
 //! of that prefix, the payload's length and CRC-32) and the payload, a `Snapshot` of the database after the covered records (what can't be

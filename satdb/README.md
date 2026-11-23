@@ -7,7 +7,8 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   (datoms, distinct entities, distinct values). `Db::transact` returns a new value.
   * Value types: `Bool`, `Int` (i64), `Float` (f64), `Str`, `Instant` (milliseconds since the Unix epoch) and `Ref`. Values order by type,
     then within it; Floats are totally ordered (`f64::total_cmp`: -0.0 before 0.0, NaN at the ends), so that they can be index keys, and
-    equality follows that order (NaN equals NaN, -0.0 doesn't equal 0.0). Comparison predicates compare an Int with a Float numerically.
+    equality follows that order (NaN equals NaN, -0.0 doesn't equal 0.0). Comparison predicates compare an Int with a Float numerically, `=` and `!=` included
+    (unlike Datomic, where `(= 1 1.0)` is false), while `min`, `max` and `count-distinct` use the index order (by type first).
 * **Transactions** (`src/db.rs`). As in Datomic, a transaction is a *set* of assertions and retractions against the database before it,
   so the order of its operations doesn't matter:
   * a tempid asserting an existing `:db.unique/identity` value upserts to that entity, and tempids asserting the same new identity value
