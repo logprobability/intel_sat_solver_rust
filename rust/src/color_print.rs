@@ -35,6 +35,6 @@ pub fn print_as_color<P: Display>(value: P, color: ansi_color_code) -> String
 	}
 	else
 	{
-		format!("{}", value)
+		value.to_string()
 	}
 }

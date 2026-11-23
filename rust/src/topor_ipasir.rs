@@ -20,9 +20,8 @@ pub struct CToporIpasirWrapper
 	m_CurrAssumps: Vec<c_int>,
 	m_Assump2Ind: HashMap<c_int, usize>,
 	m_PrevAssump2Ind: HashMap<c_int, usize>,
-	// The terminate state and function are shared with the stop-now callback (which captures the wrapper by reference in the C++ version)
-	m_CurrTerminateState: Rc<Cell<*mut c_void>>,
-	m_CurrTerminateFunc: Rc<Cell<TTerminateFunc>>,
+	// The terminate function and state are shared with the stop-now callback (which captures the wrapper by reference in the C++ version)
+	m_CurrTerminate: Rc<Cell<(TTerminateFunc, *mut c_void)>>,
 }
 
 impl Default for CToporIpasirWrapper
@@ -44,8 +43,7 @@ impl CToporIpasirWrapper
 			m_CurrAssumps: Vec::new(),
 			m_Assump2Ind: HashMap::new(),
 			m_PrevAssump2Ind: HashMap::new(),
-			m_CurrTerminateState: Rc::new(Cell::new(std::ptr::null_mut())),
-			m_CurrTerminateFunc: Rc::new(Cell::new(None)),
+			m_CurrTerminate: Rc::new(Cell::new((None, std::ptr::null_mut()))),
 		}
 	}
 
@@ -64,9 +62,9 @@ impl CToporIpasirWrapper
 
 	pub fn Assume(&mut self, lit: c_int)
 	{
-		if !self.m_Assump2Ind.contains_key(&lit)
+		if let std::collections::hash_map::Entry::Vacant(e) = self.m_Assump2Ind.entry(lit)
 		{
-			self.m_Assump2Ind.insert(lit, self.m_CurrAssumps.len());
+			e.insert(self.m_CurrAssumps.len());
 			self.m_CurrAssumps.push(lit);
 		}
 	}
@@ -75,7 +73,6 @@ impl CToporIpasirWrapper
 	{
 		let trv = self.m_Topor.Solve(&self.m_CurrAssumps, (f64::MAX, true), u64::MAX);
 		self.m_PrevAssump2Ind = std::mem::take(&mut self.m_Assump2Ind);
-		self.m_Assump2Ind.clear();
 		self.m_CurrAssumps.clear();
 
 		match trv
@@ -99,8 +96,8 @@ impl CToporIpasirWrapper
 
 	pub fn Failed(&mut self, lit: c_int) -> c_int
 	{
-		// m_PrevAssump2Ind[lit]: inserts 0, if lit is missing
-		let assumpInd = *self.m_PrevAssump2Ind.entry(lit).or_insert(0);
+		// m_PrevAssump2Ind[lit] in the C++ version, which inserts (and returns) 0, if lit is missing
+		let assumpInd = self.m_PrevAssump2Ind.get(&lit).copied().unwrap_or(0);
 		self.m_Topor.IsAssumptionRequired(assumpInd) as c_int
 	}
 
@@ -108,18 +105,16 @@ impl CToporIpasirWrapper
 	{
 		if terminate.is_none()
 		{
-			self.m_CurrTerminateFunc.set(None);
-			self.m_CurrTerminateState.set(std::ptr::null_mut());
+			self.m_CurrTerminate.set((None, std::ptr::null_mut()));
 			return;
 		}
 
-		self.m_CurrTerminateFunc.set(terminate);
-		self.m_CurrTerminateState.set(state);
-		let currTerminateFunc = self.m_CurrTerminateFunc.clone();
-		let currTerminateState = self.m_CurrTerminateState.clone();
-		let StopTopor = move || match currTerminateFunc.get()
+		self.m_CurrTerminate.set((terminate, state));
+		let currTerminate = self.m_CurrTerminate.clone();
+		let StopTopor = move || match currTerminate.get()
 		{
-			Some(terminateFunc) if unsafe { terminateFunc(currTerminateState.get()) } != 0 => TStopTopor::VAL_STOP,
+			// SAFETY: the user guarantees that terminate is callable with state for as long as it is set (see ipasir_set_terminate)
+			(Some(terminateFunc), currState) if unsafe { terminateFunc(currState) } != 0 => TStopTopor::VAL_STOP,
 			_ => TStopTopor::VAL_CONTINUE,
 		};
 
@@ -137,6 +132,14 @@ impl CToporIpasirWrapper
 	{
 		&mut self.m_Topor
 	}
+}
+
+/// The wrapper behind the opaque solver handle of the C API
+/// # Safety
+/// solver must have been returned by ipasir_init and not released yet, and not be in use by another call
+unsafe fn Wrapper<'a>(solver: *mut c_void) -> &'a mut CToporIpasirWrapper
+{
+	&mut *(solver as *mut CToporIpasirWrapper)
 }
 
 #[no_mangle]
@@ -169,8 +172,7 @@ pub unsafe extern "C" fn ipasir_release(solver: *mut c_void)
 #[no_mangle]
 pub unsafe extern "C" fn ipasir_add(solver: *mut c_void, lit: c_int)
 {
-	let tiw = &mut *(solver as *mut CToporIpasirWrapper);
-	tiw.Add(lit);
+	Wrapper(solver).Add(lit);
 }
 
 /// # Safety
@@ -178,8 +180,7 @@ pub unsafe extern "C" fn ipasir_add(solver: *mut c_void, lit: c_int)
 #[no_mangle]
 pub unsafe extern "C" fn ipasir_assume(solver: *mut c_void, lit: c_int)
 {
-	let tiw = &mut *(solver as *mut CToporIpasirWrapper);
-	tiw.Assume(lit);
+	Wrapper(solver).Assume(lit);
 }
 
 /// # Safety
@@ -187,8 +188,7 @@ pub unsafe extern "C" fn ipasir_assume(solver: *mut c_void, lit: c_int)
 #[no_mangle]
 pub unsafe extern "C" fn ipasir_solve(solver: *mut c_void) -> c_int
 {
-	let tiw = &mut *(solver as *mut CToporIpasirWrapper);
-	tiw.Solve()
+	Wrapper(solver).Solve()
 }
 
 /// # Safety
@@ -196,8 +196,7 @@ pub unsafe extern "C" fn ipasir_solve(solver: *mut c_void) -> c_int
 #[no_mangle]
 pub unsafe extern "C" fn ipasir_val(solver: *mut c_void, lit: c_int) -> c_int
 {
-	let tiw = &mut *(solver as *mut CToporIpasirWrapper);
-	tiw.Val(lit)
+	Wrapper(solver).Val(lit)
 }
 
 /// # Safety
@@ -205,8 +204,7 @@ pub unsafe extern "C" fn ipasir_val(solver: *mut c_void, lit: c_int) -> c_int
 #[no_mangle]
 pub unsafe extern "C" fn ipasir_failed(solver: *mut c_void, lit: c_int) -> c_int
 {
-	let tiw = &mut *(solver as *mut CToporIpasirWrapper);
-	tiw.Failed(lit)
+	Wrapper(solver).Failed(lit)
 }
 
 /// # Safety
@@ -214,8 +212,7 @@ pub unsafe extern "C" fn ipasir_failed(solver: *mut c_void, lit: c_int) -> c_int
 #[no_mangle]
 pub unsafe extern "C" fn ipasir_set_terminate(solver: *mut c_void, state: *mut c_void, terminate: TTerminateFunc)
 {
-	let tiw = &mut *(solver as *mut CToporIpasirWrapper);
-	tiw.SetTerminate(state, terminate);
+	Wrapper(solver).SetTerminate(state, terminate);
 }
 
 /// # Safety
@@ -223,6 +220,5 @@ pub unsafe extern "C" fn ipasir_set_terminate(solver: *mut c_void, state: *mut c
 #[no_mangle]
 pub unsafe extern "C" fn ipasir_set_parameter(solver: *mut c_void, paramName: *const c_char, paramVal: *const c_char)
 {
-	let tiw = &mut *(solver as *mut CToporIpasirWrapper);
-	tiw.SetParam(&CStr::from_ptr(paramName).to_string_lossy(), &CStr::from_ptr(paramVal).to_string_lossy());
+	Wrapper(solver).SetParam(&CStr::from_ptr(paramName).to_string_lossy(), &CStr::from_ptr(paramVal).to_string_lossy());
 }

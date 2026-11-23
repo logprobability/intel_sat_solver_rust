@@ -189,7 +189,7 @@ impl<Ind: TUInd, const Compress: bool> TToporInst for CTopor<Ind, Compress>
 	}
 }
 
-fn OnFinishingSolving(out: &mut dyn Write, topor: &mut dyn TToporInst, ret: TToporReturnVal, printModel: bool, printUcore: bool, assumps: &[TLit], varsToPrint: Option<&Vec<TLit>>) -> i32
+fn OnFinishingSolving(out: &mut dyn Write, topor: &mut dyn TToporInst, ret: TToporReturnVal, printModel: bool, printUcore: bool, assumps: &[TLit], varsToPrint: Option<&[TLit]>) -> i32
 {
 	let res = OnFinishingSolvingInternal(out, topor, ret, printModel, printUcore, assumps, varsToPrint);
 
@@ -203,7 +203,7 @@ fn OnFinishingSolving(out: &mut dyn Write, topor: &mut dyn TToporInst, ret: TTop
 	res
 }
 
-fn OnFinishingSolvingInternal(out: &mut dyn Write, topor: &mut dyn TToporInst, ret: TToporReturnVal, printModel: bool, printUcore: bool, assumps: &[TLit], varsToPrint: Option<&Vec<TLit>>) -> i32
+fn OnFinishingSolvingInternal(out: &mut dyn Write, topor: &mut dyn TToporInst, ret: TToporReturnVal, printModel: bool, printUcore: bool, assumps: &[TLit], varsToPrint: Option<&[TLit]>) -> i32
 {
 	match ret
 	{
@@ -823,7 +823,7 @@ impl<'a> CToporTool<'a>
 	}
 
 	// Returns 10 upon success and BadRetVal upon failure
-	fn VerifyModel(&mut self, assumps: Option<&Vec<TLit>>) -> i32
+	fn VerifyModel(&mut self, assumps: Option<&[TLit]>) -> i32
 	{
 		// Verify the model
 		coutln!(self.out, "c topor_tool: before verifying that the model satisfies {}", if assumps.is_none() { "the clauses" } else { "the assumptions and the clauses" });
@@ -875,7 +875,7 @@ impl<'a> CToporTool<'a>
 		10
 	}
 
-	fn ToporOnFinishedSolving(&mut self, assumps: &[TLit], varsToPrint: Option<&Vec<TLit>>) -> i32
+	fn ToporOnFinishedSolving(&mut self, assumps: &[TLit], varsToPrint: Option<&[TLit]>) -> i32
 	{
 		let (ret, printModel, printUcore) = (self.ret, self.printModel, self.printUcore);
 		match self.topor.as_mut()
@@ -885,10 +885,9 @@ impl<'a> CToporTool<'a>
 		}
 	}
 
-	fn Solve(&mut self, assumpsPtr: Option<&Vec<TLit>>) -> i32
+	fn Solve(&mut self, assumpsPtr: Option<&[TLit]>) -> i32
 	{
-		let assumpsEmpty: Vec<TLit> = Vec::new();
-		let assumps = assumpsPtr.unwrap_or(&assumpsEmpty);
+		let assumps = assumpsPtr.unwrap_or(&[]);
 		let (nextSolveToInSecIsCpuTime, nextSolveConfThr) = (self.nextSolveToInSecIsCpuTime, self.nextSolveConfThr);
 		self.ret = self.Topor().ToporSolve(assumps, nextSolveToInSecIsCpuTime, nextSolveConfThr);
 		self.nextSolveToInSecIsCpuTime = (f64::MAX, false);
@@ -1303,10 +1302,9 @@ impl<'a> CToporTool<'a>
 		{
 			if self.allsatModels > 1 && !self.blockingVars.is_empty()
 			{
-				let assumpsEmpty: Vec<TLit> = Vec::new();
 				let blockingVars = self.blockingVars.clone();
 				self.ret = self.Topor().ToporSolve(&[], (f64::MAX, true), u64::MAX);
-				self.retValBasedOnLatestSolve = self.ToporOnFinishedSolving(&assumpsEmpty, Some(&blockingVars));
+				self.retValBasedOnLatestSolve = self.ToporOnFinishedSolving(&[], Some(&blockingVars));
 				if self.verifyModel && self.retValBasedOnLatestSolve == 10
 				{
 					if self.VerifyModel(None) == BadRetVal
@@ -1330,7 +1328,7 @@ impl<'a> CToporTool<'a>
 					}
 					self.Topor().ToporAddClause(&cls);
 					self.ret = self.Topor().ToporSolve(&[], (f64::MAX, true), u64::MAX);
-					self.retValBasedOnLatestSolve = self.ToporOnFinishedSolving(&assumpsEmpty, Some(&blockingVars));
+					self.retValBasedOnLatestSolve = self.ToporOnFinishedSolving(&[], Some(&blockingVars));
 					if self.verifyModel && self.retValBasedOnLatestSolve == 10
 					{
 						if self.VerifyModel(None) == BadRetVal
