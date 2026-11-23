@@ -593,27 +593,22 @@ fn string_stream_and_var_list()
 	assert_eq!(ss.getline(b','), b"987");
 	assert!(!ss.good());
 
-	let R = |s: &str| -> (Vec<TLit>, String)
-	{
-		let mut errMsg = "garbage".to_string();
-		let varList = ReadCommaSeparatedVarList(&mut errMsg, s.as_bytes());
-		(varList, errMsg)
-	};
-	assert_eq!(R("1,4,15"), (vec![1, 4, 15], String::new()));
-	assert_eq!(R("7"), (vec![7], String::new()));
-	assert_eq!(R("7\n"), (vec![7], String::new()));
+	let R = |s: &str| ReadCommaSeparatedVarList(s.as_bytes());
+	assert_eq!(R("1,4,15"), Ok(vec![1, 4, 15]));
+	assert_eq!(R("7"), Ok(vec![7]));
+	assert_eq!(R("7\n"), Ok(vec![7]));
 	// A trailing comma is an error: there is nothing to convert after it
-	assert_eq!(R("7,8,"), (vec![7, 8], "c ERROR: couldn't convert 7,8, to a variable list\n".to_string()));
-	assert_eq!(R(""), (vec![], "c ERROR: couldn't convert  to a variable list\n".to_string()));
-	assert_eq!(R("1,x,3"), (vec![1], "c ERROR: couldn't convert 1,x,3 to a variable list\n".to_string()));
-	assert_eq!(R("1,,3"), (vec![1], "c ERROR: couldn't convert 1,,3 to a variable list\n".to_string()));
-	assert_eq!(R("99999999999999999999"), (vec![], "c ERROR: couldn't convert 99999999999999999999 to a variable list\n".to_string()));
+	assert_eq!(R("7,8,"), Err("c ERROR: couldn't convert 7,8, to a variable list\n".to_string()));
+	assert_eq!(R(""), Err("c ERROR: couldn't convert  to a variable list\n".to_string()));
+	assert_eq!(R("1,x,3"), Err("c ERROR: couldn't convert 1,x,3 to a variable list\n".to_string()));
+	assert_eq!(R("1,,3"), Err("c ERROR: couldn't convert 1,,3 to a variable list\n".to_string()));
+	assert_eq!(R("99999999999999999999"), Err("c ERROR: couldn't convert 99999999999999999999 to a variable list\n".to_string()));
 	// A non-positive variable at the end of the list: precisely as in the C++ version, the error message is lost, since the stream isn't good anymore
-	assert_eq!(R("1,0"), (vec![1, 0], String::new()));
-	assert_eq!(R("1,-2"), (vec![1, -2], String::new()));
+	assert_eq!(R("1,0"), Ok(vec![1, 0]));
+	assert_eq!(R("1,-2"), Ok(vec![1, -2]));
 	// A non-positive variable in the middle of the list: precisely as in the C++ version, the error message goes into the stream the variables are read from, so reading the next variable fails
-	assert_eq!(R("-2,3"), (vec![-2], "c ERROR: couldn't convert -2,3 to a variable list\n".to_string()));
-	assert_eq!(R("0,5"), (vec![0], "c ERROR: couldn't convert 0,5 to a variable list\n".to_string()));
+	assert_eq!(R("-2,3"), Err("c ERROR: couldn't convert -2,3 to a variable list\n".to_string()));
+	assert_eq!(R("0,5"), Err("c ERROR: couldn't convert 0,5 to a variable list\n".to_string()));
 }
 
 #[test]
@@ -673,31 +668,26 @@ fn line_parsing()
 #[test]
 fn param_readers()
 {
-	let mut errMsg = String::new();
-	assert!(!CToporTool::ReadBoolParam(&mut errMsg, "0") && errMsg.is_empty());
-	assert!(CToporTool::ReadBoolParam(&mut errMsg, "1") && errMsg.is_empty());
-	assert!(CToporTool::ReadBoolParam(&mut errMsg, "5"));
-	assert_eq!(errMsg, "c ERROR: 5 must be 0 or 1\n");
-	assert!(!CToporTool::ReadBoolParam(&mut errMsg, "y"));
-	assert_eq!(errMsg, "c ERROR: couldn't convert y to an integer\n");
+	fn E<T>(s: &str) -> Result<T, String>
+	{
+		Err(s.to_string())
+	}
+	assert_eq!(CToporTool::ReadBoolParam("0"), Ok(false));
+	assert_eq!(CToporTool::ReadBoolParam("1"), Ok(true));
+	assert_eq!(CToporTool::ReadBoolParam("5"), E("c ERROR: 5 must be 0 or 1\n"));
+	assert_eq!(CToporTool::ReadBoolParam("y"), E("c ERROR: couldn't convert y to an integer\n"));
 	// Out of the range of int
-	assert!(!CToporTool::ReadBoolParam(&mut errMsg, "99999999999"));
-	assert_eq!(errMsg, "c ERROR: couldn't convert 99999999999 to an integer\n");
+	assert_eq!(CToporTool::ReadBoolParam("99999999999"), E("c ERROR: couldn't convert 99999999999 to an integer\n"));
 
 	for (s, v) in [("0", 0), ("1", 1), ("2", 2)]
 	{
-		assert_eq!(CToporTool::Read0to2Param(&mut errMsg, s), v);
-		assert!(errMsg.is_empty());
+		assert_eq!(CToporTool::Read0to2Param(s), Ok(v));
 	}
-	assert_eq!(CToporTool::Read0to2Param(&mut errMsg, "3"), 3);
-	assert_eq!(errMsg, "c ERROR: 3 must be 0 or 1 or 2\n");
-	assert_eq!(CToporTool::Read0to2Param(&mut errMsg, "two"), 0);
-	assert_eq!(errMsg, "c ERROR: couldn't convert two to an integer\n");
+	assert_eq!(CToporTool::Read0to2Param("3"), E("c ERROR: 3 must be 0 or 1 or 2\n"));
+	assert_eq!(CToporTool::Read0to2Param("two"), E("c ERROR: couldn't convert two to an integer\n"));
 
-	assert_eq!(CToporTool::ReadULongParam(&mut errMsg, "18446744073709551615"), u64::MAX);
-	assert!(errMsg.is_empty());
-	assert_eq!(CToporTool::ReadULongParam(&mut errMsg, "many"), 0);
-	assert_eq!(errMsg, "c ERROR: couldn't convert many to an unsigned long\n");
+	assert_eq!(CToporTool::ReadULongParam("18446744073709551615"), Ok(u64::MAX));
+	assert_eq!(CToporTool::ReadULongParam("many"), E("c ERROR: couldn't convert many to an unsigned long\n"));
 }
 
 // A solver, which answers as told: for the paths of the tool, which a correct solver never triggers (wrong models and wrong unsatisfiable cores)
