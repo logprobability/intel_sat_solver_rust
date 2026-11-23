@@ -79,26 +79,25 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			!topi.IsAssigned(l) || (eraseDecLevel && topi.GetAssignedDecLevel(l) == decLevel)
 		}
 
-		// The closure needs the solver, while m_ToPropagate is being modified; it only touches the visited-related members
-		let toPropagate: *mut CVector<TULit> = &mut self.m_ToPropagate;
-		unsafe
-		{
-			(*toPropagate).erase_if_may_reorder(
-				|l: TULit|
+		// The closure needs the solver, while m_ToPropagate is being modified; it only touches the visited-related members,
+		// so m_ToPropagate is moved out for the duration (moving the vector doesn't move its buffer)
+		let mut toPropagate = std::mem::take(&mut self.m_ToPropagate);
+		toPropagate.erase_if_may_reorder(
+			|l: TULit|
+			{
+				debug_assert!(!self.IsAssigned(l) || self.GetAssignedDecLevel(l) <= decLevel);
+				let eraseLit = EraseLit(self, l, decLevel, eraseDecLevel);
+				if eraseLit
 				{
-					debug_assert!(!self.IsAssigned(l) || self.GetAssignedDecLevel(l) <= decLevel);
-					let eraseLit = EraseLit(self, l, decLevel, eraseDecLevel);
-					if eraseLit
-					{
-						// Marking literals erased from toPropagate
-						// for implementing ProcessDelayedImplication correctly (see the comments there)
-						self.MarkVisited(l);
-					}
-					eraseLit
-				},
-				0,
-			);
-		}
+					// Marking literals erased from toPropagate
+					// for implementing ProcessDelayedImplication correctly (see the comments there)
+					self.MarkVisited(l);
+				}
+				eraseLit
+			},
+			0,
+		);
+		self.m_ToPropagate = toPropagate;
 
 		debug_assert!(self.m_CurrentlyPropagatedLit != BadULit);
 		if EraseLit(self, self.m_CurrentlyPropagatedLit, decLevel, eraseDecLevel)
@@ -158,20 +157,18 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 			self.BCPBacktrack(maxDecLevelInContradictingCls, true);
 
-			// The closure needs the solver (read-only), while m_Cis is being modified
-			let cis: *mut CVector<TContradictionInfo<Ind>> = &mut self.m_Cis;
-			unsafe
-			{
-				(*cis).erase_if_may_reorder(
-					|mut ci: TContradictionInfo<Ind>|
-					{
-						debug_assert!(ci.IsContradiction());
-						debug_assert!(self.IsAssigned(self.CiGetSpanDebug(&mut ci, TUV::MAX)[0]) == self.IsAssigned(self.CiGetSpanDebug(&mut ci, TUV::MAX)[1]));
-						!self.IsAssigned(self.CiGetSpanDebug(&mut ci, 1)[0])
-					},
-					0,
-				);
-			}
+			// The closure needs the solver (read-only), while m_Cis is being modified, so m_Cis is moved out for the duration
+			let mut cis = std::mem::take(&mut self.m_Cis);
+			cis.erase_if_may_reorder(
+				|mut ci: TContradictionInfo<Ind>|
+				{
+					debug_assert!(ci.IsContradiction());
+					debug_assert!(self.IsAssigned(self.CiGetSpanDebug(&mut ci, TUV::MAX)[0]) == self.IsAssigned(self.CiGetSpanDebug(&mut ci, TUV::MAX)[1]));
+					!self.IsAssigned(self.CiGetSpanDebug(&mut ci, 1)[0])
+				},
+				0,
+			);
+			self.m_Cis = cis;
 
 			self.m_Cis.emplace_back(newCi);
 

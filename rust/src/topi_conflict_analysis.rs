@@ -155,7 +155,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		self.m_AllUipAttemptedCurrRestart = 0;
 	}
 
-	// cls is a raw pointer, since it normally points at one of the solver's own members (m_HandyLitsClearBefore[i])
+	// cls is a raw pointer (the C++ reference); the callers move m_HandyLitsClearBefore[i] out of the solver first, so that cls never aliases self
 	pub(crate) fn MinimizeClauseBin(&mut self, cls: *mut CVector<TULit>)
 	{
 		let cls = unsafe { &mut *cls };
@@ -190,7 +190,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		self.CleanRooted();
 	}
 
-	// cls is a raw pointer, since it normally points at one of the solver's own members (m_HandyLitsClearBefore[i])
+	// cls is a raw pointer (the C++ reference); the callers move m_HandyLitsClearBefore[i] out of the solver first, so that cls never aliases self
 	pub(crate) fn GenerateAllUipClause(&mut self, cls: *mut CVector<TULit>) -> bool
 	{
 		let cls = unsafe { &mut *cls };
@@ -460,7 +460,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		canBeRemoved
 	}
 
-	// cls is a raw pointer, since it normally points at one of the solver's own members (m_HandyLitsClearBefore[i])
+	// cls is a raw pointer (the C++ reference); the callers move m_HandyLitsClearBefore[i] out of the solver first, so that cls never aliases self
 	pub(crate) fn MinimizeClauseMinisat(&mut self, cls: *mut CVector<TULit>)
 	{
 		let cls = unsafe { &mut *cls };
@@ -595,393 +595,399 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		}
 
 		// Giving an alias to m_VisitedLits to reflect the current usage for readability
-		let visitedNegLitsPrevDecLevelsPtr: *mut CVector<TULit> = &mut self.m_HandyLitsClearBefore[0];
+		// The vector is moved out of the solver while in use, so that the borrows of the solver don't alias it (moving it doesn't move its buffer)
+		let mut visitedNegLitsPrevDecLevelsVec = std::mem::take(&mut self.m_HandyLitsClearBefore[0]);
 		macro_rules! visitedNegLitsPrevDecLevels
 		{
-			() => { (unsafe { &mut *visitedNegLitsPrevDecLevelsPtr }) };
+			() => { (&mut visitedNegLitsPrevDecLevelsVec) };
 		}
-		// Clear from any previous usage
-		visitedNegLitsPrevDecLevels!().clear();
-
-		debug_assert!(self.CiIsLegal(contradictionInfo, true));
-
-		let mut contradictingCls = self.CiGetSpan(contradictionInfo, TUV::MAX);
-
-		debug_assert!(self.NV(2) || self.P(&("************************ Conflict #".to_string() + &self.m_Stat.m_Conflicts.to_string() + "\n" + &self.STrail() + "\n" + "Contradicting clause: " + &self.SLits(contradictingCls, false) + "\n")));
-
-		// The other case is taken care of by the CDCL-loop in Solve
-		debug_assert!(self.GetAssignedDecLevel(contradictingCls[0]) == self.GetAssignedDecLevel(contradictingCls[1]));
-		// Again, any backtracking is taken care of by the CDCL-loop in Solve
-		debug_assert!(self.GetAssignedDecLevel(contradictingCls[0]) == self.m_DecLevel);
-
-		let mut varsToVisitCurrDecLevel: TUV = 0;
-
-		self.LearnAndUpdateHeuristicsVisitCls(contradictingCls, if contradictionInfo.m_IsContradictionInBinaryCls { Self::BadClsInd } else { contradictionInfo.m_ParentClsInd }, false, &mut varsToVisitCurrDecLevel, visitedNegLitsPrevDecLevelsPtr);
-
-		// Used to maintain all the heuristics working if the contradicting clause manages to stay the 1UIP
-		let trailEndBeforeOnTheFlySubsumption: TUVar = self.m_TrailEnd;
-
-		self.m_VarsParentSubsumed.clear();
-
-		let mut v: TUVar = self.m_TrailEnd;
-		let vDecLevel: TUV = self.GetAssignedDecLevelVar(v);
-		let vDecVar: TUVar = self.GetDecVar(vDecLevel);
-		let isAssumpLevel = self.IsAssumpVar(vDecVar);
-		// Removing a subsumed contradicting clause at assumption level might result in a correctness problem,
-		// because the algorithm doesn't stop at first UIP, so it won't record the subsuming clause
-		let mut contradictingIsLearnt = self.IsOnTheFlySubsumptionContradictingOn() && !isAssumpLevel;
-		while varsToVisitCurrDecLevel != 1 || (isAssumpLevel && !(self.IsSatisfiedAssump(v) && self.m_AssignmentInfo[v as usize].m_Visit()))
+		let res = 'body:
 		{
-			'iter:
+			// Clear from any previous usage
+			visitedNegLitsPrevDecLevels!().clear();
+
+			debug_assert!(self.CiIsLegal(contradictionInfo, true));
+
+			let mut contradictingCls = self.CiGetSpan(contradictionInfo, TUV::MAX);
+
+			debug_assert!(self.NV(2) || self.P(&("************************ Conflict #".to_string() + &self.m_Stat.m_Conflicts.to_string() + "\n" + &self.STrail() + "\n" + "Contradicting clause: " + &self.SLits(contradictingCls, false) + "\n")));
+
+			// The other case is taken care of by the CDCL-loop in Solve
+			debug_assert!(self.GetAssignedDecLevel(contradictingCls[0]) == self.GetAssignedDecLevel(contradictingCls[1]));
+			// Again, any backtracking is taken care of by the CDCL-loop in Solve
+			debug_assert!(self.GetAssignedDecLevel(contradictingCls[0]) == self.m_DecLevel);
+
+			let mut varsToVisitCurrDecLevel: TUV = 0;
+
+			self.LearnAndUpdateHeuristicsVisitCls(contradictingCls, if contradictionInfo.m_IsContradictionInBinaryCls { Self::BadClsInd } else { contradictionInfo.m_ParentClsInd }, false, &mut varsToVisitCurrDecLevel, visitedNegLitsPrevDecLevels!());
+
+			// Used to maintain all the heuristics working if the contradicting clause manages to stay the 1UIP
+			let trailEndBeforeOnTheFlySubsumption: TUVar = self.m_TrailEnd;
+
+			self.m_VarsParentSubsumed.clear();
+
+			let mut v: TUVar = self.m_TrailEnd;
+			let vDecLevel: TUV = self.GetAssignedDecLevelVar(v);
+			let vDecVar: TUVar = self.GetDecVar(vDecLevel);
+			let isAssumpLevel = self.IsAssumpVar(vDecVar);
+			// Removing a subsumed contradicting clause at assumption level might result in a correctness problem,
+			// because the algorithm doesn't stop at first UIP, so it won't record the subsuming clause
+			let mut contradictingIsLearnt = self.IsOnTheFlySubsumptionContradictingOn() && !isAssumpLevel;
+			while varsToVisitCurrDecLevel != 1 || (isAssumpLevel && !(self.IsSatisfiedAssump(v) && self.m_AssignmentInfo[v as usize].m_Visit()))
 			{
-				// The references to the entries of v
-				let ai: *mut TAssignmentInfo = self.m_AssignmentInfo.get_ptr(v as usize);
-				let vi: *mut TVarInfo<Ind> = self.m_VarInfo.get_ptr(v as usize);
-				macro_rules! ai
+				'iter:
 				{
-					() => { (unsafe { &mut *ai }) };
-				}
-				macro_rules! vi
-				{
-					() => { (unsafe { &mut *vi }) };
-				}
-
-				if ai!().m_Visit()
-				{
-					varsToVisitCurrDecLevel -= 1;
-					debug_assert!(ai!().m_IsAssigned());
-					if ai!().IsAssignedBinary() || vi!().m_ParentClsInd != Self::BadClsInd
+					// The references to the entries of v
+					let ai: *mut TAssignmentInfo = self.m_AssignmentInfo.get_ptr(v as usize);
+					let vi: *mut TVarInfo<Ind> = self.m_VarInfo.get_ptr(v as usize);
+					macro_rules! ai
 					{
-						// If the clause is binary, the parent will contain only the other literal (without l), but we don't need l anyway
-						// If the clause isn't binary, the parent will be complete, which is fine too
-						let parent = self.GetAssignedNonDecParentSpanVI(v);
-						let psNo0: usize = if parent.size() == 1 { 2 } else { self.SizeWithoutDecLevel0(parent) };
-						debug_assert!(self.NV(2) || self.P(&("Visited var: ".to_string() + &self.SVar(v) + &(if !self.IsCbLearntOrDrat() { String::new() } else { "; external-lit = ".to_string() + &self.GetExternalLit(self.GetAssignedLitForVar(v)).to_string() }) + "; Visited clause: " + &self.SLits(parent, false) + "\n")));
-						let visitedBefore = self.m_VisitedVars.size();
-						let updateClsCounter = self.IsOnTheFlySubsumptionParentOn() && psNo0 > 2 && (self.IsParentLongInitial(*ai!(), *vi!()) || psNo0 < self.m_Params.m_ParamOnTheFlySubsumptionParentMinGlueToDisable.get() as usize);
-						self.LearnAndUpdateHeuristicsVisitCls(parent, if ai!().IsAssignedBinary() { Self::BadClsInd } else { vi!().m_ParentClsInd }, updateClsCounter, &mut varsToVisitCurrDecLevel, visitedNegLitsPrevDecLevelsPtr);
-						if contradictingIsLearnt
+						() => { (unsafe { &mut *ai }) };
+					}
+					macro_rules! vi
+					{
+						() => { (unsafe { &mut *vi }) };
+					}
+
+					if ai!().m_Visit()
+					{
+						varsToVisitCurrDecLevel -= 1;
+						debug_assert!(ai!().m_IsAssigned());
+						if ai!().IsAssignedBinary() || vi!().m_ParentClsInd != Self::BadClsInd
 						{
-							if GetVar(self.m_FlippedLit) == v
+							// If the clause is binary, the parent will contain only the other literal (without l), but we don't need l anyway
+							// If the clause isn't binary, the parent will be complete, which is fine too
+							let parent = self.GetAssignedNonDecParentSpanVI(v);
+							let psNo0: usize = if parent.size() == 1 { 2 } else { self.SizeWithoutDecLevel0(parent) };
+							debug_assert!(self.NV(2) || self.P(&("Visited var: ".to_string() + &self.SVar(v) + &(if !self.IsCbLearntOrDrat() { String::new() } else { "; external-lit = ".to_string() + &self.GetExternalLit(self.GetAssignedLitForVar(v)).to_string() }) + "; Visited clause: " + &self.SLits(parent, false) + "\n")));
+							let visitedBefore = self.m_VisitedVars.size();
+							let updateClsCounter = self.IsOnTheFlySubsumptionParentOn() && psNo0 > 2 && (self.IsParentLongInitial(*ai!(), *vi!()) || psNo0 < self.m_Params.m_ParamOnTheFlySubsumptionParentMinGlueToDisable.get() as usize);
+							self.LearnAndUpdateHeuristicsVisitCls(parent, if ai!().IsAssignedBinary() { Self::BadClsInd } else { vi!().m_ParentClsInd }, updateClsCounter, &mut varsToVisitCurrDecLevel, visitedNegLitsPrevDecLevels!());
+							if contradictingIsLearnt
 							{
-								debug_assert!(self.NV(2) || self.P(&("Visited flipped var while still minimizing the contradicting clause, hence disable flipped recording for this conflict; var = ".to_string() + &self.SVar(v) + "\n")));
-								self.m_FlippedLit = BadULit;
-							}
-
-							let csNo0 = self.SizeWithoutDecLevel0(contradictingCls);
-
-							if self.m_VisitedVars.size() == visitedBefore && ((!contradictionInfo.m_IsContradictionInBinaryCls && !self.ClsGetIsLearnt(contradictionInfo.m_ParentClsInd)) || csNo0 < self.m_Params.m_ParamOnTheFlySubsumptionContradictingMinGlueToDisable.get() as usize)
-							{
-								// The contradicting clause can be subsumed!
-								// Is the parent clause subsumed by the contradicting clause too?
-								let parentSubsumedByContradicting = psNo0 == csNo0;
-								let mut longInitParentSubsumedByLearntContradicting = parentSubsumedByContradicting && psNo0 > 2 && !self.ClsGetIsLearnt(vi!().m_ParentClsInd) && self.ClsGetIsLearnt(contradictionInfo.m_ParentClsInd);
-
-								if contradictingCls.size() == 2
+								if GetVar(self.m_FlippedLit) == v
 								{
-									// A binary clause --> it can be deleted
-									debug_assert!(contradictionInfo.m_IsContradictionInBinaryCls);
-									// We have a new unit clause, which will serve as the learnt clause
-									debug_assert!(varsToVisitCurrDecLevel == 1);
-									self.DeleteBinaryCls(contradictingCls);
-									let unitInd = if v == GetVar(contradictionInfo.m_BinClause[0]) { 1 } else { 0 };
-									contradictingCls = Span::new(unsafe { contradictionInfo.m_BinClause.as_mut_ptr().add(unitInd) }, 1);
-									if self.IsCbLearntOrDrat()
+									debug_assert!(self.NV(2) || self.P(&("Visited flipped var while still minimizing the contradicting clause, hence disable flipped recording for this conflict; var = ".to_string() + &self.SVar(v) + "\n")));
+									self.m_FlippedLit = BadULit;
+								}
+
+								let csNo0 = self.SizeWithoutDecLevel0(contradictingCls);
+
+								if self.m_VisitedVars.size() == visitedBefore && ((!contradictionInfo.m_IsContradictionInBinaryCls && !self.ClsGetIsLearnt(contradictionInfo.m_ParentClsInd)) || csNo0 < self.m_Params.m_ParamOnTheFlySubsumptionContradictingMinGlueToDisable.get() as usize)
+								{
+									// The contradicting clause can be subsumed!
+									// Is the parent clause subsumed by the contradicting clause too?
+									let parentSubsumedByContradicting = psNo0 == csNo0;
+									let mut longInitParentSubsumedByLearntContradicting = parentSubsumedByContradicting && psNo0 > 2 && !self.ClsGetIsLearnt(vi!().m_ParentClsInd) && self.ClsGetIsLearnt(contradictionInfo.m_ParentClsInd);
+
+									if contradictingCls.size() == 2
 									{
-										self.NewLearntClsApplyCbLearntDrat(contradictingCls);
+										// A binary clause --> it can be deleted
+										debug_assert!(contradictionInfo.m_IsContradictionInBinaryCls);
+										// We have a new unit clause, which will serve as the learnt clause
+										debug_assert!(varsToVisitCurrDecLevel == 1);
+										self.DeleteBinaryCls(contradictingCls);
+										let unitInd = if v == GetVar(contradictionInfo.m_BinClause[0]) { 1 } else { 0 };
+										contradictingCls = Span::new(unsafe { contradictionInfo.m_BinClause.as_mut_ptr().add(unitInd) }, 1);
+										if self.IsCbLearntOrDrat()
+										{
+											self.NewLearntClsApplyCbLearntDrat(contradictingCls);
+										}
+									}
+									else
+									{
+										// A trinary clause, which will now convert into a binary one
+										if contradictingCls.size() == 3
+										{
+											// ContradictingTrinary2BinaryByResolvingCurrVar
+											{
+												let l1: TULit = contradictingCls[if GetVar(contradictingCls[0]) == v { 1 } else { 0 }];
+												let l2: TULit = contradictingCls[if GetVar(contradictingCls[2]) == v { 1 } else { 2 }];
+												self.DeleteCls(contradictionInfo.m_ParentClsInd, None);
+												contradictionInfo.m_IsContradictionInBinaryCls = true;
+												contradictionInfo.m_BinClause = [l1, l2];
+												// The 2nd parameter doesn't matter since the clause is binary
+												self.AddClsToBufferAndWatch(Span::new(contradictionInfo.m_BinClause.as_mut_ptr(), 2), true, true);
+											}
+											longInitParentSubsumedByLearntContradicting = false;
+										}
+										else
+										{
+											debug_assert!(contradictingCls.size() > 3);
+											let l = Negate(self.GetAssignedLitForVar(v));
+											self.DeleteLitFromCls(&mut contradictionInfo.m_ParentClsInd, l);
+										}
+										contradictingCls = self.CiGetSpan(contradictionInfo, TUV::MAX);
+									}
+									self.m_Stat.m_LitsRemovedByConfSubsumption += 1;
+
+									debug_assert!(self.NV(2) || self.P(&("Contradicting clause after reduction: ".to_string() + &self.SLits(contradictingCls, false) + "\n")));
+
+									if parentSubsumedByContradicting
+									{
+										debug_assert!(self.NV(2) || self.P("Parent clause deleted, since subsumed by contradicting!\n"));
+										if parent.size() == 1
+										{
+											debug_assert!(ai!().m_IsAssignedInBinary());
+											let mut binCls: [TULit; 2] = [vi!().m_BinOtherLit(), self.GetAssignedLitForVar(v)];
+											self.DeleteBinaryCls(Span::new(binCls.as_mut_ptr(), 2));
+											self.m_Stat.m_LitsRemovedByConfSubsumption += 2;
+										}
+										else
+										{
+											if longInitParentSubsumedByLearntContradicting
+											{
+												debug_assert!(self.NV(2) || self.P("Parent and contradicting swapped, being a long-initial and learnt, respectively!\n"));
+												self.m_Stat.m_LitsRemovedByConfSubsumption += 1;
+												if self.ClsGetSize(vi!().m_ParentClsInd) == 3
+												{
+													// Contradicting2BinaryByRemovingLevel0
+													{
+														let mut currGoodLitInd: usize = 0;
+														for l in contradictingCls
+														{
+															if self.GetAssignedDecLevel(l) != 0
+															{
+																contradictionInfo.m_BinClause[currGoodLitInd] = l;
+																currGoodLitInd += 1;
+															}
+														}
+														debug_assert!(currGoodLitInd == 2);
+														contradictionInfo.m_IsContradictionInBinaryCls = true;
+														// The 2nd parameter doesn't matter since the clause is binary
+														self.AddClsToBufferAndWatch(Span::new(contradictionInfo.m_BinClause.as_mut_ptr(), 2), true, true);
+													}
+												}
+												else
+												{
+													let l = self.GetAssignedLitForVar(v);
+													let mut parentClsInd = vi!().m_ParentClsInd;
+													self.DeleteLitFromCls(&mut parentClsInd, l);
+													vi!().m_ParentClsInd = parentClsInd;
+													std::mem::swap(&mut vi!().m_ParentClsInd, &mut contradictionInfo.m_ParentClsInd);
+												}
+												contradictingCls = self.CiGetSpan(contradictionInfo, TUV::MAX);
+											}
+											self.m_Stat.m_LitsRemovedByConfSubsumption += self.ClsGetSize(vi!().m_ParentClsInd) as u64;
+											self.DeleteCls(vi!().m_ParentClsInd, None);
+										}
+									}
+
+									while self.m_TrailEnd != v
+									{
+										self.UnassignVar(self.m_TrailEnd);
+									}
+									self.UnassignVar(self.m_TrailEnd);
+									while !self.IsVisitedVar(self.m_TrailEnd)
+									{
+										self.UnassignVar(self.m_TrailEnd);
+									}
+									if self.m_CurrCustomBtStrat > 0
+									{
+										let dl = self.GetAssignedDecLevelVar(self.m_TrailEnd);
+										let maxDecLevelScore = self.CalcMaxDecLevelScore(dl);
+										self.m_BestScorePerDecLevel[dl as usize] = maxDecLevelScore;
 									}
 								}
 								else
 								{
-									// A trinary clause, which will now convert into a binary one
-									if contradictingCls.size() == 3
+									contradictingIsLearnt = false;
+								}
+							}
+							else if self.IsOnTheFlySubsumptionParentOn() && psNo0 > 2 && (self.IsParentLongInitial(*ai!(), *vi!()) || psNo0 < self.m_Params.m_ParamOnTheFlySubsumptionParentMinGlueToDisable.get() as usize)
+							{
+								let parentSubsumedByCurrResolvent = visitedNegLitsPrevDecLevels!().size() + varsToVisitCurrDecLevel as usize + 1 <= psNo0;
+								if !parentSubsumedByCurrResolvent
+								{
+									break 'iter;
+								}
+
+								// The C++ version now tests that every literal of the current resolvent (the visited literals of the previous decision levels and the visited variables
+								// of the current one) appears in the parent. Once the size test above has passed, this always holds: the resolvent contains the parent without the pivot,
+								// and it's not larger than that, so they are equal
+								#[cfg(debug_assertions)]
+								{
+									let visitedNegLitsPrevDecLevelsSpan = visitedNegLitsPrevDecLevels!().get_span();
+									debug_assert!(visitedNegLitsPrevDecLevelsSpan.iter().all(|l| self.m_CurrClsCounters[GetVar(l) as usize] == self.m_CurrClsCounter));
+									let mut varsVisitedNum: TUV = 0;
+									let mut u: TUVar = self.m_VarInfo[v as usize].m_TrailPrev;
+									while varsVisitedNum < varsToVisitCurrDecLevel
 									{
-										// ContradictingTrinary2BinaryByResolvingCurrVar
+										if self.IsVisitedVar(u)
 										{
-											let l1: TULit = contradictingCls[if GetVar(contradictingCls[0]) == v { 1 } else { 0 }];
-											let l2: TULit = contradictingCls[if GetVar(contradictingCls[2]) == v { 1 } else { 2 }];
-											self.DeleteCls(contradictionInfo.m_ParentClsInd, None);
-											contradictionInfo.m_IsContradictionInBinaryCls = true;
-											contradictionInfo.m_BinClause = [l1, l2];
-											// The 2nd parameter doesn't matter since the clause is binary
-											self.AddClsToBufferAndWatch(Span::new(contradictionInfo.m_BinClause.as_mut_ptr(), 2), true, true);
+											debug_assert!(self.m_CurrClsCounters[u as usize] == self.m_CurrClsCounter);
+											varsVisitedNum += 1;
 										}
-										longInitParentSubsumedByLearntContradicting = false;
-									}
-									else
-									{
-										debug_assert!(contradictingCls.size() > 3);
-										let l = Negate(self.GetAssignedLitForVar(v));
-										self.DeleteLitFromCls(&mut contradictionInfo.m_ParentClsInd, l);
-									}
-									contradictingCls = self.CiGetSpan(contradictionInfo, TUV::MAX);
-								}
-								self.m_Stat.m_LitsRemovedByConfSubsumption += 1;
-
-								debug_assert!(self.NV(2) || self.P(&("Contradicting clause after reduction: ".to_string() + &self.SLits(contradictingCls, false) + "\n")));
-
-								if parentSubsumedByContradicting
-								{
-									debug_assert!(self.NV(2) || self.P("Parent clause deleted, since subsumed by contradicting!\n"));
-									if parent.size() == 1
-									{
-										debug_assert!(ai!().m_IsAssignedInBinary());
-										let mut binCls: [TULit; 2] = [vi!().m_BinOtherLit(), self.GetAssignedLitForVar(v)];
-										self.DeleteBinaryCls(Span::new(binCls.as_mut_ptr(), 2));
-										self.m_Stat.m_LitsRemovedByConfSubsumption += 2;
-									}
-									else
-									{
-										if longInitParentSubsumedByLearntContradicting
-										{
-											debug_assert!(self.NV(2) || self.P("Parent and contradicting swapped, being a long-initial and learnt, respectively!\n"));
-											self.m_Stat.m_LitsRemovedByConfSubsumption += 1;
-											if self.ClsGetSize(vi!().m_ParentClsInd) == 3
-											{
-												// Contradicting2BinaryByRemovingLevel0
-												{
-													let mut currGoodLitInd: usize = 0;
-													for l in contradictingCls
-													{
-														if self.GetAssignedDecLevel(l) != 0
-														{
-															contradictionInfo.m_BinClause[currGoodLitInd] = l;
-															currGoodLitInd += 1;
-														}
-													}
-													debug_assert!(currGoodLitInd == 2);
-													contradictionInfo.m_IsContradictionInBinaryCls = true;
-													// The 2nd parameter doesn't matter since the clause is binary
-													self.AddClsToBufferAndWatch(Span::new(contradictionInfo.m_BinClause.as_mut_ptr(), 2), true, true);
-												}
-											}
-											else
-											{
-												let l = self.GetAssignedLitForVar(v);
-												let mut parentClsInd = vi!().m_ParentClsInd;
-												self.DeleteLitFromCls(&mut parentClsInd, l);
-												vi!().m_ParentClsInd = parentClsInd;
-												std::mem::swap(&mut vi!().m_ParentClsInd, &mut contradictionInfo.m_ParentClsInd);
-											}
-											contradictingCls = self.CiGetSpan(contradictionInfo, TUV::MAX);
-										}
-										self.m_Stat.m_LitsRemovedByConfSubsumption += self.ClsGetSize(vi!().m_ParentClsInd) as u64;
-										self.DeleteCls(vi!().m_ParentClsInd, None);
+										u = self.m_VarInfo[u as usize].m_TrailPrev;
 									}
 								}
 
-								while self.m_TrailEnd != v
-								{
-									self.UnassignVar(self.m_TrailEnd);
-								}
-								self.UnassignVar(self.m_TrailEnd);
-								while !self.IsVisitedVar(self.m_TrailEnd)
-								{
-									self.UnassignVar(self.m_TrailEnd);
-								}
-								if self.m_CurrCustomBtStrat > 0
-								{
-									let dl = self.GetAssignedDecLevelVar(self.m_TrailEnd);
-									let maxDecLevelScore = self.CalcMaxDecLevelScore(dl);
-									self.m_BestScorePerDecLevel[dl as usize] = maxDecLevelScore;
-								}
-							}
-							else
-							{
-								contradictingIsLearnt = false;
-							}
-						}
-						else if self.IsOnTheFlySubsumptionParentOn() && psNo0 > 2 && (self.IsParentLongInitial(*ai!(), *vi!()) || psNo0 < self.m_Params.m_ParamOnTheFlySubsumptionParentMinGlueToDisable.get() as usize)
-						{
-							let parentSubsumedByCurrResolvent = visitedNegLitsPrevDecLevels!().size() + varsToVisitCurrDecLevel as usize + 1 <= psNo0;
-							if !parentSubsumedByCurrResolvent
-							{
-								break 'iter;
-							}
+								// A failure to allocate inside a standard vector aborts in Rust, hence there is no counterpart to the C++ catch block, which sets STATUS_ALLOC_FAILED
+								let parentSubsumed = TParentSubsumed::new(self.GetAssignedLitForVar(v), self.m_AssignmentInfo[v as usize].IsAssignedBinary(), self.m_VarInfo[v as usize].m_ParentClsInd);
+								self.m_VarsParentSubsumed.push(parentSubsumed);
 
-							// The C++ version now tests that every literal of the current resolvent (the visited literals of the previous decision levels and the visited variables
-							// of the current one) appears in the parent. Once the size test above has passed, this always holds: the resolvent contains the parent without the pivot,
-							// and it's not larger than that, so they are equal
-							#[cfg(debug_assertions)]
-							{
-								let visitedNegLitsPrevDecLevelsSpan = visitedNegLitsPrevDecLevels!().get_span();
-								debug_assert!(visitedNegLitsPrevDecLevelsSpan.iter().all(|l| self.m_CurrClsCounters[GetVar(l) as usize] == self.m_CurrClsCounter));
-								let mut varsVisitedNum: TUV = 0;
-								let mut u: TUVar = self.m_VarInfo[v as usize].m_TrailPrev;
-								while varsVisitedNum < varsToVisitCurrDecLevel
+								if self.IsUnrecoverable()
 								{
-									if self.IsVisitedVar(u)
-									{
-										debug_assert!(self.m_CurrClsCounters[u as usize] == self.m_CurrClsCounter);
-										varsVisitedNum += 1;
-									}
-									u = self.m_VarInfo[u as usize].m_TrailPrev;
+									break 'body (visitedNegLitsPrevDecLevels!().get_span(), Self::BadClsInd);
 								}
+								debug_assert!(self.NV(2) || self.P(&("On-the-fly subsumption will remove the pivot ".to_string() + &self.SVar(v) + " from the parent " + &HexStrInd(self.m_VarInfo[v as usize].m_ParentClsInd) + " : " + &self.SLits(parent, false) + "\n")));
 							}
-
-							// A failure to allocate inside a standard vector aborts in Rust, hence there is no counterpart to the C++ catch block, which sets STATUS_ALLOC_FAILED
-							let parentSubsumed = TParentSubsumed::new(self.GetAssignedLitForVar(v), self.m_AssignmentInfo[v as usize].IsAssignedBinary(), self.m_VarInfo[v as usize].m_ParentClsInd);
-							self.m_VarsParentSubsumed.push(parentSubsumed);
-
-							if self.IsUnrecoverable()
-							{
-								return (visitedNegLitsPrevDecLevels!().get_span(), Self::BadClsInd);
-							}
-							debug_assert!(self.NV(2) || self.P(&("On-the-fly subsumption will remove the pivot ".to_string() + &self.SVar(v) + " from the parent " + &HexStrInd(self.m_VarInfo[v as usize].m_ParentClsInd) + " : " + &self.SLits(parent, false) + "\n")));
 						}
 					}
 				}
+				v = self.m_VarInfo[v as usize].m_TrailPrev;
 			}
-			v = self.m_VarInfo[v as usize].m_TrailPrev;
-		}
 
-		if self.m_Params.m_ParamMinimizeClausesMinisat.get() && visitedNegLitsPrevDecLevels!().size() > 1
-		{
-			self.MinimizeClauseMinisat(visitedNegLitsPrevDecLevelsPtr);
-			if self.IsUnrecoverable()
+			if self.m_Params.m_ParamMinimizeClausesMinisat.get() && visitedNegLitsPrevDecLevels!().size() > 1
 			{
-				return (visitedNegLitsPrevDecLevels!().get_span(), Self::BadClsInd);
-			}
-		}
-
-		// Find the first UIP
-		while !self.m_AssignmentInfo[v as usize].m_Visit()
-		{
-			v = self.m_VarInfo[v as usize].m_TrailPrev;
-		}
-		let firstUIPNegated: TULit = Negate(self.GetAssignedLitForVar(v));
-
-		if self.m_Params.m_ParamAllUipMode.get() == 1 || self.m_Params.m_ParamAllUipMode.get() == 3
-		{
-			clsBeforeAllUipOrEmptyIfAllUipFailed.assign(visitedNegLitsPrevDecLevels!());
-			let allUipGenerated = self.GenerateAllUipClause(visitedNegLitsPrevDecLevelsPtr);
-			if !allUipGenerated
-			{
-				clsBeforeAllUipOrEmptyIfAllUipFailed.clear();
-			}
-			else
-			{
-				clsBeforeAllUipOrEmptyIfAllUipFailed.push_back(firstUIPNegated);
-			}
-			if clsBeforeAllUipOrEmptyIfAllUipFailed.uninitialized_or_erroneous()
-			{
-				self.SetStatus(TToporStatus::STATUS_ALLOC_FAILED, "clsBeforeAllUipOrEmptyIfAllUipFailed allocation failure".to_string());
-			}
-			if self.IsUnrecoverable()
-			{
-				return (visitedNegLitsPrevDecLevels!().get_span(), Self::BadClsInd);
-			}
-		}
-
-		// Forming the 1UIP conflict clause, ensuring that literal 0 has the highest decision level, while literal 1 is the second highest
-		visitedNegLitsPrevDecLevels!().push_back(firstUIPNegated);
-		{
-			let s = visitedNegLitsPrevDecLevels!().get_span();
-			s.swap(0, s.size() - 1);
-		}
-
-		if visitedNegLitsPrevDecLevels!().size() <= self.m_Params.m_ParamMinimizeClausesBinMaxSize.get() as usize && self.GetGlueAndMarkCurrDecLevels(visitedNegLitsPrevDecLevels!().get_span()) <= self.m_Params.m_ParamMinimizeClausesBinMaxLbd.get()
-		{
-			self.MinimizeClauseBin(visitedNegLitsPrevDecLevelsPtr);
-		}
-
-		if self.IsUnrecoverable()
-		{
-			return (visitedNegLitsPrevDecLevels!().get_span(), Self::BadClsInd);
-		}
-
-		if visitedNegLitsPrevDecLevels!().size() > 2
-		{
-			let s = visitedNegLitsPrevDecLevels!().get_span();
-			let highestDecLevelLitIt = self.GetAssignedLitsHighestDecLevelIt(s, 1);
-
-			if s[highestDecLevelLitIt] != s[1]
-			{
-				s.swap(highestDecLevelLitIt, 1);
-			}
-		}
-
-		debug_assert!(self.NV(1) || self.P(&("New-clause at level ".to_string() + &self.m_DecLevel.to_string() + " : " + &self.SLits(visitedNegLitsPrevDecLevels!().get_span(), false) + "\n")));
-
-		let mut addInitCls = false;
-		let mut clsStart: Ind = Self::BadClsInd;
-
-		if contradictingIsLearnt
-		{
-			debug_assert!(self.NV(2) || self.P("The contradicting clause was reduced all the way to 1UIP\n"));
-			// The contradicting clause was reduced all the way to 1UIP
-
-			// Disabling flipped clause recording
-			self.m_FlippedLit = BadULit;
-			if !contradictionInfo.m_IsContradictionInBinaryCls
-			{
-				// Is clause initial
-				addInitCls = !self.ClsGetIsLearnt(contradictionInfo.m_ParentClsInd);
-			}
-			if contradictingCls.size() > visitedNegLitsPrevDecLevels!().size()
-			{
-				debug_assert!(self.NV(2) || self.P("The contradicting clause was reduced further by minimization and/or binary-resolution\n"));
-				if contradictionInfo.m_IsContradictionInBinaryCls
+				self.MinimizeClauseMinisat(visitedNegLitsPrevDecLevels!());
+				if self.IsUnrecoverable()
 				{
-					self.m_Stat.m_LitsRemovedByConfSubsumption += 2;
-					self.DeleteBinaryCls(contradictingCls);
+					break 'body (visitedNegLitsPrevDecLevels!().get_span(), Self::BadClsInd);
+				}
+			}
+
+			// Find the first UIP
+			while !self.m_AssignmentInfo[v as usize].m_Visit()
+			{
+				v = self.m_VarInfo[v as usize].m_TrailPrev;
+			}
+			let firstUIPNegated: TULit = Negate(self.GetAssignedLitForVar(v));
+
+			if self.m_Params.m_ParamAllUipMode.get() == 1 || self.m_Params.m_ParamAllUipMode.get() == 3
+			{
+				clsBeforeAllUipOrEmptyIfAllUipFailed.assign(visitedNegLitsPrevDecLevels!());
+				let allUipGenerated = self.GenerateAllUipClause(visitedNegLitsPrevDecLevels!());
+				if !allUipGenerated
+				{
+					clsBeforeAllUipOrEmptyIfAllUipFailed.clear();
 				}
 				else
 				{
-					self.m_Stat.m_LitsRemovedByConfSubsumption += self.ClsGetSize(contradictionInfo.m_ParentClsInd) as u64;
-					self.DeleteCls(contradictionInfo.m_ParentClsInd, None);
+					clsBeforeAllUipOrEmptyIfAllUipFailed.push_back(firstUIPNegated);
 				}
-
-				contradictingIsLearnt = false;
+				if clsBeforeAllUipOrEmptyIfAllUipFailed.uninitialized_or_erroneous()
+				{
+					self.SetStatus(TToporStatus::STATUS_ALLOC_FAILED, "clsBeforeAllUipOrEmptyIfAllUipFailed allocation failure".to_string());
+				}
+				if self.IsUnrecoverable()
+				{
+					break 'body (visitedNegLitsPrevDecLevels!().get_span(), Self::BadClsInd);
+				}
 			}
-			else
+
+			// Forming the 1UIP conflict clause, ensuring that literal 0 has the highest decision level, while literal 1 is the second highest
+			visitedNegLitsPrevDecLevels!().push_back(firstUIPNegated);
 			{
-				debug_assert!(self.NV(2) || self.P("The contradicting clause will serve as the asserting clause, no need to record a new one!\n"));
+				let s = visitedNegLitsPrevDecLevels!().get_span();
+				s.swap(0, s.size() - 1);
+			}
+
+			if visitedNegLitsPrevDecLevels!().size() <= self.m_Params.m_ParamMinimizeClausesBinMaxSize.get() as usize && self.GetGlueAndMarkCurrDecLevels(visitedNegLitsPrevDecLevels!().get_span()) <= self.m_Params.m_ParamMinimizeClausesBinMaxLbd.get()
+			{
+				self.MinimizeClauseBin(visitedNegLitsPrevDecLevels!());
+			}
+
+			if self.IsUnrecoverable()
+			{
+				break 'body (visitedNegLitsPrevDecLevels!().get_span(), Self::BadClsInd);
+			}
+
+			if visitedNegLitsPrevDecLevels!().size() > 2
+			{
+				let s = visitedNegLitsPrevDecLevels!().get_span();
+				let highestDecLevelLitIt = self.GetAssignedLitsHighestDecLevelIt(s, 1);
+
+				if s[highestDecLevelLitIt] != s[1]
+				{
+					s.swap(highestDecLevelLitIt, 1);
+				}
+			}
+
+			debug_assert!(self.NV(1) || self.P(&("New-clause at level ".to_string() + &self.m_DecLevel.to_string() + " : " + &self.SLits(visitedNegLitsPrevDecLevels!().get_span(), false) + "\n")));
+
+			let mut addInitCls = false;
+			let mut clsStart: Ind = Self::BadClsInd;
+
+			if contradictingIsLearnt
+			{
+				debug_assert!(self.NV(2) || self.P("The contradicting clause was reduced all the way to 1UIP\n"));
+				// The contradicting clause was reduced all the way to 1UIP
+
+				// Disabling flipped clause recording
+				self.m_FlippedLit = BadULit;
 				if !contradictionInfo.m_IsContradictionInBinaryCls
 				{
-					clsStart = contradictionInfo.m_ParentClsInd;
+					// Is clause initial
+					addInitCls = !self.ClsGetIsLearnt(contradictionInfo.m_ParentClsInd);
 				}
-			}
-		}
-
-		if !contradictingIsLearnt
-		{
-			// Always part of proof, even if stays initial (that is, not deletable)
-			// Added this part to fix a DRAT bug
-			clsStart = self.AddClsToBufferAndWatch(visitedNegLitsPrevDecLevels!().get_span(), !addInitCls, true);
-		}
-
-		debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(false));
-
-		if self.m_Params.m_ParamVarActivityUseMapleLevelBreaker.get()
-		{
-			let s = visitedNegLitsPrevDecLevels!().get_span();
-			let secondHighestDecLevel: TUV = if s.size() <= 1 { 0 } else { std::cmp::min(self.GetAssignedDecLevel(s[0]), self.GetAssignedDecLevel(s[1])) };
-			let mut decLevelMinToUpdate: TUV = secondHighestDecLevel.wrapping_sub(self.m_Params.m_ParamVarActivityMapleLevelBreakerDecrease.get());
-			if decLevelMinToUpdate > secondHighestDecLevel
-			{
-				decLevelMinToUpdate = 0;
-			}
-			for vv in self.m_VisitedVars.get_span()
-			{
-				if self.m_VarInfo[vv as usize].m_DecLevel >= decLevelMinToUpdate
+				if contradictingCls.size() > visitedNegLitsPrevDecLevels!().size()
 				{
-					self.UpdateScoreVar(vv, 1.0);
+					debug_assert!(self.NV(2) || self.P("The contradicting clause was reduced further by minimization and/or binary-resolution\n"));
+					if contradictionInfo.m_IsContradictionInBinaryCls
+					{
+						self.m_Stat.m_LitsRemovedByConfSubsumption += 2;
+						self.DeleteBinaryCls(contradictingCls);
+					}
+					else
+					{
+						self.m_Stat.m_LitsRemovedByConfSubsumption += self.ClsGetSize(contradictionInfo.m_ParentClsInd) as u64;
+						self.DeleteCls(contradictionInfo.m_ParentClsInd, None);
+					}
+
+					contradictingIsLearnt = false;
+				}
+				else
+				{
+					debug_assert!(self.NV(2) || self.P("The contradicting clause will serve as the asserting clause, no need to record a new one!\n"));
+					if !contradictionInfo.m_IsContradictionInBinaryCls
+					{
+						clsStart = contradictionInfo.m_ParentClsInd;
+					}
 				}
 			}
-		}
 
-		let updateGlue = visitedNegLitsPrevDecLevels!().size() > 2 && !addInitCls;
-		let glue: TUV = if updateGlue { self.ClsGetGlue(clsStart) } else { 0 };
-		debug_assert!(self.IsOnTheFlySubsumptionContradictingOn() || trailEndBeforeOnTheFlySubsumption == self.m_TrailEnd);
-		self.UpdateDecisionStrategyOnNewConflict(glue, GetVar(firstUIPNegated), trailEndBeforeOnTheFlySubsumption);
+			if !contradictingIsLearnt
+			{
+				// Always part of proof, even if stays initial (that is, not deletable)
+				// Added this part to fix a DRAT bug
+				clsStart = self.AddClsToBufferAndWatch(visitedNegLitsPrevDecLevels!().get_span(), !addInitCls, true);
+			}
 
-		if updateGlue
-		{
-			self.ClsDelNewLearntOrGlueUpdate(clsStart, glue);
-		}
+			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.WLAssertConsistency(false));
 
-		(visitedNegLitsPrevDecLevels!().get_span(), clsStart)
+			if self.m_Params.m_ParamVarActivityUseMapleLevelBreaker.get()
+			{
+				let s = visitedNegLitsPrevDecLevels!().get_span();
+				let secondHighestDecLevel: TUV = if s.size() <= 1 { 0 } else { std::cmp::min(self.GetAssignedDecLevel(s[0]), self.GetAssignedDecLevel(s[1])) };
+				let mut decLevelMinToUpdate: TUV = secondHighestDecLevel.wrapping_sub(self.m_Params.m_ParamVarActivityMapleLevelBreakerDecrease.get());
+				if decLevelMinToUpdate > secondHighestDecLevel
+				{
+					decLevelMinToUpdate = 0;
+				}
+				for vv in self.m_VisitedVars.get_span()
+				{
+					if self.m_VarInfo[vv as usize].m_DecLevel >= decLevelMinToUpdate
+					{
+						self.UpdateScoreVar(vv, 1.0);
+					}
+				}
+			}
+
+			let updateGlue = visitedNegLitsPrevDecLevels!().size() > 2 && !addInitCls;
+			let glue: TUV = if updateGlue { self.ClsGetGlue(clsStart) } else { 0 };
+			debug_assert!(self.IsOnTheFlySubsumptionContradictingOn() || trailEndBeforeOnTheFlySubsumption == self.m_TrailEnd);
+			self.UpdateDecisionStrategyOnNewConflict(glue, GetVar(firstUIPNegated), trailEndBeforeOnTheFlySubsumption);
+
+			if updateGlue
+			{
+				self.ClsDelNewLearntOrGlueUpdate(clsStart, glue);
+			}
+
+			(visitedNegLitsPrevDecLevels!().get_span(), clsStart)
+		};
+		self.m_HandyLitsClearBefore[0] = visitedNegLitsPrevDecLevelsVec;
+		res
 	}
 
 	// The VisitLit lambda of RecordFlipped
@@ -1022,10 +1028,11 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	pub(crate) fn RecordFlipped(&mut self, contradictionInfo: &mut TContradictionInfo<Ind>, mainClsBeforeAllUip: TSpanTULit) -> (TSpanTULit, Ind)
 	{
 		// Giving an alias to m_VisitedLits to reflect the current usage for readability
-		let visitedNegLitsPrevFlippedLevelsPtr: *mut CVector<TULit> = &mut self.m_HandyLitsClearBefore[1];
+		// The vector is moved out of the solver while in use, so that the borrows of the solver don't alias it (moving it doesn't move its buffer)
+		let mut visitedNegLitsPrevFlippedLevelsVec = std::mem::take(&mut self.m_HandyLitsClearBefore[1]);
 		macro_rules! visitedNegLitsPrevFlippedLevels
 		{
-			() => { (unsafe { &mut *visitedNegLitsPrevFlippedLevelsPtr }) };
+			() => { (&mut visitedNegLitsPrevFlippedLevelsVec) };
 		}
 		// Clear from any previous usage
 		visitedNegLitsPrevFlippedLevels!().clear();
@@ -1033,7 +1040,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		if self.m_Params.m_ParamFlippedRecordingMaxLbdToRecord.get() == 0 || self.m_FlippedLit == BadULit || self.GetAssignedDecLevel(self.m_FlippedLit) != self.m_DecLevel
 		{
 			visitedNegLitsPrevFlippedLevels!().clear();
-			return (visitedNegLitsPrevFlippedLevels!().get_span(), Self::BadClsInd);
+			let res = (visitedNegLitsPrevFlippedLevels!().get_span(), Self::BadClsInd);
+			self.m_HandyLitsClearBefore[1] = visitedNegLitsPrevFlippedLevelsVec;
+			return res;
 		}
 
 		let flippedVar: TUVar = GetVar(self.m_FlippedLit);
@@ -1064,7 +1073,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 			let mut varsToVisitCurrFlippedLevel: TUV = 0;
 
-			self.RecordFlippedVisitCls(contradictingCls, if contradictionInfo.m_IsContradictionInBinaryCls { Self::BadClsInd } else { contradictionInfo.m_ParentClsInd }, &mut varsToVisitCurrFlippedLevel, visitedNegLitsPrevFlippedLevelsPtr);
+			self.RecordFlippedVisitCls(contradictingCls, if contradictionInfo.m_IsContradictionInBinaryCls { Self::BadClsInd } else { contradictionInfo.m_ParentClsInd }, &mut varsToVisitCurrFlippedLevel, visitedNegLitsPrevFlippedLevels!());
 
 			if varsToVisitCurrFlippedLevel == 1
 			{
@@ -1090,7 +1099,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 						// If the clause isn't binary, the parent will be complete, which is fine too
 						let parent = self.GetAssignedNonDecParentSpanVI(v);
 						debug_assert!(self.NV(2) || self.P(&("Visited var: ".to_string() + &self.SVar(v) + "; Visited clause: " + &self.SLits(parent, false) + "\n")));
-						self.RecordFlippedVisitCls(parent, if ai.IsAssignedBinary() { Self::BadClsInd } else { vi.m_ParentClsInd }, &mut varsToVisitCurrFlippedLevel, visitedNegLitsPrevFlippedLevelsPtr);
+						self.RecordFlippedVisitCls(parent, if ai.IsAssignedBinary() { Self::BadClsInd } else { vi.m_ParentClsInd }, &mut varsToVisitCurrFlippedLevel, visitedNegLitsPrevFlippedLevels!());
 					}
 				}
 				v = self.m_VarInfo[v as usize].m_TrailPrev;
@@ -1127,7 +1136,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 			if self.m_Params.m_ParamMinimizeClausesMinisat.get() && visitedNegLitsPrevFlippedLevels!().size() > 1
 			{
-				self.MinimizeClauseMinisat(visitedNegLitsPrevFlippedLevelsPtr);
+				self.MinimizeClauseMinisat(visitedNegLitsPrevFlippedLevels!());
 				if self.IsUnrecoverable()
 				{
 					visitedNegLitsPrevFlippedLevels!().clear();
@@ -1137,7 +1146,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 			if self.m_Params.m_ParamAllUipMode.get() == 2 || self.m_Params.m_ParamAllUipMode.get() == 3
 			{
-				self.GenerateAllUipClause(visitedNegLitsPrevFlippedLevelsPtr);
+				self.GenerateAllUipClause(visitedNegLitsPrevFlippedLevels!());
 				if self.IsUnrecoverable()
 				{
 					visitedNegLitsPrevFlippedLevels!().clear();
@@ -1156,7 +1165,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 			if visitedNegLitsPrevFlippedLevels!().size() <= self.m_Params.m_ParamMinimizeClausesBinMaxSize.get() as usize && self.GetGlueAndMarkCurrDecLevels(visitedNegLitsPrevFlippedLevels!().get_span()) <= self.m_Params.m_ParamMinimizeClausesBinMaxLbd.get()
 			{
-				self.MinimizeClauseBin(visitedNegLitsPrevFlippedLevelsPtr);
+				self.MinimizeClauseBin(visitedNegLitsPrevFlippedLevels!());
 			}
 
 			if self.IsUnrecoverable()
@@ -1201,6 +1210,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		// onExit
 		self.CleanVisited();
 		self.CleanRooted();
+		self.m_HandyLitsClearBefore[1] = visitedNegLitsPrevFlippedLevelsVec;
 
 		res
 	}

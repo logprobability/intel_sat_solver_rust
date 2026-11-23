@@ -1002,8 +1002,10 @@ fn conflict_analysis_when_unrecoverable()
 		// The whole loop gives up too
 		t.ConflictAnalysisLoop(&mut ci);
 		assert!(ci.IsContradiction());
-		let c: *mut CVector<TULit> = &mut t.m_HandyLitsClearBefore[0];
-		t.MinimizeClauseMinisat(c);
+		// As in the solver, the clause is moved out of the solver, so that it doesn't alias it
+		let mut c = std::mem::take(&mut t.m_HandyLitsClearBefore[0]);
+		t.MinimizeClauseMinisat(&mut c);
+		t.m_HandyLitsClearBefore[0] = c;
 		assert!(t.m_RootedVars.empty());
 	}
 }
