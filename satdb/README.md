@@ -21,6 +21,23 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   holds exactly the history up to its basis. Two views, each a cheap clone with a marker, filter the reads: `Db::history()` (every change, with
   its `added` flag; history statistics for the planner) and `Db::since(t)` (only the datoms of transactions after basis `t`, for every read,
   pull included); they compose. `Db::datoms(e, a, v)` scans a view; transacting against a view is an error.
+* **Durability** (`src/log.rs`). `Conn::open(path)` backs a connection with an append-only log file (created if missing); `Conn::new()` stays in memory.
+  * Each committed transaction is one record holding its *effect*: basis, transaction entity, the next entity id after it (tempids that
+    unified away or only appear in `retract_entity` still use up ids), instant, the attributes it defined (with their ids), and the datoms
+    it retracted and asserted. Replay doesn't resolve tempids, lookups or upserts again.
+  * `transact` appends the record and syncs it (`sync_data`) before the transaction becomes visible or `transact` returns.
+    If the write fails, the file is cut back to the committed data and the transaction is an `Error::Io`. If even the cut fails, the log
+    refuses further appends until it is reopened.
+  * Framing: a file header (magic, format version), then per record its length, a CRC-32 of the length, a CRC-32 of the payload, and the payload.
+    The length's own checksum is what tells a corrupted length (which may point past the end of the file) from a torn record.
+  * Recovery on open: a final record cut short (fewer bytes than its header, or than its valid header's length) is a torn, never
+    acknowledged append, and is truncated away; so is a partial file header. Any other damage is `Error::CorruptLog { offset, msg }` at the
+    record's offset, and the file is left untouched. That covers a checksum failure (in the last complete record too, since every
+    acknowledged record was synced), a payload that doesn't decode, and a record that `Db::replay` refuses because it doesn't fit the value
+    before it (basis, entity ids, schema, types, retracting an absent datom, asserting a present one, broken cardinality or uniqueness).
+  * Replay applies records with the same code as `transact`, so a reopened connection has the same values at every basis, down to the
+    index contents and statistics.
+  * The file is locked while open (`File::try_lock`), so a second connection to it is an `Error::Io`.
 * **Pull** (`src/query.rs`). `Db::pull(pattern, eid)` reads an entity as a tree (`Pulled`): attribute lists, the wildcard (which pulls
   components recursively, stopping at cycles), nested patterns for Ref attributes, and reverse refs through VAET (`Pull::reverse`, key `ns/_name`).
   Cardinality-one attributes and reverse components give one value, the others a list; absent attributes are left out. The pattern is
@@ -108,7 +125,12 @@ The crate depends on the solver by path (`../rust`), with the solver's profiles 
                             # evaluator, aggregates against a hand grouping, text queries against the builder, transitive closure
                             # (four formulations, random graphs with cycles) against Floyd-Warshall, mutual recursion against a
                             # parity search, stratified negation, random rule programs against a naive simultaneous fixpoint,
-                            # and the plan count of semi-naive evaluation on a long chain
+                            # and the plan count of semi-naive evaluation on a long chain; the durable log: a random history reopened
+                            # (every basis structurally equal to an in-memory connection's, and the next transaction's report identical),
+                            # a file cut at every byte of its last record and header (truncated, then appendable), three changes of
+                            # every byte of a middle record and damaged headers (reported at the record, file untouched), well-framed records that
+                            # don't fit, decoding arbitrary bytes, injected write and truncation failures, and the file lock
+                            # (test files go under target/satdb-log-tests/ and are removed)
     cargo test --release
 
 ## Status and next steps
@@ -141,4 +163,7 @@ This is a start. What is missing, roughly in order of value:
 * Ordering constraints: only `require_before` on the query's top-level clauses (not inside `not`, `or` or rule bodies), no text syntax,
   and no way to drop an accepted constraint.
 * Cost model: independence assumptions and fixed predicate selectivities; no histograms.
-* Storage: everything is in memory; no durable log or segment storage.
+* Storage: the transaction log is durable (`Conn::open`), but everything else is in memory. Opening replays the whole log, and `Conn`
+  keeps every past value. Missing: index segments on disk (so opening doesn't replay everything and memory isn't bounded by the database),
+  checkpoints and compaction, Datomic's `tx-range` over the log, access by several processes (today one connection holds the file's lock),
+  and group commit (each transaction syncs on its own).

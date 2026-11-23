@@ -4,6 +4,9 @@
 //!   (a set of assertions and retractions, with upserts, lookup refs, `retract_entity` and a reified transaction entity) and returns a new value,
 //!   and `Conn` keeps every past value (`as_of`) at the cost of the changed index paths only. Every value also holds its history
 //!   (every assertion and retraction, with its transaction), which the `history()` and `since(t)` views expose.
+//!   `Conn::open(path)` makes the connection durable: it replays the log at `path`, and every committed transaction is appended and synced
+//!   before `transact` returns.
+//! * `log` (private): the durable log's format, commit and recovery (a torn final record is truncated, any other damage refused).
 //! * `query`: Datalog-style queries (patterns, comparison predicates, `not`/`not-join`, `or`/`or-join`, over any view), planned online while
 //!   they are assembled, with aggregates in the find spec; and `Db::pull`, which reads an entity as a tree.
 //! * `rules`: Datalog rules, recursive and mutually recursive ones included, evaluated bottom-up (stratified, semi-naive,
@@ -49,6 +52,7 @@
 //! ```
 
 pub mod db;
+mod log;
 pub mod parse;
 pub mod planner;
 pub mod pmap;

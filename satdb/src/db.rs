@@ -28,10 +28,18 @@
 //! * `since(t)`: every read sees only the datoms of the transactions after basis t (the transactions' entities increase with t).
 //!
 //! A view is the same value with a marker (a clone of a few `Arc`s); transacting against a view is an error.
+//!
+//! # Durability
+//! `Conn::open` backs a connection with a log file (see `log`): each committed transaction's effect (`TxRecord`: its entity, the next entity id,
+//! its instant, the attributes it defined and the datoms it retracted and asserted) is appended and synced before the transaction is visible,
+//! and opening replays the records through `Db::replay`, which validates each one against the value before it and applies it with the same
+//! code as `transact`, so a reopened connection has the same values, down to the index contents and statistics.
 
+use crate::log::Log;
 use crate::pmap::PMap;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::path::Path;
 use std::sync::Arc;
 
 pub type Eid = u64;
@@ -222,6 +230,11 @@ pub enum Error
 	InvalidQuery(String),
 	/// A syntax error in a text query, at a 1-based line and column (in characters)
 	Parse { line: usize, col: usize, msg: String },
+	/// An I/O error of the durable log (the `std::io::Error`'s message); a transaction that fails with it isn't committed
+	Io(String),
+	/// A durable log that can't be replayed: a damaged file header or record, or a record that doesn't fit the database before it,
+	/// at a byte offset of the file (the record's start); the file is left as it is
+	CorruptLog { offset: u64, msg: String },
 }
 
 impl fmt::Display for Error
@@ -254,6 +267,8 @@ impl fmt::Display for Error
 			}
 			Error::InvalidQuery(m) => write!(f, "invalid query: {m}"),
 			Error::Parse { line, col, msg } => write!(f, "parse error at {line}:{col}: {msg}"),
+			Error::Io(m) => write!(f, "log I/O error: {m}"),
+			Error::CorruptLog { offset, msg } => write!(f, "corrupt log at byte {offset}: {msg}"),
 		}
 	}
 }
@@ -467,6 +482,41 @@ impl TxReport
 			Entity::Lookup(l) => self.lookups[l as usize],
 			Entity::Tx => self.tx,
 		}
+	}
+}
+
+/// The effect of a committed transaction, which is what the durable log (see `log`) records and replays:
+/// the transaction's resolved datoms rather than its operations, so replaying it doesn't depend on resolving tempids or lookups again
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct TxRecord
+{
+	pub(crate) basis_t: T,
+	/// The transaction's entity
+	pub(crate) tx: Eid,
+	/// The next entity id after the transaction (tempids that only appear in retract_entity or unified away still use up ids)
+	pub(crate) next_eid: Eid,
+	pub(crate) instant: i64,
+	/// The attributes the transaction defined, with their ids
+	pub(crate) attrs: Vec<(AttrId, Attr)>,
+	/// The datoms retracted, then asserted (each in EAV order), without the transaction's instant
+	pub(crate) retracted: Vec<(Eid, AttrId, Value)>,
+	pub(crate) asserted: Vec<(Eid, AttrId, Value)>,
+}
+
+impl TxReport
+{
+	/// The record of this transaction for the durable log
+	pub(crate) fn record(&self) -> TxRecord
+	{
+		let (before, after) = (&self.db_before, &self.db_after);
+		let attrs = (before.attrs.len()..after.attrs.len()).map(|a| (a as AttrId, after.attr(a as AttrId).clone())).collect();
+		let instant = match self.tx_data[0].v
+		{
+			Value::Int(i) => i,
+			_ => unreachable!("the first datom is the transaction's instant"),
+		};
+		let changes = |added: bool| self.tx_data[1..].iter().filter(|d| d.added == added).map(|d| (d.e, d.a, d.v.clone())).collect();
+		TxRecord { basis_t: after.basis_t, tx: self.tx, next_eid: after.next_eid, instant, attrs, retracted: changes(false), asserted: changes(true) }
 	}
 }
 
@@ -910,14 +960,8 @@ impl Db
 			}
 		}
 		let asserted: Vec<(Eid, AttrId, Value)> = adds.into_iter().filter(|(e, a, v)| !self.has(*e, *a, v)).collect();
-		for (e, a, v) in &retracted
-		{
-			db.remove(*e, *a, v, tx_eid);
-		}
-		for (e, a, v) in &asserted
-		{
-			db.insert(*e, *a, v, tx_eid);
-		}
+		let retracted: Vec<(Eid, AttrId, Value)> = retracted.into_iter().collect();
+		db.apply(tx_eid, instant, &retracted, &asserted);
 		for (_, a, v) in &asserted
 		{
 			if db.attr(*a).unique.is_some() && db.entities(*a, v).nth(1).is_some()
@@ -926,7 +970,6 @@ impl Db
 			}
 		}
 		let instant_attr = db.attr_id(TX_INSTANT).expect("built in");
-		db.insert(tx_eid, instant_attr, &Value::Int(instant), tx_eid);
 		let datom = |(e, a, v): (Eid, AttrId, Value), added: bool| Datom { e, a, v, tx: tx_eid, added };
 		let mut tx_data = vec![datom((tx_eid, instant_attr, Value::Int(instant)), true)];
 		tx_data.extend(retracted.into_iter().map(|d| datom(d, false)));
@@ -964,6 +1007,90 @@ impl Db
 	pub(crate) fn check_eid(&self, e: Eid) -> Result<Eid, Error>
 	{
 		if e == 0 || e >= self.next_eid { Err(Error::UnknownEntity(e)) } else { Ok(e) }
+	}
+
+	// The datom changes of transaction tx (shared by transact and replay): the retractions of present datoms, the assertions of absent ones, and the instant
+	fn apply(&mut self, tx: Eid, instant: i64, retracted: &[(Eid, AttrId, Value)], asserted: &[(Eid, AttrId, Value)])
+	{
+		for (e, a, v) in retracted
+		{
+			self.remove(*e, *a, v, tx);
+		}
+		for (e, a, v) in asserted
+		{
+			self.insert(*e, *a, v, tx);
+		}
+		let instant_attr = self.attr_id(TX_INSTANT).expect("built in");
+		self.insert(tx, instant_attr, &Value::Int(instant), tx);
+	}
+
+	/// Apply a transaction read back from the durable log: the database the transaction that wrote `rec` produced, if `self` is the database before it.
+	/// A record that doesn't fit (its basis, entity ids, schema, value types, a retraction of an absent datom, an assertion of a present one,
+	/// or a result that breaks cardinality or uniqueness) is refused with an explanation, so a corrupt record never produces an inconsistent value
+	pub(crate) fn replay(&self, rec: &TxRecord) -> Result<Db, String>
+	{
+		debug_assert!(!self.history && self.since == 0, "the log replays unfiltered values");
+		if rec.basis_t != self.basis_t + 1
+		{
+			return Err(format!("basis {} after basis {}", rec.basis_t, self.basis_t));
+		}
+		if rec.tx != self.next_eid || rec.next_eid <= rec.tx
+		{
+			return Err(format!("transaction entity {} and next entity {} after next entity {}", rec.tx, rec.next_eid, self.next_eid));
+		}
+		if rec.instant < self.instant
+		{
+			return Err(format!("instant {} before {}", rec.instant, self.instant));
+		}
+		let mut db = self.clone();
+		for (a, def) in &rec.attrs
+		{
+			if *a as usize != db.attrs.len() || db.attr_id(&def.name).is_some()
+			{
+				return Err(format!("attribute {} defined as id {a}, when the next id is {}", def.name, db.attrs.len()));
+			}
+			db.define(def).map_err(|e| e.to_string())?;
+		}
+		let eid = |e: Eid| (1..rec.next_eid).contains(&e);
+		for (list, added) in [(&rec.retracted, false), (&rec.asserted, true)]
+		{
+			if list.windows(2).any(|w| w[0] >= w[1])
+			{
+				return Err("the datoms are not in strictly increasing EAV order".into());
+			}
+			for (e, a, v) in list
+			{
+				let def = db.try_attr(*a).ok_or_else(|| format!("unknown attribute id {a}"))?;
+				let ref_ok = match v
+				{
+					Value::Ref(r) => eid(*r),
+					_ => true,
+				};
+				if def.name.starts_with("db/") || def.value_type != v.value_type() || !eid(*e) || !ref_ok
+				{
+					return Err(format!("invalid datom [{e} {} {v:?}]", def.name));
+				}
+				if db.has(*e, *a, v) != !added
+				{
+					let what = if added { "assertion of a present" } else { "retraction of an absent" };
+					return Err(format!("{what} datom [{e} {} {v:?}]", def.name));
+				}
+			}
+		}
+		db.basis_t = rec.basis_t;
+		db.next_eid = rec.next_eid;
+		db.instant = rec.instant;
+		db.txs = db.txs.insert(rec.basis_t, rec.tx);
+		db.apply(rec.tx, rec.instant, &rec.retracted, &rec.asserted);
+		for (e, a, v) in &rec.asserted
+		{
+			let def = db.attr(*a);
+			if (def.cardinality == Cardinality::One && db.values(*e, *a).nth(1).is_some()) || (def.unique.is_some() && db.entities(*a, v).nth(1).is_some())
+			{
+				return Err(format!("[{e} {} {v:?}] breaks the attribute's cardinality or uniqueness", def.name));
+			}
+		}
+		Ok(db)
 	}
 
 	// Assert an absent datom in transaction tx (insert and remove only see unfiltered values, as transact refuses views)
@@ -1021,25 +1148,43 @@ impl Db
 	}
 }
 
-/// A connection: the current database value and every past one
+/// A connection: the current database value and every past one, in memory (`Conn::new`) or backed by a durable log (`Conn::open`)
 pub struct Conn
 {
 	history: Vec<Db>,
+	log: Option<Log>,
 }
 
 impl Default for Conn
 {
 	fn default() -> Self
 	{
-		Conn { history: vec![Db::new()] }
+		Conn { history: vec![Db::new()], log: None }
 	}
 }
 
 impl Conn
 {
+	/// A connection to a new, empty database in memory
 	pub fn new() -> Self
 	{
 		Self::default()
+	}
+
+	/// A connection to the database of the durable log at `path`, created if it doesn't exist: every recorded transaction is replayed
+	/// (so `as_of` sees them all), and every transaction committed from now on is appended. A torn final record (an append that a crash
+	/// interrupted, so one never acknowledged) is truncated; any other damage is `Error::CorruptLog`, and the file is left as it is.
+	/// One connection at a time can hold a log (opening it again meanwhile is an `Error::Io`). See `log` for the format
+	pub fn open(path: impl AsRef<Path>) -> Result<Conn, Error>
+	{
+		let (log, history) = Log::open(path.as_ref())?;
+		Ok(Conn { history, log: Some(log) })
+	}
+
+	#[cfg(test)]
+	pub(crate) fn log_mut(&mut self) -> &mut Log
+	{
+		self.log.as_mut().expect("a durable connection")
 	}
 
 	pub fn db(&self) -> Db
@@ -1047,9 +1192,15 @@ impl Conn
 		self.history.last().expect("the history starts with the empty database").clone()
 	}
 
+	/// Apply a transaction; on a durable connection, it returns once the transaction's record is appended to the log and synced
 	pub fn transact(&mut self, tx: &Tx) -> Result<TxReport, Error>
 	{
 		let report = self.db().transact(tx)?;
+		// Durable before it is visible: a transaction whose append fails isn't committed
+		if let Some(log) = &mut self.log
+		{
+			log.append(&report.record())?;
+		}
 		self.history.push(report.db_after.clone());
 		Ok(report)
 	}
@@ -1603,6 +1754,13 @@ pub(crate) mod tests
 	pub(crate) fn random_conn(seed: u64, txs: usize) -> (Conn, Vec<TxReport>)
 	{
 		let mut conn = Conn::new();
+		let reports = random_workload(&mut conn, seed, txs);
+		(conn, reports)
+	}
+
+	/// The workload of `random_conn`, into an empty connection (in memory or durable)
+	pub(crate) fn random_workload(conn: &mut Conn, seed: u64, txs: usize) -> Vec<TxReport>
+	{
 		let mut tx = Tx::new();
 		tx.define("n", ValueType::Int, Cardinality::One)
 			.define("tag", ValueType::Str, Cardinality::Many)
@@ -1654,7 +1812,29 @@ pub(crate) mod tests
 				reports.push(r);
 			}
 		}
-		(conn, reports)
+		reports
+	}
+
+	/// Assert that two database values are the same: every field, every index (with its transactions) and the view markers
+	pub(crate) fn assert_same_db(x: &Db, y: &Db, what: &str)
+	{
+		fn all<K: Ord + std::hash::Hash + Clone, V: Clone>(m: &PMap<K, V>) -> Vec<(K, V)>
+		{
+			m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+		}
+		assert_eq!((x.basis_t, x.next_eid, x.instant, x.history, x.since), (y.basis_t, y.next_eid, y.instant, y.history, y.since), "{what}");
+		assert_eq!(all(&x.attrs), all(&y.attrs), "{what}");
+		assert_eq!(all(&x.attr_ids), all(&y.attr_ids), "{what}");
+		assert_eq!(all(&x.stats), all(&y.stats), "{what}");
+		assert_eq!(all(&x.hstats), all(&y.hstats), "{what}");
+		assert_eq!(all(&x.txs), all(&y.txs), "{what}");
+		assert_eq!(all(&x.eavt), all(&y.eavt), "{what}");
+		assert_eq!(all(&x.aevt), all(&y.aevt), "{what}");
+		assert_eq!(all(&x.avet), all(&y.avet), "{what}");
+		assert_eq!(all(&x.vaet), all(&y.vaet), "{what}");
+		assert_eq!(all(&x.heavt), all(&y.heavt), "{what}");
+		assert_eq!(all(&x.haevt), all(&y.haevt), "{what}");
+		assert_eq!(all(&x.havet), all(&y.havet), "{what}");
 	}
 
 	/// The current datoms that a transaction log leaves, with the transaction that asserted each
