@@ -29,18 +29,23 @@
 //! * `history()`: `datoms` and queries see the history, with the `added` flag (and history statistics for the planner);
 //! * `since(t)`: every read sees only the datoms of the transactions after basis t (the transactions' entities increase with t).
 //!
-//! A view is the same value with a marker (a clone of a few `Arc`s); transacting against a view is an error.
-//! One more history index in transaction order is the log (`tx_range`).
+//! * `as_of(t)`: the value as of basis t, its schema included (a schema history records every definition and alteration):
+//!   every read derives the datoms of the time from the history indexes (a datom is current when its last change by then is an assertion).
+//!   So a connection keeps only its latest value, and every past one is a view of it.
+//!
+//! A view is the same value with a marker (a clone of a few `Arc`s); views compose, and transacting against one is an error.
+//! More history indexes serve the views: VAET order (reverse refs as of a time) and transaction order, the log (`tx_range`).
 //!
 //! # Durability
 //! `Conn::open` backs a connection with a log file (see `log`): each committed transaction's effect (`TxRecord`: its entity, the next entity id,
 //! its instant, the attributes it defined and the datoms it retracted and asserted) is appended and synced before the transaction is visible,
 //! and opening replays the records through `Db::replay`, which validates each one against the value before it and applies it with the same
 //! code as `transact`, so a reopened connection has the same values, down to the index contents and statistics.
+//! `Conn::checkpoint` writes a `Snapshot` next to the log, from which `Db::from_snapshot` rebuilds the value without replaying (see `log`).
 
 use crate::log::Log;
 use crate::pmap::PMap;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -607,6 +612,21 @@ impl TxReport
 		let changes = |added: bool| self.tx_data[1..].iter().filter(|d| d.added == added).map(|d| (d.e, d.a, d.v.clone())).collect();
 		TxRecord { basis_t: after.basis_t, tx: self.tx, next_eid: after.next_eid, instant, attrs, retracted: changes(false), asserted: changes(true) }
 	}
+}
+
+/// The contents of a checkpoint (see `Db::snapshot`)
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub(crate) struct Snapshot
+{
+	pub(crate) basis_t: T,
+	pub(crate) next_eid: Eid,
+	pub(crate) instant: i64,
+	/// Every definition and alteration, by (attribute, basis)
+	pub(crate) schema: Vec<((AttrId, T), Attr)>,
+	/// The transaction entity of each basis
+	pub(crate) txs: Vec<(T, Eid)>,
+	/// Every change, in log order: (tx, e, a, v, added)
+	pub(crate) history: Vec<(Eid, Eid, AttrId, Value, bool)>,
 }
 
 /// An entity of a transaction before its tempids are allocated
@@ -1427,6 +1447,125 @@ impl Db
 		Ok(db)
 	}
 
+	/// What a checkpoint stores of this (unfiltered) value: what can't be derived (the counters, the schema history, the transactions
+	/// and the history in log order); `from_snapshot` derives everything else
+	pub(crate) fn snapshot(&self) -> Snapshot
+	{
+		debug_assert!(!self.history && self.since == 0 && self.upto.is_none(), "a checkpoint is of an unfiltered value");
+		Snapshot {
+			basis_t: self.basis_t,
+			next_eid: self.next_eid,
+			instant: self.instant,
+			schema: self.schema.iter().map(|(k, def)| (*k, def.clone())).collect(),
+			txs: self.txs.iter().map(|(t, tx)| (*t, *tx)).collect(),
+			history: self.tlog.iter().map(|(k, _)| k.clone()).collect(),
+		}
+	}
+
+	/// The value of a snapshot, built in O(n log n) (sorting the history into each index's order, then building each map in linear time),
+	/// rather than by replaying the transactions. The current indexes and the statistics are derived from the history: a datom is current
+	/// when its last change is an assertion. A snapshot that isn't well-formed (out of order, or naming an unknown attribute) is refused
+	pub(crate) fn from_snapshot(s: Snapshot) -> Result<Db, String>
+	{
+		let increasing = |ok: bool, what: &str| if ok { Ok(()) } else { Err(format!("the {what} are not in strictly increasing order")) };
+		increasing(s.schema.windows(2).all(|w| w[0].0 < w[1].0), "attribute definitions")?;
+		increasing(s.txs.windows(2).all(|w| w[0] < w[1]), "transactions")?;
+		increasing(s.history.windows(2).all(|w| w[0] < w[1]), "history entries")?;
+		if s.txs.len() as T != s.basis_t || s.txs.iter().enumerate().any(|(i, (t, _))| *t != i as T + 1)
+		{
+			return Err(format!("{} transactions for basis {}", s.txs.len(), s.basis_t));
+		}
+		// The latest definition of each attribute (the schema is in (id, basis) order)
+		let mut latest: Vec<(AttrId, Attr)> = Vec::new();
+		for ((a, _), def) in &s.schema
+		{
+			match latest.last_mut()
+			{
+				Some((b, d)) if b == a => *d = def.clone(),
+				_ => latest.push((*a, def.clone())),
+			}
+		}
+		if latest.iter().enumerate().any(|(i, (a, _))| *a != i as AttrId)
+		{
+			return Err("the attribute ids are not consecutive from 0".into());
+		}
+		if let Some(k) = s.history.iter().find(|k| k.2 as usize >= latest.len())
+		{
+			return Err(format!("a history entry of unknown attribute {}", k.2));
+		}
+		let mut names: Vec<(Arc<str>, AttrId)> = latest.iter().map(|(a, def)| (def.name.clone(), *a)).collect();
+		names.sort();
+		increasing(names.windows(2).all(|w| w[0].0 < w[1].0), "attribute names")?;
+
+		// The history in each index's order
+		fn sorted<K: Ord>(mut v: Vec<K>) -> Vec<K>
+		{
+			v.sort_unstable();
+			v
+		}
+		let heavt = sorted(s.history.iter().map(|(tx, e, a, v, added)| (*e, *a, v.clone(), *tx, *added)).collect());
+		let haevt = sorted(s.history.iter().map(|(tx, e, a, v, added)| (*a, *e, v.clone(), *tx, *added)).collect());
+		let havet = sorted(s.history.iter().map(|(tx, e, a, v, added)| (*a, v.clone(), *e, *tx, *added)).collect());
+		let hvaet = sorted(s.history.iter().filter_map(|(tx, e, a, v, added)| if let Value::Ref(r) = v { Some((*r, *a, *e, *tx, *added)) } else { None }).collect());
+		// The current datoms (EAVT order), each with the transaction of its last change, an assertion
+		let current: Vec<(Eid, AttrId, Value, Eid)> =
+			Self::current_as_of(heavt.iter(), |x, y| (x.0, x.1, &x.2) == (y.0, y.1, &y.2), |k| (k.3, k.4), Eid::MAX).into_iter().map(|(k, tx)| (k.0, k.1, k.2.clone(), tx)).collect();
+		let aevt = sorted(current.iter().map(|(e, a, v, tx)| ((*a, *e, v.clone()), *tx)).collect());
+		let avet = sorted(current.iter().map(|(e, a, v, tx)| ((*a, v.clone(), *e), *tx)).collect());
+		let vaet = sorted(current.iter().filter_map(|(e, a, v, tx)| if let Value::Ref(r) = v { Some(((*r, *a, *e), *tx)) } else { None }).collect());
+
+		// The statistics: the number of entries, and of distinct (attribute, entity) and (attribute, value) pairs, of each attribute
+		// that ever had a datom (as transact keeps one for every attribute it ever inserted, zero counts included)
+		let ever: BTreeSet<AttrId> = s.history.iter().map(|k| k.2).collect();
+		let count = |ae: &mut dyn Iterator<Item = (AttrId, bool)>, av: &mut dyn Iterator<Item = (AttrId, bool)>, datoms: &mut dyn Iterator<Item = AttrId>| {
+			let mut stats: BTreeMap<AttrId, AttrStats> = ever.iter().map(|a| (*a, AttrStats::default())).collect();
+			for a in datoms
+			{
+				stats.get_mut(&a).expect("an attribute with a history").datoms += 1;
+			}
+			for (a, new) in ae
+			{
+				stats.get_mut(&a).expect("an attribute with a history").entities += new as u64;
+			}
+			for (a, new) in av
+			{
+				stats.get_mut(&a).expect("an attribute with a history").values += new as u64;
+			}
+			PMap::from_sorted(stats)
+		};
+		// Whether each entry of a sorted list starts a new (attribute, x) pair
+		fn firsts<'a, K: 'a, X: PartialEq>(list: &'a [K], key: impl Fn(&'a K) -> (AttrId, X) + 'a) -> impl Iterator<Item = (AttrId, bool)> + 'a
+		{
+			list.iter().enumerate().map(move |(i, k)| (key(k).0, i == 0 || key(&list[i - 1]) != key(k)))
+		}
+		let stats = count(&mut firsts(&aevt, |k| (k.0 .0, k.0 .1)), &mut firsts(&avet, |k| (k.0 .0, &k.0 .1)), &mut aevt.iter().map(|k| k.0 .0));
+		let hstats = count(&mut firsts(&haevt, |k| (k.0, k.1)), &mut firsts(&havet, |k| (k.0, &k.1)), &mut haevt.iter().map(|k| k.0));
+
+		Ok(Db {
+			basis_t: s.basis_t,
+			next_eid: s.next_eid,
+			instant: s.instant,
+			attrs: PMap::from_sorted(latest),
+			attr_ids: PMap::from_sorted(names),
+			stats,
+			eavt: PMap::from_sorted(current.into_iter().map(|(e, a, v, tx)| ((e, a, v), tx))),
+			aevt: PMap::from_sorted(aevt),
+			avet: PMap::from_sorted(avet),
+			vaet: PMap::from_sorted(vaet),
+			heavt: PMap::from_sorted(heavt.into_iter().map(|k| (k, ()))),
+			haevt: PMap::from_sorted(haevt.into_iter().map(|k| (k, ()))),
+			havet: PMap::from_sorted(havet.into_iter().map(|k| (k, ()))),
+			hvaet: PMap::from_sorted(hvaet.into_iter().map(|k| (k, ()))),
+			tlog: PMap::from_sorted(s.history.into_iter().map(|k| (k, ()))),
+			schema: PMap::from_sorted(s.schema),
+			hstats,
+			txs: PMap::from_sorted(s.txs),
+			history: false,
+			since: 0,
+			upto: None,
+		})
+	}
+
 	// Assert an absent datom in transaction tx (insert and remove only see unfiltered values, as transact refuses views)
 	fn insert(&mut self, e: Eid, a: AttrId, v: &Value, tx: Eid)
 	{
@@ -1522,6 +1661,12 @@ impl Conn
 	}
 
 	#[cfg(test)]
+	pub(crate) fn log(&self) -> &Log
+	{
+		self.log.as_ref().expect("a durable connection")
+	}
+
+	#[cfg(test)]
 	pub(crate) fn log_mut(&mut self) -> &mut Log
 	{
 		self.log.as_mut().expect("a durable connection")
@@ -1543,6 +1688,19 @@ impl Conn
 		}
 		self.db = report.db_after.clone();
 		Ok(report)
+	}
+
+	/// Write a checkpoint of the current value next to the log (its file name with `.ckpt` appended), so that the next `open` rebuilds this value
+	/// from the checkpoint in O(n log n) and replays only the records after it. The checkpoint is a cache: the log still holds every record,
+	/// and a checkpoint that is damaged, torn, of another log or ahead of the log is ignored on open (the log is replayed in full).
+	/// An `Error::Io` for an in-memory connection
+	pub fn checkpoint(&mut self) -> Result<(), Error>
+	{
+		match &mut self.log
+		{
+			Some(log) => log.checkpoint(&self.db),
+			None => Err(Error::Io("an in-memory connection has no log to checkpoint".into())),
+		}
 	}
 
 	/// The database as of basis `t` (None if `t` is in the future): a view of the current value (see `Db::as_of`)
@@ -2652,6 +2810,43 @@ pub(crate) mod tests
 		assert_eq!(db.history().tx_range(3, 4), log[2..3].to_vec());
 		assert_eq!(db.since(20).unwrap().tx_range(0, T::MAX), log);
 		assert!(db.tx_range(9, 9).is_empty() && db.tx_range(db.basis_t() + 1, T::MAX).is_empty());
+	}
+
+	// A value rebuilt from its snapshot (every index and statistic derived from the history alone) is the value transact maintained,
+	// at every basis of two workloads: a check of the incremental maintenance by a second implementation
+	#[test]
+	fn snapshots_rebuild_the_same_value()
+	{
+		for seed in [3, 41]
+		{
+			let (mut conn, mut reports) = random_conn(seed, 40);
+			let mut tx = Tx::new();
+			tx.alter_attr(Attr::new("key", ValueType::Int, Cardinality::One)).define("extra", ValueType::Str, Cardinality::One);
+			reports.push(conn.transact(&tx).unwrap());
+			let mut values = vec![Db::new()];
+			values.extend(reports.iter().map(|r| r.db_after.clone()));
+			for (t, db) in values.iter().enumerate()
+			{
+				let rebuilt = Db::from_snapshot(db.snapshot()).unwrap();
+				assert_same_db(&rebuilt, db, &format!("seed {seed}, basis {t}"));
+				assert_eq!(rebuilt.snapshot(), db.snapshot());
+			}
+		}
+		// Malformed snapshots are refused
+		let (conn, _) = random_conn(5, 10);
+		let good = conn.db().snapshot();
+		let mut s = good.clone();
+		s.history.swap(0, 1);
+		assert!(Db::from_snapshot(s).is_err());
+		let mut s = good.clone();
+		s.history[0].2 = 99;
+		assert!(Db::from_snapshot(s).is_err());
+		let mut s = good.clone();
+		s.txs.pop();
+		assert!(Db::from_snapshot(s).is_err());
+		let mut s = good;
+		s.schema.remove(0);
+		assert!(Db::from_snapshot(s).is_err());
 	}
 
 	// Every past value, as an as-of view of the latest one, reads the same as the value the transaction produced at the time

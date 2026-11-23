@@ -23,16 +23,27 @@
 //! so reporting it is safer than silently dropping a transaction that may have been acknowledged.
 //!
 //! The file is locked (`File::try_lock`) while a connection holds it, so a second connection can't interleave appends.
+//!
+//! # Checkpoints
+//! `Conn::checkpoint` writes `<log>.ckpt`: a 36-byte header (magic, format version, the length of the log prefix it covers, the CRC-32
+//! of that prefix, the payload's length and CRC-32) and the payload, a `Snapshot` of the database after the covered records (what can't be
+//! derived: the counters, the schema history, the transactions, and the history in log order). It is written to a temporary file, synced,
+//! and renamed over the previous one. Opening uses it when it is intact (both checksums), its covered prefix ends at a record boundary of
+//! the log and is the log's (the prefix's CRC), and its basis is the number of records it covers; then `Db::from_snapshot` rebuilds every
+//! index from the history in O(n log n), and only the later records are replayed. In every other case the checkpoint is ignored and the log
+//! replayed in full: the log holds the data, the checkpoint is a cache.
 
-use crate::db::{Attr, AttrId, Cardinality, Db, Eid, Error, TxRecord, Unique, Value, ValueType};
+use crate::db::{Attr, AttrId, Cardinality, Db, Eid, Error, Snapshot, TxRecord, Unique, Value, ValueType};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"satdblog";
+const CKPT_MAGIC: &[u8; 8] = b"satdbckp";
 const VERSION: u32 = 1;
 const FILE_HEADER: usize = 12;
 const RECORD_HEADER: usize = 12;
+const CKPT_HEADER: usize = 36;
 
 /// The CRC-32 (IEEE 802.3, reflected) lookup table
 const CRC_TABLE: [u32; 256] = {
@@ -126,24 +137,59 @@ pub(crate) fn encode(rec: &TxRecord) -> Vec<u8>
 	for (a, def) in &rec.attrs
 	{
 		out.extend_from_slice(&a.to_le_bytes());
-		put_str(&mut out, &def.name);
-		let vt = match def.value_type
-		{
-			ValueType::Bool => 0,
-			ValueType::Int => 1,
-			ValueType::Str => 2,
-			ValueType::Ref => 3,
-		};
-		let unique = match def.unique
-		{
-			None => 0,
-			Some(Unique::Identity) => 1,
-			Some(Unique::Value) => 2,
-		};
-		out.extend_from_slice(&[vt, (def.cardinality == Cardinality::Many) as u8, unique, def.component as u8]);
+		put_attr(&mut out, def);
 	}
 	put_datoms(&mut out, &rec.retracted);
 	put_datoms(&mut out, &rec.asserted);
+	out
+}
+
+fn put_attr(out: &mut Vec<u8>, def: &Attr)
+{
+	put_str(out, &def.name);
+	let vt = match def.value_type
+	{
+		ValueType::Bool => 0,
+		ValueType::Int => 1,
+		ValueType::Str => 2,
+		ValueType::Ref => 3,
+	};
+	let unique = match def.unique
+	{
+		None => 0,
+		Some(Unique::Identity) => 1,
+		Some(Unique::Value) => 2,
+	};
+	out.extend_from_slice(&[vt, (def.cardinality == Cardinality::Many) as u8, unique, def.component as u8]);
+}
+
+/// The payload of a checkpoint
+fn encode_snapshot(s: &Snapshot) -> Vec<u8>
+{
+	let mut out = Vec::new();
+	for x in [s.basis_t, s.next_eid, s.instant as u64, s.schema.len() as u64, s.txs.len() as u64, s.history.len() as u64]
+	{
+		out.extend_from_slice(&x.to_le_bytes());
+	}
+	for ((a, t), def) in &s.schema
+	{
+		out.extend_from_slice(&a.to_le_bytes());
+		out.extend_from_slice(&t.to_le_bytes());
+		put_attr(&mut out, def);
+	}
+	for (t, tx) in &s.txs
+	{
+		out.extend_from_slice(&t.to_le_bytes());
+		out.extend_from_slice(&tx.to_le_bytes());
+	}
+	for (tx, e, a, v, added) in &s.history
+	{
+		out.extend_from_slice(&tx.to_le_bytes());
+		out.extend_from_slice(&e.to_le_bytes());
+		out.extend_from_slice(&a.to_le_bytes());
+		put_value(&mut out, v);
+		out.push(*added as u8);
+	}
 	out
 }
 
@@ -220,6 +266,16 @@ impl<'a> Reader<'a>
 		})
 	}
 
+	fn attr(&mut self) -> Result<Attr, String>
+	{
+		let name = self.str()?;
+		let value_type = [ValueType::Bool, ValueType::Int, ValueType::Str, ValueType::Ref][self.tag("value type", 3)? as usize];
+		let cardinality = [Cardinality::One, Cardinality::Many][self.tag("cardinality", 1)? as usize];
+		let unique = [None, Some(Unique::Identity), Some(Unique::Value)][self.tag("uniqueness", 2)? as usize];
+		let component = self.tag("component flag", 1)? == 1;
+		Ok(Attr { name: name.into(), value_type, cardinality, unique, component })
+	}
+
 	fn datoms(&mut self) -> Result<Vec<(Eid, AttrId, Value)>, String>
 	{
 		// The count isn't trusted for an allocation: a corrupt one fails on the first missing datom
@@ -242,12 +298,7 @@ pub(crate) fn decode(payload: &[u8]) -> Result<TxRecord, String>
 	for _ in 0..r.u32()?
 	{
 		let a = r.u32()?;
-		let name = r.str()?;
-		let value_type = [ValueType::Bool, ValueType::Int, ValueType::Str, ValueType::Ref][r.tag("value type", 3)? as usize];
-		let cardinality = [Cardinality::One, Cardinality::Many][r.tag("cardinality", 1)? as usize];
-		let unique = [None, Some(Unique::Identity), Some(Unique::Value)][r.tag("uniqueness", 2)? as usize];
-		let component = r.tag("component flag", 1)? == 1;
-		attrs.push((a, Attr { name: name.into(), value_type, cardinality, unique, component }));
+		attrs.push((a, r.attr()?));
 	}
 	let (retracted, asserted) = (r.datoms()?, r.datoms()?);
 	if r.pos != payload.len()
@@ -255,6 +306,84 @@ pub(crate) fn decode(payload: &[u8]) -> Result<TxRecord, String>
 		return Err(format!("{} bytes after the record", payload.len() - r.pos));
 	}
 	Ok(TxRecord { basis_t, tx, next_eid, instant, attrs, retracted, asserted })
+}
+
+/// The snapshot of a checkpoint's payload (an error, never a panic, for any bytes)
+fn decode_snapshot(payload: &[u8]) -> Result<Snapshot, String>
+{
+	let mut r = Reader { bytes: payload, pos: 0 };
+	let (basis_t, next_eid, instant) = (r.u64()?, r.u64()?, r.u64()? as i64);
+	let (nschema, ntxs, nhistory) = (r.u64()?, r.u64()?, r.u64()?);
+	// The counts aren't trusted for allocations: a corrupt one fails on the first missing entry
+	let mut s = Snapshot { basis_t, next_eid, instant, schema: Vec::new(), txs: Vec::new(), history: Vec::new() };
+	for _ in 0..nschema
+	{
+		let key = (r.u32()?, r.u64()?);
+		s.schema.push((key, r.attr()?));
+	}
+	for _ in 0..ntxs
+	{
+		s.txs.push((r.u64()?, r.u64()?));
+	}
+	for _ in 0..nhistory
+	{
+		s.history.push((r.u64()?, r.u64()?, r.u32()?, r.value()?, r.tag("added flag", 1)? == 1));
+	}
+	if r.pos != payload.len()
+	{
+		return Err(format!("{} bytes after the snapshot", payload.len() - r.pos));
+	}
+	Ok(s)
+}
+
+/// The checkpoint file of the log at `path`: its name with `.ckpt` appended
+pub(crate) fn checkpoint_path(path: &Path) -> PathBuf
+{
+	let mut name = path.file_name().unwrap_or_default().to_os_string();
+	name.push(".ckpt");
+	path.with_file_name(name)
+}
+
+/// A checkpoint file: the header (magic, format version, the length of the log prefix it covers, the CRC-32 of that prefix,
+/// the payload's length and CRC-32), then the payload, the snapshot of the database after the covered records
+fn checkpoint_bytes(snapshot: &Snapshot, log_prefix: &[u8]) -> Vec<u8>
+{
+	let payload = encode_snapshot(snapshot);
+	let mut out = Vec::with_capacity(CKPT_HEADER + payload.len());
+	out.extend_from_slice(CKPT_MAGIC);
+	out.extend_from_slice(&VERSION.to_le_bytes());
+	out.extend_from_slice(&(log_prefix.len() as u64).to_le_bytes());
+	out.extend_from_slice(&crc32(log_prefix).to_le_bytes());
+	out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+	out.extend_from_slice(&crc32(&payload).to_le_bytes());
+	out.extend_from_slice(&payload);
+	out
+}
+
+/// The database of a checkpoint file and the number of log records it covers, if it is intact and belongs to the log `bytes`
+/// (whose records start at `starts`, and whose complete records end at `end`); None otherwise, so that the log is replayed in full
+fn load_checkpoint(ckpt: &[u8], bytes: &[u8], starts: &[usize], end: usize) -> Option<(Db, usize)>
+{
+	if ckpt.len() < CKPT_HEADER || ckpt[..8] != *CKPT_MAGIC || ckpt[8..12] != VERSION.to_le_bytes()
+	{
+		return None;
+	}
+	let u64_at = |i: usize| u64::from_le_bytes(ckpt[i..i + 8].try_into().expect("8 bytes"));
+	let u32_at = |i: usize| u32::from_le_bytes(ckpt[i..i + 4].try_into().expect("4 bytes"));
+	let (covered, log_crc, len, payload_crc) = (u64_at(12) as usize, u32_at(20), u64_at(24), u32_at(32));
+	let payload = &ckpt[CKPT_HEADER..];
+	if payload.len() as u64 != len || crc32(payload) != payload_crc
+	{
+		return None;
+	}
+	// The covered prefix must end at a record boundary of this log, and be this log's
+	let records = if covered == end { starts.len() } else { starts.iter().position(|&s| s == covered)? };
+	if crc32(bytes.get(..covered)?) != log_crc
+	{
+		return None;
+	}
+	let db = Db::from_snapshot(decode_snapshot(payload).ok()?).ok()?;
+	(db.basis_t() == records as u64).then_some((db, records))
 }
 
 /// The records of a log file's contents after its header, as (offset, payload), and the end of the last complete record
@@ -292,14 +421,16 @@ pub(crate) fn records(bytes: &[u8]) -> Result<(Vec<(usize, &[u8])>, usize), Erro
 	Ok((out, at))
 }
 
-/// The database of a log file's contents (its past values are `as_of` views of it), and where the valid data ends
-/// (`FILE_HEADER` at least, as a torn header is rewritten)
-pub(crate) fn replay(bytes: &[u8]) -> Result<(Db, usize), Error>
+/// The database of a log file's contents (its past values are `as_of` views of it), where the valid data ends
+/// (`FILE_HEADER` at least, as a torn header is rewritten), and whether the checkpoint `ckpt` was used.
+/// An intact checkpoint of this log saves replaying the records it covers; any other checkpoint is ignored, and the log replayed in full.
+/// (Should the records after a checkpoint not fit it, the log is replayed in full too: the log is what holds the data, the checkpoint a cache.)
+pub(crate) fn replay(bytes: &[u8], ckpt: Option<&[u8]>) -> Result<(Db, usize, bool), Error>
 {
 	let header = file_header();
 	if bytes.len() < FILE_HEADER
 	{
-		return if header.starts_with(bytes) { Ok((Db::new(), FILE_HEADER)) } else { Err(Error::CorruptLog { offset: 0, msg: "not a satdb log".into() }) };
+		return if header.starts_with(bytes) { Ok((Db::new(), FILE_HEADER, false)) } else { Err(Error::CorruptLog { offset: 0, msg: "not a satdb log".into() }) };
 	}
 	if bytes[..8] != *MAGIC
 	{
@@ -311,14 +442,25 @@ pub(crate) fn replay(bytes: &[u8]) -> Result<(Db, usize), Error>
 		return Err(Error::CorruptLog { offset: 8, msg: format!("format version {v}, this library reads version {VERSION}") });
 	}
 	let (recs, end) = records(bytes)?;
-	let mut db = Db::new();
-	for (at, payload) in recs
+	let apply = |mut db: Db, recs: &[(usize, &[u8])]| -> Result<Db, Error>
 	{
-		let corrupt = |msg: String| Error::CorruptLog { offset: at as u64, msg };
-		let rec = decode(payload).map_err(corrupt)?;
-		db = db.replay(&rec).map_err(corrupt)?;
+		for &(at, payload) in recs
+		{
+			let corrupt = |msg: String| Error::CorruptLog { offset: at as u64, msg };
+			let rec = decode(payload).map_err(corrupt)?;
+			db = db.replay(&rec).map_err(corrupt)?;
+		}
+		Ok(db)
+	};
+	let starts: Vec<usize> = recs.iter().map(|r| r.0).collect();
+	if let Some((db, covered)) = ckpt.and_then(|c| load_checkpoint(c, bytes, &starts, end))
+	{
+		if let Ok(db) = apply(db, &recs[covered..])
+		{
+			return Ok((db, end, true));
+		}
 	}
-	Ok((db, end))
+	Ok((apply(Db::new(), &recs)?, end, false))
 }
 
 /// An open log: the locked file and the length of its committed data
@@ -328,6 +470,11 @@ pub(crate) struct Log
 	len: u64,
 	/// A failed append whose truncation failed too: the end of the file is unknown, so nothing more is appended
 	broken: bool,
+	/// The checkpoint file (see `checkpoint_path`)
+	ckpt: PathBuf,
+	/// Whether opening started from the checkpoint
+	#[cfg(test)]
+	pub(crate) from_checkpoint: bool,
 	/// Tests inject I/O errors: 1 fails appends after writing half of the record, 2 also fails the truncation that follows
 	#[cfg(test)]
 	pub(crate) fault: u8,
@@ -346,7 +493,11 @@ impl Log
 		})?;
 		let mut bytes = Vec::new();
 		file.read_to_end(&mut bytes).map_err(io)?;
-		let (db, end) = replay(&bytes)?;
+		// A missing or unreadable checkpoint is just not used
+		let ckpt = checkpoint_path(path);
+		let ckpt_bytes = std::fs::read(&ckpt).ok();
+		#[cfg_attr(not(test), allow(unused_variables))]
+		let (db, end, from_checkpoint) = replay(&bytes, ckpt_bytes.as_deref())?;
 		if bytes.len() < FILE_HEADER
 		{
 			// A new file (or a torn header): write the header, and make the file's directory entry durable
@@ -371,10 +522,40 @@ impl Log
 			file,
 			len: end as u64,
 			broken: false,
+			ckpt,
+			#[cfg(test)]
+			from_checkpoint,
 			#[cfg(test)]
 			fault: 0,
 		};
 		Ok((log, db))
+	}
+
+	/// Write a checkpoint of `db`, the database after every committed record: to a temporary file, synced, then renamed over the
+	/// previous checkpoint (and the directory synced), so a crash leaves either checkpoint whole. It is a cache: the log keeps every record
+	pub(crate) fn checkpoint(&mut self, db: &Db) -> Result<(), Error>
+	{
+		if self.broken
+		{
+			return Err(Error::Io("an earlier append failed and the log couldn't be truncated back; reopen it".into()));
+		}
+		let mut prefix = vec![0; self.len as usize];
+		self.file.seek(SeekFrom::Start(0)).map_err(io)?;
+		self.file.read_exact(&mut prefix).map_err(io)?;
+		let bytes = checkpoint_bytes(&db.snapshot(), &prefix);
+		let mut tmp = self.ckpt.clone().into_os_string();
+		tmp.push(".tmp");
+		let tmp = PathBuf::from(tmp);
+		let mut f = File::create(&tmp).map_err(io)?;
+		f.write_all(&bytes).and_then(|_| f.sync_all()).map_err(io)?;
+		std::fs::rename(&tmp, &self.ckpt).map_err(io)?;
+		#[cfg(unix)]
+		if let Some(dir) = self.ckpt.parent()
+		{
+			let dir = if dir.as_os_str().is_empty() { Path::new(".") } else { dir };
+			File::open(dir).and_then(|d| d.sync_all()).map_err(io)?;
+		}
+		Ok(())
 	}
 
 	/// Append a committed transaction's record and sync it; on an error, the file is truncated back to the committed data
@@ -825,6 +1006,107 @@ mod tests
 		assert!(matches!(Conn::open(scratch.path("missing/db.log")), Err(Error::Io(_))));
 	}
 
+	// A checkpoint opens to the same value as a full replay (and every past value reads the same), saves replaying the records it covers,
+	// and is ignored, with the log replayed in full, whenever it doesn't fit: torn at any offset, damaged, of another log, or ahead of the log
+	#[test]
+	fn checkpoints_are_a_verified_cache()
+	{
+		let scratch = Scratch::new("checkpoints");
+		let path = scratch.path("db.log");
+		let ckpt = checkpoint_path(&path);
+		assert_eq!(ckpt, scratch.path("db.log.ckpt"));
+		let mut mem = Conn::new();
+		let mut mem_reports = random_workload(&mut mem, 29, 40);
+		mem_reports.extend(extras(&mut mem));
+		let (n, len_at_ckpt) = {
+			let mut conn = Conn::open(&path).unwrap();
+			random_workload(&mut conn, 29, 40);
+			extras(&mut conn);
+			conn.checkpoint().unwrap();
+			(conn.db().basis_t(), file_len(&path))
+		};
+		let full_db = {
+			let bytes = fs::read(&path).unwrap();
+			replay(&bytes, None).unwrap().0
+		};
+		fn check(conn: &Conn, mem: &Conn, from_ckpt: bool, what: &str)
+		{
+			assert_eq!(conn.log().from_checkpoint, from_ckpt, "{what}");
+			assert_same_db(&conn.db(), &mem.db(), what);
+			for t in (0..=mem.db().basis_t()).step_by(7)
+			{
+				assert_same_reads(&conn.as_of(t).unwrap(), &mem.as_of(t).unwrap(), &format!("{what}, as of {t}"));
+			}
+		}
+		check(&Conn::open(&path).unwrap(), &mem, true, "from the checkpoint");
+		assert_same_db(&full_db, &mem.db(), "full replay");
+
+		// More transactions after the checkpoint: the tail is replayed on top of it
+		{
+			let mut conn = Conn::open(&path).unwrap();
+			let (x, y) = (conn.transact(&probe()).unwrap(), mem.transact(&probe()).unwrap());
+			same_report(&x, &y);
+		}
+		check(&Conn::open(&path).unwrap(), &mem, true, "checkpoint and tail");
+		let good = fs::read(&ckpt).unwrap();
+		// A torn checkpoint (cut anywhere) or a damaged one (a byte flipped anywhere, by a step) is ignored
+		for cut in 0..good.len()
+		{
+			fs::write(&ckpt, &good[..cut]).unwrap();
+			let conn = Conn::open(&path).unwrap();
+			assert!(!conn.log().from_checkpoint, "cut at {cut}");
+			assert_same_db(&conn.db(), &mem.db(), &format!("checkpoint cut at {cut}"));
+		}
+		for at in (0..good.len()).step_by(97)
+		{
+			let mut bad = good.clone();
+			bad[at] ^= 0x20;
+			fs::write(&ckpt, &bad).unwrap();
+			check(&Conn::open(&path).unwrap(), &mem, false, &format!("byte {at} flipped"));
+		}
+		// The checkpoint of another log: a log with the same transactions but one, shorter than the covered prefix or not
+		fs::write(&ckpt, &good).unwrap();
+		let other = scratch.path("other.log");
+		{
+			let mut conn = Conn::open(&other).unwrap();
+			random_workload(&mut conn, 30, 60);
+		}
+		fs::copy(&ckpt, checkpoint_path(&other)).unwrap();
+		let conn = Conn::open(&other).unwrap();
+		assert!(!conn.log().from_checkpoint);
+		drop(conn);
+		// ... and a log with the same records but for one value (so the same record boundaries and basis): only the fingerprint tells
+		let twin = |name: &str, v: i64| {
+			let path = scratch.path(name);
+			let mut conn = Conn::open(&path).unwrap();
+			let mut tx = Tx::new();
+			let e = tx.temp();
+			tx.define("x", ValueType::Int, Cardinality::One).add(e, "x", v);
+			conn.transact(&tx).unwrap();
+			path
+		};
+		let (a, b) = (twin("a.log", 1), twin("b.log", 2));
+		Conn::open(&a).unwrap().checkpoint().unwrap();
+		fs::copy(checkpoint_path(&a), checkpoint_path(&b)).unwrap();
+		let conn = Conn::open(&b).unwrap();
+		assert!(!conn.log().from_checkpoint);
+		let x = conn.db().attr_id("x").unwrap();
+		assert_eq!(conn.db().attr_datoms(x).map(|(_, v)| v.clone()).collect::<Vec<_>>(), vec![Value::Int(2)]);
+		drop(conn);
+		// A log cut back below the covered prefix (as if its later records were lost) makes the checkpoint useless too
+		let bytes = fs::read(&path).unwrap();
+		let (recs, _) = records(&bytes).unwrap();
+		let cut = recs[recs.len() - 3].0;
+		assert!(cut < len_at_ckpt);
+		fs::write(&path, &bytes[..cut]).unwrap();
+		let conn = Conn::open(&path).unwrap();
+		assert!(!conn.log().from_checkpoint);
+		assert_eq!(conn.db().basis_t(), n - 2);
+		assert_same_db(&conn.db(), &replay(&bytes[..cut], None).unwrap().0, "shortened log");
+		// An in-memory connection has no log to checkpoint
+		assert!(matches!(Conn::new().checkpoint(), Err(Error::Io(_))));
+	}
+
 	/// A log of `txs` transactions of 20 assertions each (and some retractions), written without syncing (the test is about reading)
 	fn big_log(path: &Path, txs: usize)
 	{
@@ -869,9 +1151,20 @@ mod tests
 			let path = scratch.path(&format!("{txs}.log"));
 			big_log(&path, txs);
 			let t = std::time::Instant::now();
-			let conn = Conn::open(&path).unwrap();
-			println!("{txs} transactions, {} bytes: open {:?}", file_len(&path), t.elapsed());
+			let mut conn = Conn::open(&path).unwrap();
+			let replayed = t.elapsed();
+			let t = std::time::Instant::now();
+			conn.checkpoint().unwrap();
+			let written = t.elapsed();
+			let db = conn.db();
 			drop(conn);
+			let t = std::time::Instant::now();
+			let conn = Conn::open(&path).unwrap();
+			let from_ckpt = t.elapsed();
+			assert!(conn.log().from_checkpoint);
+			assert_same_db(&conn.db(), &db, "reopened from the checkpoint");
+			let ckpt = fs::metadata(checkpoint_path(&path)).unwrap().len();
+			println!("{txs} transactions, {} bytes: open by replay {replayed:?}; checkpoint ({ckpt} bytes) written in {written:?}; open from it {from_ckpt:?}", file_len(&path));
 		}
 	}
 }
