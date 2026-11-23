@@ -111,6 +111,8 @@ impl CVarScores
 		is_rescaled
 	}
 
+	// Inlined into UnassignVar (its only caller), so that a variable which is still in the heap, the common case when backtracking, costs a test rather than a call
+	#[inline]
 	pub fn reinsert_if_not_in_heap(&mut self, v: TUVar)
 	{
 		debug_assert!(!self.uninitialized_or_erroneous());
@@ -158,6 +160,8 @@ impl CVarScores
 		self.percolate_up(self.m_PosScore[v as usize].m_Pos);
 	}
 
+	// Inlined into Decide (its only caller)
+	#[inline]
 	pub fn remove_min(&mut self) -> TUVar
 	{
 		let v = self.m_Heap[1];

@@ -537,7 +537,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	}
 
 	// The VisitCls lambda of LearnAndUpdateHeuristics
-	#[inline]
+	// Forced inline into its two call sites in the resolution loop (the compiler's own choice with a profile): out of line, varsToVisitCurrDecLevel, which it takes by reference, lives in memory across the loop
+	#[inline(always)]
 	fn LearnAndUpdateHeuristicsVisitCls(&mut self, cls: TSpanTULit, longClsInd: Ind, updateClsCounter: bool, varsToVisitCurrDecLevel: &mut TUV, visitedNegLitsPrevDecLevels: *mut CVector<TULit>)
 	{
 		if updateClsCounter

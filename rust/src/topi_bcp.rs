@@ -16,6 +16,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		self.WLAddLongWatch(cls.get(watchInd as usize), cls.get(!watchInd as usize), clsInd);
 	}
 
+	// Forced inline (as clang does for the C++): out of line, the by-reference currLongWatchInd/currLongWatchPtr of BCP's long-watch loop would have to live in memory rather than in registers
+	#[inline(always)]
 	pub(crate) fn SwapCurrWatch(&mut self, l: TULit, newWatchIt: usize, clsInd: Ind, cls: &mut CCls<Ind, Compress>, currLongWatchInd: &mut usize, currLongWatchPtr: &mut *mut TULit, wi: *mut TWatchInfo<Ind>)
 	{
 		// Remove the current watch and adjust the indices, since removal moves the last watch into the current location
