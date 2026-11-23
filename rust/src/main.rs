@@ -64,7 +64,9 @@ const fn AllSigsDifferByFirstInt() -> bool
 const _: () = assert!(AllSigsDifferByFirstInt());
 
 // Strings before and after the command for each archive type
-const commandStringBeforeAndAfter: [(&str, &str); TArchiveFileType::None as usize] = [("xz -c -d", ""), ("lzma -c -d", ""), ("bzip2 -c -d", ""), ("gzip -c -d", ""), ("7z x -so", "2>/dev/null")];
+// The C++ version runs "<program> <args> <file> <suffix>" through popen; here the program is spawned directly with the file as a single argument,
+// so that the file name is never interpreted by a shell. The Boolean stands for the "2>/dev/null" suffix
+const archiveCommands: [(&str, &[&str], bool); TArchiveFileType::None as usize] = [("xz", &["-c", "-d"], false), ("lzma", &["-c", "-d"], false), ("bzip2", &["-c", "-d"], false), ("gzip", &["-c", "-d"], false), ("7z", &["x", "-so"], true)];
 
 const BadRetVal: i32 = -1;
 
@@ -1100,6 +1102,13 @@ impl<'a> CToporTool<'a>
 			return Ok(None);
 		}
 
+		// The solver commands need the solver instance, which only exists once the p-line or the first clause is read
+		// (the C++ version dereferences a null pointer otherwise)
+		if ((l.curr() == b'r' && !self.ignoreFileParams) || l.curr() == b'l' || l.curr() == b'b' || l.curr() == b'n') && self.AllToporsNull()
+		{
+			return Err("c topor_tool ERROR: a solver command appears before the p-line and the first clause at line number ".to_string() + &lineNum.to_string());
+		}
+
 		if l.curr() == b'r'
 		{
 			if !self.ignoreFileParams
@@ -1579,16 +1588,11 @@ fn ToporToolMain(argv: &[String], out: &mut dyn Write) -> Result<i32, String>
 		}
 	};
 
-	let command = if aFileType != TArchiveFileType::None
+	if aFileType != TArchiveFileType::None
 	{
-		let command = commandStringBeforeAndAfter[aFileType as usize].0.to_string() + " " + inputFileName + " " + commandStringBeforeAndAfter[aFileType as usize].1;
-		coutln!(out, "c topor_tool: file type determined to an archive file. The following command will be used to read it through a pipe : {}", command);
-		command
+		let (program, args, discardStderr) = archiveCommands[aFileType as usize];
+		coutln!(out, "c topor_tool: file type determined to an archive file. The following command will be used to read it through a pipe : {} {} {} {}", program, args.join(" "), inputFileName, if discardStderr { "2>/dev/null" } else { "" });
 	}
-	else
-	{
-		String::new()
-	};
 
 	// Open the input file: it can be an archive file, in which case it is read as a pipe
 	// or a plain text file, which is read as a file
@@ -1609,13 +1613,29 @@ fn ToporToolMain(argv: &[String], out: &mut dyn Write) -> Result<i32, String>
 	else
 	{
 		// popen
-		match std::process::Command::new("sh").arg("-c").arg(&command).stdout(std::process::Stdio::piped()).spawn()
+		let (program, args, discardStderr) = archiveCommands[aFileType as usize];
+		let mut command = std::process::Command::new(program);
+		command.args(args).arg(inputFileName).stdout(std::process::Stdio::piped());
+		if discardStderr
+		{
+			command.stderr(std::process::Stdio::null());
+		}
+		match command.spawn()
 		{
 			Ok(mut child) =>
 			{
 				let childStdout = child.stdout.take().unwrap();
 				pipe = Some(child);
 				Box::new(BufReader::new(childStdout))
+			}
+			// popen succeeds even if the program is missing (the shell reports it and the pipe provides nothing), so the input is empty
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound =>
+			{
+				if !discardStderr
+				{
+					eprintln!("sh: {}: command not found", program);
+				}
+				Box::new(std::io::empty())
 			}
 			Err(_) =>
 			{
