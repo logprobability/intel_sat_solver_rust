@@ -1017,11 +1017,11 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			if !self.m_AxePrinted
 			{
 				self.PrintAxe();
-				println!("{}{}{}{}{}{}", print_as_color("c Literal bit-width= ", ansi_color_code::blue), print_as_color((std::mem::size_of::<TLit>() << 3).to_string(), ansi_color_code::blue),
+				stdout_println!("{}{}{}{}{}{}", print_as_color("c Literal bit-width= ", ansi_color_code::blue), print_as_color((std::mem::size_of::<TLit>() << 3).to_string(), ansi_color_code::blue),
 					print_as_color("; Clause-index bit-width= ", ansi_color_code::blue), print_as_color((Ind::DIGITS as usize).to_string(), ansi_color_code::blue),
 					print_as_color("; Compress = ", ansi_color_code::blue), print_as_color(if Compress { "1" } else { "0" }, ansi_color_code::blue));
 			}
-			print!("{}", self.m_Params.GetAllParamsCurrValues());
+			stdout_print!("{}", self.m_Params.GetAllParamsCurrValues());
 		}
 
 		self.m_Stat.NewSolveInvocation(self.m_QueryCurr == TQueryType::QUERY_INC_SHORT);
@@ -1092,7 +1092,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 		if self.m_Params.m_ParamVerbosity.get() > 0
 		{
-			print!("{}", self.StatStrShort(false));
+			stdout_print!("{}", self.StatStrShort(false));
 		}
 
 		if self.m_Stat.m_SolveInvs == self.m_Params.m_ParamPrintDebugModelInvocation.get() as u64
@@ -1286,7 +1286,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 		if self.m_Params.m_ParamVerbosity.get() > 0
 		{
-			print!("{}", self.StatStrShort(false));
+			stdout_print!("{}", self.StatStrShort(false));
 		}
 
 		self.m_DecLevelOfLastAssignedAssumption = if self.m_Assumps.cap() == 0
@@ -1620,7 +1620,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 	pub(crate) fn PrintAxe(&mut self)
 	{
-		print!("\
+		stdout_print!("\
 c Intel(R) SAT Solver by Alexander Nadel\n\
 c          A\n\
 c         /!\\\n\
