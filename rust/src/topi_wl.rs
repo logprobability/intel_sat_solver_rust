@@ -217,7 +217,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	}
 
 	// The AllocateNewArenaAndCopyOldArenaIfAny lambda of WLPrepareArena
-	fn WLPrepareArenaAllocateNewArenaAndCopyOldArenaIfAny(&mut self, wi: *mut TWatchInfo<Ind>, sz: Ind) -> *mut TULit
+	// The lambda captures the watch-info of l by reference; here it is re-read by index, since CompressWLs rewrites it
+	fn WLPrepareArenaAllocateNewArenaAndCopyOldArenaIfAny(&mut self, l: TULit, sz: Ind) -> *mut TULit
 	{
 		let mut allocatedWordsRequired = self.m_WNext + sz;
 		if allocatedWordsRequired < self.m_WNext || ((self.m_WWasted + self.m_WNext).as_u64() as f64 > self.m_WNext.as_u64() as f64 * self.m_Params.m_ParamMultWasteWatches.get())
@@ -238,61 +239,59 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			return std::ptr::null_mut();
 		}
 
-		unsafe
+		// MarkWatchBufferChunkDeleted only touches m_W, so the watch-info is updated in a copy, which is then stored back
+		let mut wi = self.m_Watches[l as usize];
+		if !wi.IsEmpty()
 		{
-			if !(*wi).IsEmpty()
-			{
-				self.m_W.memcpy(self.m_WNext.as_usize(), (*wi).m_WBInd.as_usize(), (*wi).GetUsedEntries());
-				self.MarkWatchBufferChunkDeleted(&mut *wi);
-			}
-			(*wi).PointToNewArena(self.m_WNext, sz);
-			self.m_WNext += (*wi).m_AllocatedEntries;
-			self.m_W.get_ptr((self.m_WNext - (*wi).m_AllocatedEntries).as_usize())
+			self.m_W.memcpy(self.m_WNext.as_usize(), wi.m_WBInd.as_usize(), wi.GetUsedEntries());
+			self.MarkWatchBufferChunkDeleted(&mut wi);
 		}
+		wi.PointToNewArena(self.m_WNext, sz);
+		self.m_WNext += wi.m_AllocatedEntries;
+		self.m_Watches[l as usize] = wi;
+		self.m_W.get_ptr((self.m_WNext - wi.m_AllocatedEntries).as_usize())
 	}
 
 	pub(crate) fn WLPrepareArena(&mut self, l: TULit, allowNewBinaryWatch: bool, allowNewLongWatch: bool) -> *mut TULit
 	{
-		let wi: *mut TWatchInfo<Ind> = self.m_Watches.get_ptr(l as usize);
+		// The watch-info is only read here (the lambda re-reads and updates it), so a copy is used
+		let wi = self.m_Watches[l as usize];
 
-		unsafe
+		let currRequiredEntries = Ind::from_usize(allowNewBinaryWatch as usize + (allowNewLongWatch as usize * TWatchInfo::<Ind>::BinsInLong));
+		if wi.IsEmpty()
 		{
-			let currRequiredEntries = Ind::from_usize(allowNewBinaryWatch as usize + (allowNewLongWatch as usize * TWatchInfo::<Ind>::BinsInLong));
-			if (*wi).IsEmpty()
-			{
-				let initEntriesPerWL = Ind::from_usize(self.m_Params.m_ParamInitEntriesPerWL.get() as usize);
-				return self.WLPrepareArenaAllocateNewArenaAndCopyOldArenaIfAny(wi, if initEntriesPerWL < currRequiredEntries { Ind::from_usize(currRequiredEntries.as_usize().next_power_of_two()) } else { initEntriesPerWL });
-			}
-
-			debug_assert!(!(*wi).IsEmpty());
-
-			let usedEntries = Ind::from_usize((*wi).GetUsedEntries());
-			let requiredEntries = usedEntries + currRequiredEntries;
-
-			if requiredEntries <= (*wi).m_AllocatedEntries
-			{
-				return self.m_W.get_ptr((*wi).m_WBInd.as_usize());
-			}
-
-			if requiredEntries < usedEntries
-			{
-				// Overflow
-				self.SetStatus(TToporStatus::STATUS_INDEX_TOO_NARROW, "The actual number of entries for one literal doesn't fit into the buffer".to_string());
-				return std::ptr::null_mut();
-			}
-
-			// Re-allocation is required
-
-			if (*wi).m_AllocatedEntries == TWatchInfo::<Ind>::MaxWatchInfoAlloc()
-			{
-				// Reached the maximum allocation!
-				self.SetStatus(TToporStatus::STATUS_INDEX_TOO_NARROW, "The watch list for one literal doesn't fit into the buffer".to_string());
-				return std::ptr::null_mut();
-			}
-
-			self.m_WWasted += (*wi).m_AllocatedEntries;
-			self.WLPrepareArenaAllocateNewArenaAndCopyOldArenaIfAny(wi, Ind::from_u64((*wi).m_AllocatedEntries.as_u64() << 1))
+			let initEntriesPerWL = Ind::from_usize(self.m_Params.m_ParamInitEntriesPerWL.get() as usize);
+			return self.WLPrepareArenaAllocateNewArenaAndCopyOldArenaIfAny(l, if initEntriesPerWL < currRequiredEntries { Ind::from_usize(currRequiredEntries.as_usize().next_power_of_two()) } else { initEntriesPerWL });
 		}
+
+		debug_assert!(!wi.IsEmpty());
+
+		let usedEntries = Ind::from_usize(wi.GetUsedEntries());
+		let requiredEntries = usedEntries + currRequiredEntries;
+
+		if requiredEntries <= wi.m_AllocatedEntries
+		{
+			return self.m_W.get_ptr(wi.m_WBInd.as_usize());
+		}
+
+		if requiredEntries < usedEntries
+		{
+			// Overflow
+			self.SetStatus(TToporStatus::STATUS_INDEX_TOO_NARROW, "The actual number of entries for one literal doesn't fit into the buffer".to_string());
+			return std::ptr::null_mut();
+		}
+
+		// Re-allocation is required
+
+		if wi.m_AllocatedEntries == TWatchInfo::<Ind>::MaxWatchInfoAlloc()
+		{
+			// Reached the maximum allocation!
+			self.SetStatus(TToporStatus::STATUS_INDEX_TOO_NARROW, "The watch list for one literal doesn't fit into the buffer".to_string());
+			return std::ptr::null_mut();
+		}
+
+		self.m_WWasted += wi.m_AllocatedEntries;
+		self.WLPrepareArenaAllocateNewArenaAndCopyOldArenaIfAny(l, Ind::from_u64(wi.m_AllocatedEntries.as_u64() << 1))
 	}
 
 	// The test of one binary clause, shared by WLAssertNoMissedImplications and WLAssertConsistency
