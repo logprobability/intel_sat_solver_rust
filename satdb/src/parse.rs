@@ -22,8 +22,10 @@
 //! * `:find` takes variables and aggregates `(count ?x)`, `(count-distinct ?x)`, `(sum ?x)`, `(min ?x)`, `(max ?x)`, `(avg ?x)`
 //!   (see `Query::find`); `:with` takes variables.
 //! * `:in` takes `$` (the database; one at most, and it may be left out), `%` (the rules, given as a text of their own to
-//!   `Db::q_rules`) and scalar inputs `?x`, which are bound to `inputs` in order and become constants of the query
-//!   (so the planner sees them as bound).
+//!   `Db::q_rules`) and bindings, each bound to the `Input` at its position among them: a scalar `?x` (`Input::Scalar`) and a tuple
+//!   `[?a ?b]` (`Input::Tuple`) become constants of the query (so the planner sees them as bound); a collection `[?x ...]`
+//!   (`Input::Coll`) and a relation `[[?a ?b]]` (`Input::Rel`) become base relations (`Query::relation`) that the query joins, like
+//!   rule calls, so its solutions (and its aggregates) range over all of them. `_` in a binding ignores that position.
 //! * Rules are written as in Datomic, `[[(name ?a ?b) clause ...] ...]`: a head of distinct variables, then the body; definitions
 //!   with the same name are a union, and rules can call each other in any order. A call `(name arg ...)` is a clause, in the query
 //!   or in a rule, whose arguments are terms or lookup refs (see the `rules` module). Required variables (`(name [?a] ?b)`) are not supported.
@@ -47,6 +49,28 @@ use crate::db::{Db, Eid, Error, Value};
 use crate::query::{Agg, Clause, Cmp, Find, Pull, Pulled, Query, Term};
 use std::collections::{BTreeSet, HashMap};
 
+/// An input of a text query, for the binding in its `:in` section at the same position (`$` and `%` take none)
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Input
+{
+	/// For `?x`
+	Scalar(Value),
+	/// For `[?x ...]`: the query's solutions for each value
+	Coll(Vec<Value>),
+	/// For `[?a ?b]`: a value for each variable
+	Tuple(Vec<Value>),
+	/// For `[[?a ?b]]`: the query's solutions for each tuple
+	Rel(Vec<Vec<Value>>),
+}
+
+impl From<Value> for Input
+{
+	fn from(v: Value) -> Self
+	{
+		Input::Scalar(v)
+	}
+}
+
 /// A parsed text query: the query (planned as its clauses were read), its find spec and its `with` terms
 pub struct TextQuery
 {
@@ -66,32 +90,32 @@ impl TextQuery
 
 impl Db
 {
-	/// Parse a text query (see the module documentation), with `inputs` bound to the scalar inputs of its `:in` section, in order
-	pub fn parse_query(&self, text: &str, inputs: &[Value]) -> Result<TextQuery, Error>
+	/// Parse a text query (see the module documentation), with `inputs` bound to the bindings of its `:in` section after `$` and `%`, in order
+	pub fn parse_query(&self, text: &str, inputs: &[Input]) -> Result<TextQuery, Error>
 	{
 		self.parse(text, None, inputs)
 	}
 
 	/// Parse a text query that takes the rule set `rules` (as `%` in its `:in` section; see the module documentation)
-	pub fn parse_query_rules(&self, text: &str, rules: &str, inputs: &[Value]) -> Result<TextQuery, Error>
+	pub fn parse_query_rules(&self, text: &str, rules: &str, inputs: &[Input]) -> Result<TextQuery, Error>
 	{
 		self.parse(text, Some(rules), inputs)
 	}
 
-	fn parse(&self, text: &str, rules: Option<&str>, inputs: &[Value]) -> Result<TextQuery, Error>
+	fn parse(&self, text: &str, rules: Option<&str>, inputs: &[Input]) -> Result<TextQuery, Error>
 	{
 		let node = Reader { text, pos: 0 }.read_all()?;
 		Parser { text, q: self.query(), inputs: HashMap::new(), fresh: 0, rule_names: HashMap::new() }.query(node, rules, inputs)
 	}
 
 	/// Parse and run a text query
-	pub fn q(&self, text: &str, inputs: &[Value]) -> Result<Vec<Vec<Value>>, Error>
+	pub fn q(&self, text: &str, inputs: &[Input]) -> Result<Vec<Vec<Value>>, Error>
 	{
 		self.parse_query(text, inputs)?.run()
 	}
 
 	/// Parse and run a text query that takes the rule set `rules`
-	pub fn q_rules(&self, text: &str, rules: &str, inputs: &[Value]) -> Result<Vec<Vec<Value>>, Error>
+	pub fn q_rules(&self, text: &str, rules: &str, inputs: &[Input]) -> Result<Vec<Vec<Value>>, Error>
 	{
 		self.parse_query_rules(text, rules, inputs)?.run()
 	}
@@ -496,6 +520,28 @@ impl<'a> Reader<'a>
 }
 
 /// The reader of a query's forms into the builder
+/// A binding of the `:in` section (None: `_`, a position that binds nothing)
+enum Binding
+{
+	Scalar(String),
+	Coll(Option<String>),
+	Tuple(Vec<Option<String>>),
+	Rel(Vec<Option<String>>),
+}
+
+impl Binding
+{
+	fn vars(&self) -> Box<dyn Iterator<Item = Option<&String>> + '_>
+	{
+		match self
+		{
+			Binding::Scalar(x) => Box::new(std::iter::once(Some(x))),
+			Binding::Coll(x) => Box::new(std::iter::once(x.as_ref())),
+			Binding::Tuple(xs) | Binding::Rel(xs) => Box::new(xs.iter().map(|x| x.as_ref())),
+		}
+	}
+}
+
 struct Parser<'a>
 {
 	text: &'a str,
@@ -515,7 +561,7 @@ impl<'a> Parser<'a>
 		error_at(self.text, node.pos, msg)
 	}
 
-	fn query(mut self, node: Node, rules: Option<&'a str>, inputs: &[Value]) -> Result<TextQuery, Error>
+	fn query(mut self, node: Node, rules: Option<&'a str>, inputs: &[Input]) -> Result<TextQuery, Error>
 	{
 		let Form::Vector(items) = node.form
 		else
@@ -559,15 +605,16 @@ impl<'a> Parser<'a>
 			return Err(self.err(&find_kw, ":find needs at least one variable or aggregate"));
 		}
 
-		// The inputs first, as constants of the clauses
-		let mut scalars = Vec::new();
+		// The inputs first: scalars and tuples become constants of the clauses, collections and relations base relations that the query joins
+		let mut bindings: Vec<Binding> = Vec::new();
 		let mut takes_rules = false;
 		if let Some((_, _, names)) = input
 		{
 			let mut sources = 0;
+			let mut seen: Vec<String> = Vec::new();
 			for n in &names
 			{
-				match &n.form
+				let binding = match &n.form
 				{
 					Form::Symbol(s) if s == "$" =>
 					{
@@ -576,14 +623,7 @@ impl<'a> Parser<'a>
 						{
 							return Err(self.err(n, "only one database input ($) is supported"));
 						}
-					}
-					Form::Symbol(s) if s.starts_with('?') =>
-					{
-						if scalars.contains(s)
-						{
-							return Err(self.err(n, format!("the input {s} is named twice")));
-						}
-						scalars.push(s.clone());
+						continue;
 					}
 					Form::Symbol(s) if s == "%" =>
 					{
@@ -596,15 +636,33 @@ impl<'a> Parser<'a>
 							return Err(self.err(n, "the query takes rules (%), but none were given (see Db::q_rules)"));
 						}
 						takes_rules = true;
+						continue;
 					}
-					Form::Vector(_) => return Err(self.err(n, "collection, tuple and relation inputs are not supported (only scalars ?x)")),
-					_ => return Err(self.err(n, "an input is $, % or a variable ?x")),
+					Form::Symbol(s) if s.starts_with('?') => Binding::Scalar(s.clone()),
+					Form::Vector(items) => match &items[..]
+					{
+						[x, Node { form: Form::Symbol(dots), .. }] if dots == "..." => Binding::Coll(self.binding_var(x)?),
+						[Node { form: Form::Vector(vars), .. }] if !vars.is_empty() => Binding::Rel(vars.iter().map(|v| self.binding_var(v)).collect::<Result<_, _>>()?),
+						[] => return Err(self.err(n, "an empty binding")),
+						_ if items.iter().any(|v| matches!(&v.form, Form::Symbol(s) if s == "...")) => return Err(self.err(n, "a collection binding is [?x ...]")),
+						vars => Binding::Tuple(vars.iter().map(|v| self.binding_var(v)).collect::<Result<_, _>>()?),
+					},
+					_ => return Err(self.err(n, "an input is $, %, a variable ?x, a collection [?x ...], a tuple [?a ?b] or a relation [[?a ?b]]")),
+				};
+				for v in binding.vars().flatten()
+				{
+					if seen.contains(v)
+					{
+						return Err(self.err(n, format!("the input {v} is named twice")));
+					}
+					seen.push(v.clone());
 				}
+				bindings.push(binding);
 			}
 		}
-		if scalars.len() != inputs.len()
+		if bindings.len() != inputs.len()
 		{
-			return Err(Error::InvalidQuery(match scalars.len()
+			return Err(Error::InvalidQuery(match bindings.len()
 			{
 				0 => format!("the query takes no inputs, got {}", inputs.len()),
 				n => format!("the query takes {n} inputs, got {}", inputs.len()),
@@ -617,7 +675,47 @@ impl<'a> Parser<'a>
 			Some(_) => return Err(Error::InvalidQuery("rules were given, but the query's :in has no %".into())),
 			None => {}
 		}
-		self.inputs = scalars.into_iter().zip(inputs.iter().cloned()).collect();
+		let mut calls = Vec::new();
+		for (k, (b, input)) in bindings.into_iter().zip(inputs).enumerate()
+		{
+			let mismatch = |want: &str| Error::InvalidQuery(format!("input {} is for {want}", k + 1));
+			let tuples = match (b, input)
+			{
+				(Binding::Scalar(x), Input::Scalar(v)) =>
+				{
+					self.inputs.insert(x, v.clone());
+					continue;
+				}
+				(Binding::Tuple(xs), Input::Tuple(vs)) if xs.len() == vs.len() =>
+				{
+					self.inputs.extend(xs.into_iter().zip(vs.iter().cloned()).filter_map(|(x, v)| Some((x?, v))));
+					continue;
+				}
+				(Binding::Coll(x), Input::Coll(vs)) => (vec![x], vs.iter().map(|v| vec![v.clone()]).collect()),
+				(Binding::Rel(xs), Input::Rel(ts)) => (xs, ts.clone()),
+				(Binding::Scalar(_), _) => return Err(mismatch("a scalar binding (Input::Scalar)")),
+				(Binding::Tuple(xs), _) => return Err(mismatch(&format!("a tuple binding of {} (Input::Tuple)", xs.len()))),
+				(Binding::Coll(_), _) => return Err(mismatch("a collection binding (Input::Coll)")),
+				(Binding::Rel(_), _) => return Err(mismatch("a relation binding (Input::Rel)")),
+			};
+			// A name that no query can write
+			let name = format!(":in {}", k + 1);
+			self.q.relation(&name, tuples.0.len(), tuples.1)?;
+			calls.push((name, tuples.0));
+		}
+		for (name, xs) in calls
+		{
+			let mut args = Vec::with_capacity(xs.len());
+			for x in xs
+			{
+				args.push(match x
+				{
+					Some(x) => self.q.var(&x),
+					None => self.blank(),
+				});
+			}
+			self.q.call(&name, &args)?;
+		}
 
 		for c in clauses.map(|s| s.2).unwrap_or_default()
 		{
@@ -658,6 +756,17 @@ impl<'a> Parser<'a>
 			}
 		}
 		Ok(TextQuery { query: self.q, find: spec, with })
+	}
+
+	// A variable of an input binding, or `_`
+	fn binding_var(&self, node: &Node) -> Result<Option<String>, Error>
+	{
+		match &node.form
+		{
+			Form::Symbol(s) if s == "_" => Ok(None),
+			Form::Symbol(s) if s.starts_with('?') => Ok(Some(s.clone())),
+			_ => Err(self.err(node, "a binding takes variables ?x (or _)")),
+		}
 	}
 
 	// A variable (an input's value, for an input) or a constant
@@ -1044,7 +1153,7 @@ mod tests
 			        [(>= ?v ?min)]
 			        (not [?e :tag "a"])
 			        (or-join [?e] [?e :ref ?f] (and [?e :best ?g] [?g :n 2]))]"#;
-		let mut tq = db.parse_query(text, &[Value::Int(1)]).unwrap();
+		let mut tq = db.parse_query(text, &[Value::Int(1).into()]).unwrap();
 		let mut q = db.query();
 		let (e, v, f, g) = (q.var("?e"), q.var("?v"), q.var("?f"), q.var("?g"));
 		q.pattern(e.clone(), "n", v.clone()).unwrap();
@@ -1085,7 +1194,7 @@ mod tests
 		assert_eq!(db.q("[:find ?e :where [?e :tag _] [?e :ref _]]", &[]).unwrap(), want);
 		// A two-element pattern, commas, and the database input in any position
 		let target = facts.iter().find(|f| f.1 == id("ref") && has(f.0, "tag")).unwrap();
-		let got = db.q("[:find ?e, :in ?a $ :where [?e :tag], [?e :ref ?a]]", &[target.2.clone()]).unwrap();
+		let got = db.q("[:find ?e, :in ?a $ :where [?e :tag], [?e :ref ?a]]", &[target.2.clone().into()]).unwrap();
 		assert_eq!(got, refs(facts.iter().filter(|f| f.1 == id("ref") && f.2 == target.2 && has(f.0, "tag")).map(|f| f.0)));
 
 		// A lookup ref, in the entity position and as a value
@@ -1195,7 +1304,7 @@ mod tests
 		assert_eq!(at("[:find 3 :where [?e :n 1]]"), (1, 8));
 		assert_eq!(at("[:find ?e :with 3 :where [?e :n 1]]"), (1, 17));
 		assert_eq!(at("[:find ?e :in $ $ :where [?e :n 1]]"), (1, 17));
-		assert_eq!(at("[:find ?e :in $ [?x ...] :where [?e :n ?x]]"), (1, 17));
+		assert_eq!(at("[:find ?e :in $ [?x ... ?y] :where [?e :n ?x]]"), (1, 17));
 		assert_eq!(at("[:find ?e :in % :where [?e :n 1]]"), (1, 15));
 		assert_eq!(at("[:find ?e :in ?x ?x :where [?e :n 1]]"), (1, 18));
 		assert_eq!(at("[:find ?e :where [?e :n ?v] [[:key ?v] :n 1]]"), (1, 36));
@@ -1204,14 +1313,14 @@ mod tests
 
 		// The inputs, and the errors of the builder, which have no position
 		assert_eq!(db.parse_query("[:find ?e :in $ ?x :where [?e :n ?x]]", &[]).err(), Some(Error::InvalidQuery("the query takes 1 inputs, got 0".into())));
-		assert!(matches!(db.parse_query("[:find ?e :where [?e :n ?x]]", &[Value::Int(1)]), Err(Error::InvalidQuery(_))));
+		assert!(matches!(db.parse_query("[:find ?e :where [?e :n ?x]]", &[Value::Int(1).into()]), Err(Error::InvalidQuery(_))));
 		assert_eq!(db.parse_query("[:find ?e :where [?e :nope 1]]", &[]).err(), Some(Error::UnknownAttr("nope".into())));
 		assert!(matches!(db.parse_query("[:find ?e :where [?e :n \"x\"]]", &[]), Err(Error::TypeMismatch { .. })));
 		assert!(matches!(db.parse_query("[:find ?e :where [?e :n 1] (or [?e :n 2] [?f :n 3])]", &[]), Err(Error::InvalidQuery(_))));
 		assert_eq!(db.q("[:find ?x :where [?e :n 1]]", &[]).err(), Some(Error::Unbound("?x".into())));
 		assert_eq!(db.q("[:find ?e :where (not [?e :n 1])]", &[]).err(), Some(Error::Unbound("?e".into())));
 		// An input in a join list is a constant, which drops out of the list
-		let tq = db.parse_query("[:find ?e :in ?x :where [?e :n ?x] (not-join [?x] [?e :tag \"a\"])]", &[Value::Int(1)]).unwrap();
+		let tq = db.parse_query("[:find ?e :in ?x :where [?e :n ?x] (not-join [?x] [?e :tag \"a\"])]", &[Value::Int(1).into()]).unwrap();
 		assert!(matches!(&tq.query.clauses()[1], Clause::Not { join, .. } if join.is_empty()));
 	}
 
@@ -1241,7 +1350,7 @@ mod tests
 		let db = conn.db();
 		// ?x is an input of the query and a variable of the rules, which are their own
 		let text = "[:find ?a ?b :in $ % ?x :where (reach ?a ?b) [?b :n ?x] (not (even ?a ?b))]";
-		let mut tq = db.parse_query_rules(text, RULES, &[Value::Int(2)]).unwrap();
+		let mut tq = db.parse_query_rules(text, RULES, &[Value::Int(2).into()]).unwrap();
 		let mut q = db.query();
 		let (x, y, z) = (q.var("?x"), q.var("?y"), q.var("?z"));
 		let edge = |q: &Query, a: &Term, b: &Term| q.pattern_clause(a.clone(), "ref", b.clone()).unwrap();
@@ -1366,6 +1475,53 @@ mod tests
 		for bad in ["", "2024-02-30", "2023-02-29", "2024-13-01", "2024-1-01", "24-01-01", "2024-01-01T25:00:00Z", "2024-01-01T10:00:00", "2024-01-01T10:00Z", "2024-01-01T10:00:00+2:00", "2024-01-01T10:00:00.Z", "x"]
 		{
 			assert_eq!(parse_instant(bad), None, "{bad}");
+		}
+	}
+
+	// Collection, tuple and relation inputs, against scalar runs and the log
+	#[test]
+	fn collection_tuple_and_relation_inputs()
+	{
+		let (conn, reports) = random_conn(19, 40);
+		let db = conn.db();
+		let current = replay(reports.iter().flat_map(|r| &r.tx_data));
+		let n = db.attr_id("n").unwrap();
+		let ks: Vec<Value> = (0..6).map(Value::Int).collect();
+		// A collection is the union of the scalar runs
+		let coll = db.q("[:find ?e ?k :in $ [?k ...] :where [?e :n ?k]]", &[Input::Coll(ks.clone())]).unwrap();
+		let mut union = BTreeSet::new();
+		for k in &ks
+		{
+			for row in db.q("[:find ?e ?k :in $ ?k :where [?e :n ?k]]", &[k.clone().into()]).unwrap()
+			{
+				union.insert(row);
+			}
+		}
+		assert_eq!(coll, union.into_iter().collect::<Vec<_>>());
+		let want: Vec<Vec<Value>> = current.keys().filter(|(_, a, v)| *a == n && ks.contains(v)).map(|(e, _, v)| vec![Value::Ref(*e), v.clone()]).collect::<BTreeSet<_>>().into_iter().collect();
+		assert!(!want.is_empty());
+		assert_eq!(coll, want);
+		// Aggregates run over the whole input, not per value
+		assert_eq!(db.q("[:find (count ?e) :in $ [?k ...] :where [?e :n ?k]]", &[Input::Coll(ks.clone())]).unwrap(), vec![vec![Value::Int(want.len() as i64)]]);
+		// A relation: the tuples of (entity, value) given, filtered by the data; a blank ignores a position
+		let m = want.len().min(3);
+		let rel: Vec<Vec<Value>> = want.iter().take(m).cloned().chain([vec![Value::Ref(9999), Value::Int(0)]]).collect();
+		assert_eq!(db.q("[:find ?e ?k :in [[?e ?k]] $ :where [?e :n ?k]]", &[Input::Rel(rel.clone())]).unwrap(), want[..m].to_vec());
+		assert_eq!(db.q("[:find ?e :in $ [[?e _]] :where [?e :n _]]", &[Input::Rel(rel.clone())]).unwrap(), want[..m].iter().map(|r| vec![r[0].clone()]).collect::<BTreeSet<_>>().into_iter().collect::<Vec<_>>());
+		// A tuple binds constants; with a blank, one of them
+		let (e0, k0) = (want[0][0].clone(), want[0][1].clone());
+		assert_eq!(db.q("[:find ?e :in $ [?e ?k] :where [?e :n ?k]]", &[Input::Tuple(vec![e0.clone(), k0.clone()])]).unwrap(), vec![vec![e0.clone()]]);
+		assert_eq!(db.q("[:find ?k :in $ [?e _] :where [?e :n ?k]]", &[Input::Tuple(vec![e0.clone(), Value::Int(-1)])]).unwrap(), vec![vec![k0]]);
+		// Several inputs, and an empty collection
+		assert_eq!(db.q("[:find ?e :in $ [?k ...] ?e :where [?e :n ?k]]", &[Input::Coll(ks.clone()), e0.clone().into()]).unwrap(), vec![vec![e0]]);
+		assert!(db.q("[:find ?e :in $ [?k ...] :where [?e :n ?k]]", &[Input::Coll(vec![])]).unwrap().is_empty());
+		// Mismatches and malformed bindings
+		assert!(matches!(db.q("[:find ?e :in $ [?k ...] :where [?e :n ?k]]", &[Value::Int(1).into()]), Err(Error::InvalidQuery(_))));
+		assert!(matches!(db.q("[:find ?e :in $ [?e ?k] :where [?e :n ?k]]", &[Input::Tuple(vec![Value::Int(1)])]), Err(Error::InvalidQuery(_))));
+		assert!(matches!(db.q("[:find ?e :in $ [[?e ?k]] :where [?e :n ?k]]", &[Input::Rel(vec![vec![Value::Int(1)]])]), Err(Error::InvalidQuery(_))));
+		for bad in ["[:find ?e :in $ [] :where [?e :n _]]", "[:find ?e :in $ [[]] :where [?e :n _]]", "[:find ?e :in $ [?e 1] :where [?e :n _]]", "[:find ?e :in $ [?e ?e] :where [?e :n _]]", "[:find ?e :in $ [... ?e] :where [?e :n _]]"]
+		{
+			assert!(matches!(db.q(bad, &[Input::Tuple(vec![Value::Int(1), Value::Int(1)])]), Err(Error::Parse { .. })), "{bad}");
 		}
 	}
 

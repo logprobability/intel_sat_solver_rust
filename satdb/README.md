@@ -101,7 +101,7 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
 * **Text queries** (`src/parse.rs`). `Db::q(text, inputs)` reads a subset of Datomic's Datalog in EDN into the builder, clause by clause (so it is planned
   as it is read): `[:find ?a (count ?b) :with ?c :in $ ?x :where [?e :attr ?v] [(> ?v ?x)] (not ...) (or-join [?e] ... (and ...))]`, with `_`
   (a variable of its own at each occurrence, as is each missing position of a short pattern, and never a join variable of an implicit `not` or `or`,
-  so `(not [?p :person/friend _])` keeps the people without friends, as in Datomic), 2- to 5-element patterns, lookup refs `[:attr value]`, string, integer, float (`1.5`, `-2e3`), boolean and instant (`#inst "2024-02-29T13:45:00Z"`, RFC 3339, or a date alone) constants, and scalar inputs, which become constants of the query.
+  so `(not [?p :person/friend _])` keeps the people without friends, as in Datomic), 2- to 5-element patterns, lookup refs `[:attr value]`, string, integer, float (`1.5`, `-2e3`), boolean and instant (`#inst "2024-02-29T13:45:00Z"`, RFC 3339, or a date alone) constants, and inputs (`Input`): scalars `?x` and tuples `[?a ?b]`, which become constants of the query, and collections `[?x ...]` and relations `[[?a ?b]]`, which become base relations (`Query::relation`, rules given by their tuples) that the query joins.
   Syntax errors carry their line and column; keywords only name attributes (there is no keyword value type).
   `Db::q_rules(text, rules, inputs)` takes a rule set as `%`, written as in Datomic: `[[(reach ?a ?b) [?a :edge ?b]] [(reach ?a ?b) [?a :edge ?c] (reach ?c ?b)]]`.
 * **Rules** (`src/rules.rs`). `Query::rule(name, head, body)` defines a rule (several definitions are a union) and `Query::call`/`call_clause`
@@ -192,7 +192,7 @@ This is a start. What is missing, roughly in order of value:
 * Query language: `or-join` with required variables (`[[?a] ?b]`: a clause that both needs and binds, which the planner's
   encoding would have to support: a binder's boundness justified only when its own requirements hold, pending computed as a fixpoint, and the
   brute-force test extended to such clauses); attribute variables in patterns; function and binding expressions (`[(f ?x) ?y]`);
-  collection, tuple and relation inputs; scalar/collection find specs (`.`, `...`) and pull in the find spec;
+  scalar/collection find specs (`.`, `...`) and pull in the find spec;
   the aggregates `median`, `variance` and `stddev`. The cost model doesn't see inside `not` and `or`
   (a `not` has a fixed selectivity, a binding `or` the cost of its branches with nothing bound).
 * Time: the planner's estimates for `since` and `as_of` views
