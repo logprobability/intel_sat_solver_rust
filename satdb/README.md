@@ -25,11 +25,16 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     The change is validated against the attribute's data before the transaction (cardinality one: no entity with two values; unique: no value
     held by two entities), else `Error::AlterRefused`; the transaction's own data is then checked under the new schema. Past values keep their
     schema, and the durable log records alterations like definitions.
-* **History and time** (`src/db.rs`). The current indexes map each datom to the transaction that asserted it, and four append-only
-  history indexes (EAVT/AEVT/AVET order with keys ending in `(tx, added)`, and the log in transaction order) keep every assertion and retraction,
-  all persistent, so a past value holds exactly the history up to its basis. Two views, each a cheap clone with a marker, filter the reads: `Db::history()` (every change, with
-  its `added` flag; history statistics for the planner) and `Db::since(t)` (only the datoms of transactions after basis `t`, for every read,
-  pull included); they compose. `Db::datoms(e, a, v)` scans a view; transacting against a view is an error.
+* **History and time** (`src/db.rs`). The current indexes map each datom to the transaction that asserted it, and five append-only
+  history indexes (EAVT/AEVT/AVET/VAET order with keys ending in `(tx, added)`, and the log in transaction order) keep every assertion and
+  retraction, all persistent; a schema history keeps every definition and alteration. Three views, each a cheap clone with a marker, filter the reads:
+  * `Db::history()`: every change, with its `added` flag (and history statistics for the planner);
+  * `Db::since(t)`: only the datoms of transactions after basis `t`, for every read, pull included;
+  * `Db::as_of(t)`: the value as of basis `t`, with the schema of the time: every read derives that time's datoms from the history indexes
+    (a datom is current when its last change by then is an assertion). So `Conn` keeps only its latest value, and `Conn::as_of(t)` is a view
+    of it. Its planner statistics are the latest value's, an estimate.
+
+  The views compose (`as_of(t).since(s)`, `history().as_of(t)`, ...); transacting against one is an error. `Db::datoms(e, a, v)` scans a view.
   `Db::tx_range(from, to)` reads the log: each transaction of the bases `from..to` with its entity and datoms (as Datomic's `tx-range`).
 * **Durability** (`src/log.rs`). `Conn::open(path)` backs a connection with an append-only log file (created if missing); `Conn::new()` stays in memory.
   * Each committed transaction is one record holding its *effect*: basis, transaction entity, the next entity id after it (tempids that
@@ -48,6 +53,22 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   * Replay applies records with the same code as `transact`, so a reopened connection has the same values at every basis, down to the
     index contents and statistics.
   * The file is locked while open (`File::try_lock`), so a second connection to it is an `Error::Io`.
+  * Checkpoints (`Conn::checkpoint`, explicit): a file next to the log (`<log>.ckpt`) with a snapshot of the current value: only what can't
+    be derived (counters, schema history, transactions, and the history in log order). It is written to a temporary file, synced and renamed.
+    On open, an intact checkpoint (both checksums) whose covered log prefix ends at a record boundary, has the CRC-32 the checkpoint records
+    (so it is *this* log's), and whose basis is the number of records it covers is used: `Db::from_snapshot` sorts the history into each index's
+    order and builds every map in linear time (`PMap::from_sorted`), deriving the current indexes and the statistics, and only the later
+    records are replayed. Any other checkpoint is silently ignored and the log replayed in full: the log holds the data, the checkpoint is a cache.
+    The rebuild is a second implementation of the indexes, which the tests compare with `transact`'s at every basis of random workloads.
+
+    Timings (release, transactions of 20 assertions, `cargo test --release open_timings -- --ignored --nocapture`; opening by replay costs
+    the path-copying inserts into every index, about 25 µs per datom at 50k transactions, which the bulk build avoids):
+
+    | transactions | log      | open by replay | checkpoint written | open from the checkpoint |
+    |--------------|----------|----------------|--------------------|--------------------------|
+    | 1,000        | 0.5 MB   | 139 ms         | 16 ms (0.7 MB)     | 16 ms                    |
+    | 10,000       | 5.0 MB   | 3.96 s         | 62 ms (6.9 MB)     | 252 ms                   |
+    | 50,000       | 25.1 MB  | 25.8 s         | 441 ms (34.5 MB)   | 1.20 s                   |
 * **Pull** (`src/query.rs`). `Db::pull(pattern, eid)` reads an entity as a tree (`Pulled`): attribute lists, the wildcard (which pulls
   components recursively, stopping at cycles), nested patterns for Ref attributes, and reverse refs through VAET (`Pull::reverse`, key `ns/_name`).
   Cardinality-one attributes and reverse components give one value, the others a list; absent attributes are left out. The pattern is
@@ -163,8 +184,8 @@ This is a start. What is missing, roughly in order of value:
   collection, tuple and relation inputs; scalar/collection find specs (`.`, `...`) and pull in the find spec;
   a floating-point value type (for a true `avg`, and `median`/`variance`). The cost model doesn't see inside `not` and `or`
   (a `not` has a fixed selectivity, a binding `or` the cost of its branches with nothing bound).
-* Time: `as_of` on a `Db` (today `Conn` keeps every past value; the history indexes would allow a filter instead) and by transaction
-  entity or instant, and the planner's estimates for a `since` view (it uses the whole database's).
+* Time: `as_of` by transaction entity or instant (it takes a basis), and the planner's estimates for `since` and `as_of` views
+  (they use the latest value's statistics). An as-of view derives each read from the history, so it costs more than a read of the current value.
   In a history view, the current-state accessors (`values`, `lookup`, ...) still read the current datoms; only scans and queries see the history.
 * Pull: recursion limits (`...`), attribute options (defaults, limits, renaming) and pulling from a query's find spec.
 * Schema: renaming attributes, altering the value type, and attribute retirement; user-defined transaction functions
@@ -182,7 +203,7 @@ This is a start. What is missing, roughly in order of value:
 * Ordering constraints: only `require_before` on the query's top-level clauses (not inside `not`, `or` or rule bodies), no text syntax,
   and no way to drop an accepted constraint.
 * Cost model: independence assumptions and fixed predicate selectivities; no histograms.
-* Storage: the transaction log is durable (`Conn::open`), but everything else is in memory. Opening replays the whole log, and `Conn`
-  keeps every past value. Missing: index segments on disk (so opening doesn't replay everything and memory isn't bounded by the database),
-  checkpoints and compaction, access by several processes (today one connection holds the file's lock),
-  and group commit (each transaction syncs on its own).
+* Storage: the log is durable (`Conn::open`) and checkpoints make opening fast, but the database is in memory, and so is its whole
+  history (`Conn` keeps one value, whose history indexes serve every past one). Missing: index segments on disk, read lazily (so that memory
+  isn't bounded by the database's size), log compaction (the log keeps every record, the checkpoint only caches them), an automatic
+  checkpoint policy, access by several processes (today one connection holds the file's lock), and group commit (each transaction syncs on its own).

@@ -2,11 +2,11 @@
 //!
 //! * `db`: database values (`Db`) made of datoms in persistent EAVT/AEVT/AVET/VAET indexes; `transact` applies a transaction
 //!   (a set of assertions and retractions, with upserts, lookup refs, `retract_entity` and a reified transaction entity) and returns a new value,
-//!   and `Conn` keeps every past value (`as_of`) at the cost of the changed index paths only. Every value also holds its history
-//!   (every assertion and retraction, with its transaction), which the `history()` and `since(t)` views expose.
-//!   `Conn::open(path)` makes the connection durable: it replays the log at `path`, and every committed transaction is appended and synced
-//!   before `transact` returns.
-//! * `log` (private): the durable log's format, commit and recovery (a torn final record is truncated, any other damage refused).
+//!   sharing the unchanged index nodes. Every value also holds its history (every assertion and retraction, with its transaction, and every
+//!   schema change), which the `history()`, `since(t)` and `as_of(t)` views expose; so `Conn` keeps only its latest value.
+//!   `Conn::open(path)` makes the connection durable: it replays the log at `path` (from its checkpoint, `Conn::checkpoint`, when it has one),
+//!   and every committed transaction is appended and synced before `transact` returns.
+//! * `log` (private): the durable log's format, commit and recovery (a torn final record is truncated, any other damage refused), and checkpoints.
 //! * `query`: Datalog-style queries (patterns, comparison predicates, `not`/`not-join`, `or`/`or-join`, over any view), planned online while
 //!   they are assembled, with aggregates in the find spec; and `Db::pull`, which reads an entity as a tree.
 //! * `rules`: Datalog rules, recursive and mutually recursive ones included, evaluated bottom-up (stratified, semi-naive,

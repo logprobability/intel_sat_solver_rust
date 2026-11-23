@@ -201,6 +201,49 @@ impl<K: Ord + Hash + Clone, V: Clone> PMap<K, V>
 		}
 	}
 
+	/// The map of `entries`, whose keys must be strictly increasing, built in linear time (rather than by inserting them one by one):
+	/// the treap is the Cartesian tree of the keys by their priorities, which the right-spine stack builds
+	pub fn from_sorted(entries: impl IntoIterator<Item = (K, V)>) -> Self
+	{
+		let mut items: Vec<Option<(K, V)>> = Vec::new();
+		let mut prio = Vec::new();
+		let (mut left, mut right) = (Vec::new(), Vec::new());
+		let mut spine: Vec<usize> = Vec::new();
+		for (k, v) in entries
+		{
+			debug_assert!(items.last().map_or(true, |p: &Option<(K, V)>| p.as_ref().expect("not taken yet").0 < k), "the keys must be strictly increasing");
+			let (i, p) = (items.len(), prio_of(&k));
+			let mut last = None;
+			while let Some(&top) = spine.last()
+			{
+				if prio[top] >= p
+				{
+					break;
+				}
+				last = spine.pop();
+			}
+			if let Some(&top) = spine.last()
+			{
+				right[top] = Some(i);
+			}
+			items.push(Some((k, v)));
+			prio.push(p);
+			left.push(last);
+			right.push(None);
+			spine.push(i);
+		}
+		// Children before parents (the depth is logarithmic, as in any treap)
+		fn build<K, V>(i: Option<usize>, items: &mut [Option<(K, V)>], prio: &[u64], left: &[Option<usize>], right: &[Option<usize>]) -> Link<K, V>
+		{
+			let i = i?;
+			let (l, r) = (build(left[i], items, prio, left, right), build(right[i], items, prio, left, right));
+			let (k, v) = items[i].take().expect("each node is built once");
+			node(k, v, prio[i], l, r)
+		}
+		let len = items.len();
+		PMap { root: build(spine.first().copied(), &mut items, &prio, &left, &right), len }
+	}
+
 	/// All the entries in ascending key order
 	pub fn iter(&self) -> Iter<'_, K, V>
 	{
@@ -288,6 +331,47 @@ mod tests
 			assert!(m.iter().map(|(k, v)| (*k, *v)).eq(b.iter().map(|(k, v)| (*k, *v))));
 			assert!(m.seek(|k| *k < 250).map(|(k, _)| *k).eq(b.range(250..).map(|(k, _)| *k)));
 			assert_eq!(m.get(&7), b.get(&7));
+		}
+	}
+
+	// A bulk-built map has the entries, the heap order and the operations of one built by insertions
+	#[test]
+	fn from_sorted_matches_insertions()
+	{
+		fn heap(t: &Link<u64, u64>) -> bool
+		{
+			t.as_ref().map_or(true, |n| [&n.left, &n.right].iter().all(|c| c.as_ref().map_or(true, |c| c.prio <= n.prio)) && heap(&n.left) && heap(&n.right))
+		}
+		let mut rng = Rng::new(9);
+		for n in [0, 1, 2, 7, 500]
+		{
+			let mut model = BTreeMap::new();
+			while model.len() < n
+			{
+				model.insert(rng.next() % 10_000, rng.next());
+			}
+			let bulk = PMap::from_sorted(model.iter().map(|(k, v)| (*k, *v)));
+			assert_eq!(bulk.len(), n);
+			assert!(heap(&bulk.root));
+			assert!(bulk.iter().map(|(k, v)| (*k, *v)).eq(model.iter().map(|(k, v)| (*k, *v))));
+			// It keeps working as a treap
+			let (mut m, mut b) = (bulk, model);
+			for _ in 0..200
+			{
+				let k = rng.next() % 10_000;
+				if rng.next() % 2 == 0
+				{
+					m = m.remove(&k);
+					b.remove(&k);
+				}
+				else
+				{
+					m = m.insert(k, 1);
+					b.insert(k, 1);
+				}
+			}
+			assert!(heap(&m.root));
+			assert!(m.iter().map(|(k, v)| (*k, *v)).eq(b.iter().map(|(k, v)| (*k, *v))));
 		}
 	}
 
