@@ -170,7 +170,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				self.m_BestScorePerDecLevel[decLevel as usize] = currScore;
 				debug_assert!(self.NV(2) || self.P(&("m_BestScorePerDecLevel[".to_string() + &decLevel.to_string() + "] updated to " + &format!("{:.6}", currScore) + " in Assign\n")));
 			}
-			debug_assert!(self.m_Params.m_ParamAssertConsistency.get() < 2 || self.m_Stat.m_Conflicts < self.m_Params.m_ParamAssertConsistencyStartConf.get() as u64 || self.CalcMaxDecLevelScore(decLevel) == self.m_BestScorePerDecLevel[decLevel as usize]);
+			debug_assert!(!self.AssertConsistencyOn(2) || self.CalcMaxDecLevelScore(decLevel) == self.m_BestScorePerDecLevel[decLevel as usize]);
 		}
 
 		false

@@ -22,7 +22,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			if wi.m_BinaryWatches > Ind::ZERO
 			{
 				let mut litsInBinWatches: HashSet<TULit> = HashSet::new();
-				let binWatches = TSpanTULit::new(unsafe { this.m_W.get_ptr(wi.m_WBInd.as_usize()).add(wi.GetLongEntries()) }, wi.m_BinaryWatches.as_usize());
+				let binWatches = this.WLBinWatchesSpan(wi);
 				let mut currbwInd: usize = 0;
 				while currbwInd < wi.m_BinaryWatches.as_usize()
 				{
