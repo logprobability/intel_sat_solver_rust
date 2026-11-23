@@ -120,10 +120,19 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   plain value still returns both values whole. Then the statistics (distinct entities and values per attribute) come from the neighbors
   of the key an insertion or removal changes (`PMap::insert_mut_near`) instead of separate searches, four fewer descents per datom.
 
+  Then a transaction's assertions go into each current index, and all its changes into each history index, as one sorted batch
+  (`PMap::insert_batch_mut`): a single pass in which each child gets the entries below its separator, a node that gets none isn't
+  touched (or copied), and an overflowing node splits into evenly filled siblings; with a prefix predicate the batch also reports, per entry,
+  whether an older key shares its prefix, for the statistics. Retractions stay one by one. Measured by alternating the builds before and
+  after (the machine is noisy): transactions of 20 scattered datoms gain nothing measurable (0.78 s vs 0.74 s for 10k, 5.6 s vs 5.7 s for
+  50k: each entry lands in its own leaf, so a batch shares only the hot top levels), while bulk loads, where the entries cluster
+  (`cargo test --release bulk_timings -- --ignored --nocapture`: 200 transactions of 200 new entities with 5 attributes each), go from
+  240-257 ms to 131-154 ms.
+
   Changing the past (inserting a transaction at an earlier time) would need the paper's rollback method here, since cardinality-one and
-  uniqueness make the operations non-commutative. What a transaction pays now is the tree work itself (comparisons, shifting entries within
-  leaves, and about 11 descents per datom across the indexes); batching each transaction's insertions per index (one descent per touched
-  node, in key order) or a write-buffered tree (a persistent Bε-tree) would cut it further.
+  uniqueness make the operations non-commutative. What a small transaction pays now is the tree work itself (comparisons, shifting entries
+  within leaves, a descent per datom and index); a write-buffered tree (a persistent Bε-tree, which keeps pending changes in its branches)
+  is the next step for scattered writes.
 * **Queries** (`src/query.rs`). Datalog-style queries over any view: patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`),
   comparison predicates, `not`/`not-join` and `or`/`or-join` (nested to any depth) and rule calls (see Rules), run as nested loops, each pattern using the index selected by its bound positions.
   * `not` keeps the rows for which its body has no solution; its join variables (all of its body's, or the `not-join` list) must be bound when it runs,

@@ -1530,18 +1530,15 @@ impl Db
 	}
 
 	// The datom changes of transaction tx (shared by transact and replay): the retractions of present datoms, the assertions of absent ones, and the instant
+	// The retractions go one by one; the assertions (the instant included) and every change's history go in as one batch per index
 	fn apply(&mut self, tx: Eid, instant: i64, retracted: &[(Eid, AttrId, Value)], asserted: &[(Eid, AttrId, Value)])
 	{
-		for (e, a, v) in retracted
-		{
-			self.remove(*e, *a, v, tx);
-		}
-		for (e, a, v) in asserted
-		{
-			self.insert(*e, *a, v, tx);
-		}
+		let retracted: Vec<(Eid, AttrId, Value)> = retracted.iter().filter(|(e, a, v)| self.remove(*e, *a, v)).cloned().collect();
 		let instant_attr = self.attr_id(TX_INSTANT).expect("built in");
-		self.insert(tx, instant_attr, &Value::Instant(instant), tx);
+		let mut asserted = asserted.to_vec();
+		asserted.push((tx, instant_attr, Value::Instant(instant)));
+		self.insert_current(&asserted, tx);
+		self.log_batch(tx, &retracted, &asserted);
 	}
 
 	/// Apply a transaction read back from the durable log: the database the transaction that wrote `rec` produced, if `self` is the database before it.
@@ -1746,30 +1743,13 @@ impl Db
 		})
 	}
 
-	// The statistics count distinct entities and values: whether another key of an index shares the changed key's (attribute, entity) or
-	// (attribute, value) prefix is what the insertion or removal itself shows from the keys around it (`PMap::insert_mut_near`), and only
-	// when one of those is in another leaf does it take a search of its own
+	// The statistics count distinct entities and values: whether another key of an index shares a changed key's (attribute, entity) or
+	// (attribute, value) prefix is what the removal or the batch insertion itself shows from the keys around it (`PMap::remove_mut_near`,
+	// `PMap::insert_batch_mut`), and only when those are in another leaf does it take a search of its own
 
-	// Assert an absent datom in transaction tx (insert and remove only see unfiltered values, as transact refuses views)
-	fn insert(&mut self, e: Eid, a: AttrId, v: &Value, tx: Eid)
-	{
-		self.eavt.insert_mut((e, a, v.clone()), tx);
-		let other_e = self.aevt.insert_mut_near((a, e, v.clone()), tx, |k| (k.0, k.1) == (a, e)).unwrap_or_else(|| self.values(e, a).nth(1).is_some());
-		let other_v = self.avet.insert_mut_near((a, v.clone(), e), tx, |k| k.0 == a && k.1 == *v).unwrap_or_else(|| self.entities(a, v).nth(1).is_some());
-		if let Value::Ref(r) = v
-		{
-			self.vaet.insert_mut((*r, a, e), tx);
-		}
-		let mut s = self.stats(a);
-		s.datoms += 1;
-		s.entities += !other_e as u64;
-		s.values += !other_v as u64;
-		self.stats.insert_mut(a, s);
-		self.log(e, a, v, tx, true);
-	}
-
-	// Retract a datom in transaction tx; returns whether it was present
-	fn remove(&mut self, e: Eid, a: AttrId, v: &Value, tx: Eid) -> bool
+	// Retract a present datom from the current indexes (insertions and removals only see unfiltered values, as transact refuses views);
+	// returns whether it was present
+	fn remove(&mut self, e: Eid, a: AttrId, v: &Value) -> bool
 	{
 		if self.eavt.remove_mut(&(e, a, v.clone())).is_none()
 		{
@@ -1786,31 +1766,105 @@ impl Db
 		s.entities -= !other_e as u64;
 		s.values -= !other_v as u64;
 		self.stats.insert_mut(a, s);
-		self.log(e, a, v, tx, false);
 		true
 	}
 
-	// Append a change to the history indexes (a transaction changes a datom once at most, so the keys are new)
-	fn log(&mut self, e: Eid, a: AttrId, v: &Value, tx: Eid, added: bool)
+	// Assert absent datoms in the current indexes, as one batch per index (each touched node visited once)
+	fn insert_current(&mut self, datoms: &[(Eid, AttrId, Value)], tx: Eid)
 	{
-		self.heavt.insert_mut((e, a, v.clone(), tx, added), ());
-		let other_e = self.haevt.insert_mut_near((a, e, v.clone(), tx, added), (), |k| (k.0, k.1) == (a, e)).unwrap_or_else(|| {
-			self.haevt.seek(|k| (k.0, k.1) < (a, e)).take_while(|(k, _)| (k.0, k.1) == (a, e)).nth(1).is_some()
-		});
-		let other_v = self.havet.insert_mut_near((a, v.clone(), e, tx, added), (), |k| k.0 == a && k.1 == *v).unwrap_or_else(|| {
-			self.havet.seek(|k| (k.0, &k.1) < (a, v)).take_while(|(k, _)| k.0 == a && k.1 == *v).nth(1).is_some()
-		});
-		let mut s = self.hstats.get(&a).copied().unwrap_or_default();
-		s.datoms += 1;
-		s.entities += !other_e as u64;
-		s.values += !other_v as u64;
-		self.hstats.insert_mut(a, s);
-		if let Value::Ref(r) = v
+		let mut deltas: BTreeMap<AttrId, AttrStats> = BTreeMap::new();
+		for (_, a, _) in datoms
 		{
-			self.hvaet.insert_mut((*r, a, e, tx, added), ());
+			deltas.entry(*a).or_default().datoms += 1;
 		}
-		self.tlog.insert_mut((tx, e, a, v.clone(), added), ());
+		self.eavt.insert_batch_mut(sorted_batch(datoms.iter().map(|(e, a, v)| ((*e, *a, v.clone()), tx))), None);
+		let aevt = sorted_batch(datoms.iter().map(|(e, a, v)| ((*a, *e, v.clone()), tx)));
+		let keys: Vec<(AttrId, Eid)> = aevt.iter().map(|(k, _)| (k.0, k.1)).collect();
+		let answers = self.aevt.insert_batch_mut(aevt, Some(&|x, y| (x.0, x.1) == (y.0, y.1)));
+		for (a, _) in fresh_groups(&keys, &answers, |(a, e)| self.values(*e, *a).count())
+		{
+			deltas.entry(*a).or_default().entities += 1;
+		}
+		let avet = sorted_batch(datoms.iter().map(|(e, a, v)| ((*a, v.clone(), *e), tx)));
+		let keys: Vec<(AttrId, Value)> = avet.iter().map(|(k, _)| (k.0, k.1.clone())).collect();
+		let answers = self.avet.insert_batch_mut(avet, Some(&|x, y| x.0 == y.0 && x.1 == y.1));
+		for (a, _) in fresh_groups(&keys, &answers, |(a, v)| self.entities(*a, v).count())
+		{
+			deltas.entry(*a).or_default().values += 1;
+		}
+		let refs = sorted_batch(datoms.iter().filter_map(|(e, a, v)| if let Value::Ref(r) = v { Some(((*r, *a, *e), tx)) } else { None }));
+		self.vaet.insert_batch_mut(refs, None);
+		for (a, d) in deltas
+		{
+			let mut s = self.stats(a);
+			(s.datoms, s.entities, s.values) = (s.datoms + d.datoms, s.entities + d.entities, s.values + d.values);
+			self.stats.insert_mut(a, s);
+		}
 	}
+
+	// Append transaction tx's changes to the history indexes, as one batch per index (a transaction changes a datom once at most,
+	// so the keys are new; the log's keys all start with tx, so they land together)
+	fn log_batch(&mut self, tx: Eid, retracted: &[(Eid, AttrId, Value)], asserted: &[(Eid, AttrId, Value)])
+	{
+		let changes: Vec<(Eid, AttrId, &Value, bool)> = retracted.iter().map(|(e, a, v)| (*e, *a, v, false)).chain(asserted.iter().map(|(e, a, v)| (*e, *a, v, true))).collect();
+		let mut deltas: BTreeMap<AttrId, AttrStats> = BTreeMap::new();
+		for (_, a, _, _) in &changes
+		{
+			deltas.entry(*a).or_default().datoms += 1;
+		}
+		self.heavt.insert_batch_mut(sorted_batch(changes.iter().map(|(e, a, v, added)| ((*e, *a, (*v).clone(), tx, *added), ()))), None);
+		let haevt = sorted_batch(changes.iter().map(|(e, a, v, added)| ((*a, *e, (*v).clone(), tx, *added), ())));
+		let keys: Vec<(AttrId, Eid)> = haevt.iter().map(|(k, _)| (k.0, k.1)).collect();
+		let answers = self.haevt.insert_batch_mut(haevt, Some(&|x, y| (x.0, x.1) == (y.0, y.1)));
+		for (a, _) in fresh_groups(&keys, &answers, |(a, e)| self.haevt.seek(|k| (k.0, k.1) < (*a, *e)).take_while(|(k, _)| (k.0, k.1) == (*a, *e)).count())
+		{
+			deltas.entry(*a).or_default().entities += 1;
+		}
+		let havet = sorted_batch(changes.iter().map(|(e, a, v, added)| ((*a, (*v).clone(), *e, tx, *added), ())));
+		let keys: Vec<(AttrId, Value)> = havet.iter().map(|(k, _)| (k.0, k.1.clone())).collect();
+		let answers = self.havet.insert_batch_mut(havet, Some(&|x, y| x.0 == y.0 && x.1 == y.1));
+		for (a, _) in fresh_groups(&keys, &answers, |(a, v)| self.havet.seek(|k| (k.0, &k.1) < (*a, v)).take_while(|(k, _)| k.0 == *a && k.1 == *v).count())
+		{
+			deltas.entry(*a).or_default().values += 1;
+		}
+		let refs = sorted_batch(changes.iter().filter_map(|(e, a, v, added)| if let Value::Ref(r) = v { Some(((*r, *a, *e, tx, *added), ())) } else { None }));
+		self.hvaet.insert_batch_mut(refs, None);
+		self.tlog.insert_batch_mut(sorted_batch(changes.iter().map(|(e, a, v, added)| ((tx, *e, *a, (*v).clone(), *added), ()))), None);
+		for (a, d) in deltas
+		{
+			let mut s = self.hstats.get(&a).copied().unwrap_or_default();
+			(s.datoms, s.entities, s.values) = (s.datoms + d.datoms, s.entities + d.entities, s.values + d.values);
+			self.hstats.insert_mut(a, s);
+		}
+	}
+}
+
+// A batch for `PMap::insert_batch_mut`: the entries in key order
+fn sorted_batch<K: Ord, V>(entries: impl Iterator<Item = (K, V)>) -> Vec<(K, V)>
+{
+	let mut v: Vec<(K, V)> = entries.collect();
+	v.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+	v
+}
+
+// The prefixes that a batch made new: for each group of equal prefixes in the batch (`keys`, in order), the prefix if no key that was in
+// the index before has it, from the batch's answers or, where its leaves couldn't tell, by counting the keys with the prefix now (`count`)
+fn fresh_groups<'k, P: PartialEq>(keys: &'k [P], answers: &[Option<bool>], count: impl Fn(&P) -> usize) -> Vec<&'k P>
+{
+	let mut out = Vec::new();
+	let mut s = 0;
+	while s < keys.len()
+	{
+		let e = s + keys[s..].iter().take_while(|k| **k == keys[s]).count();
+		let group = &answers[s..e];
+		let old = if group.contains(&Some(true)) { true } else if group.contains(&None) { count(&keys[s]) > e - s } else { false };
+		if !old
+		{
+			out.push(&keys[s]);
+		}
+		s = e;
+	}
+	out
 }
 
 /// A connection: the current database value, in memory (`Conn::new`) or backed by a durable log (`Conn::open`).
@@ -3177,6 +3231,35 @@ pub(crate) mod tests
 			assert_eq!(view.transact(&Tx::new()).err(), Some(Error::FilteredDb));
 		}
 		assert_eq!(latest.as_of(latest.basis_t()).unwrap().upto, None);
+	}
+
+	// Throughput of bulk loads (release: cargo test --release bulk_timings -- --ignored --nocapture): large transactions of new entities,
+	// 200 entities of 5 attributes each per transaction, so that each index's insertions cluster
+	#[test]
+	#[ignore]
+	fn bulk_timings()
+	{
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		for a in ["a", "b", "c", "d"]
+		{
+			tx.define(a, ValueType::Int, Cardinality::One);
+		}
+		tx.define("name", ValueType::Str, Cardinality::One);
+		conn.transact(&tx).unwrap();
+		let t = std::time::Instant::now();
+		for round in 0..200i64
+		{
+			let mut tx = Tx::new();
+			for i in 0..200i64
+			{
+				let e = tx.temp();
+				let n = round * 200 + i;
+				tx.add(e, "a", n % 97).add(e, "b", n % 13).add(e, "c", n).add(e, "d", -n).add(e, "name", format!("entity {n}").as_str());
+			}
+			conn.transact(&tx).unwrap();
+		}
+		println!("bulk: 200 transactions of 1000 datoms: {:?}", t.elapsed());
 	}
 
 	// Throughput of the indexes (release: cargo test --release index_timings -- --ignored --nocapture): transactions of 20 assertions

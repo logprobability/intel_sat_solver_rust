@@ -215,6 +215,111 @@ fn even(n: usize) -> impl Iterator<Item = usize>
 	(0..count).map(move |i| n / count + (i < n % count) as usize)
 }
 
+type Batch<K, V> = std::iter::Peekable<std::vec::IntoIter<(K, V)>>;
+
+// Insert the batch's entries below `hi` (absent keys, in increasing order) into the subtree of `n` in one pass: a child gets the entries
+// below its separator, and one that gets none isn't touched (so not copied). Returns the separators and nodes that follow `n` if it
+// overflowed (evenly filled). With `prefix`, pushes for each entry whether a key that was in the map shares its prefix (see `insert_batch_mut`)
+fn ins_batch<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, batch: &mut Batch<K, V>, hi: Option<&K>, prefix: Option<&dyn Fn(&K, &K) -> bool>, out: &mut Vec<Option<bool>>) -> Vec<(K, Arc<Node<K, V>>)>
+{
+	let below = |k: &K| hi.map_or(true, |h| k < h);
+	match n
+	{
+		Node::Leaf { keys, vals } =>
+		{
+			// Each entry in place, after the previous one
+			let mut new_at = Vec::new();
+			let mut i = 0;
+			while let Some((k, _)) = batch.peek().filter(|(k, _)| below(k))
+			{
+				i += keys[i..].partition_point(|o| o < k);
+				debug_assert!(keys.get(i) != Some(k), "a batch's keys are absent from the map");
+				let (k, v) = batch.next().expect("peeked");
+				keys.insert(i, k);
+				vals.insert(i, v);
+				new_at.push(i);
+				i += 1;
+			}
+			// For each new key, the run of keys with its prefix around it: whether it has an old key, unless it reaches the leaf's edge without one
+			if let Some(same) = prefix
+			{
+				let mut new = vec![false; keys.len()];
+				for &j in &new_at
+				{
+					new[j] = true;
+				}
+				for &j in &new_at
+				{
+					let (mut l, mut r) = (j, j + 1);
+					while l > 0 && same(&keys[l - 1], &keys[j])
+					{
+						l -= 1;
+					}
+					while r < keys.len() && same(&keys[r], &keys[j])
+					{
+						r += 1;
+					}
+					out.push(if new[l..r].contains(&false) { Some(true) } else if l == 0 || r == keys.len() { None } else { Some(false) });
+				}
+			}
+			if keys.len() <= B
+			{
+				return Vec::new();
+			}
+			// Evenly filled leaves: this one keeps the first part
+			let sizes: Vec<usize> = even(keys.len()).collect();
+			let mut extra = Vec::with_capacity(sizes.len() - 1);
+			for &size in sizes[1..].iter().rev()
+			{
+				let (k, v) = (keys.split_off(keys.len() - size), vals.split_off(vals.len() - size));
+				extra.push((k[0].clone(), Arc::new(Node::Leaf { keys: k, vals: v })));
+			}
+			extra.reverse();
+			extra
+		}
+		Node::Branch { keys, kids } =>
+		{
+			// Straight to the child of the next entry; it takes every entry below its upper bound
+			while let Some((k, _)) = batch.peek().filter(|(k, _)| below(k))
+			{
+				let i = keys.partition_point(|s| s <= k);
+				let kid_hi = if i < keys.len() { Some(keys[i].clone()) } else { hi.cloned() };
+				let extra = ins_batch(Arc::make_mut(&mut kids[i]), batch, kid_hi.as_ref(), prefix, out);
+				for (j, (sep, node)) in extra.into_iter().enumerate()
+				{
+					keys.insert(i + j, sep);
+					kids.insert(i + 1 + j, node);
+				}
+			}
+			if kids.len() <= B
+			{
+				return Vec::new();
+			}
+			let (new_keys, new_kids) = (std::mem::take(keys), std::mem::take(kids));
+			split_branch(keys, kids, new_keys, new_kids)
+		}
+	}
+}
+
+// Fill a branch with these children and separators, evenly split into it and the siblings that follow it (returned) if there are more than B
+fn split_branch<K: Clone, V>(keys: &mut Vec<K>, kids: &mut Vec<Arc<Node<K, V>>>, new_keys: Vec<K>, new_kids: Vec<Arc<Node<K, V>>>) -> Vec<(K, Arc<Node<K, V>>)>
+{
+	let mut out = Vec::new();
+	let (mut ks, mut cs) = (new_keys.into_iter(), new_kids.into_iter());
+	for (c, size) in even(cs.len()).enumerate()
+	{
+		// The separator before a chunk goes up; the chunk keeps the size - 1 between its children
+		let up = if c > 0 { ks.next() } else { None };
+		let (chunk_keys, chunk_kids): (Vec<K>, Vec<Arc<Node<K, V>>>) = (ks.by_ref().take(size - 1).collect(), cs.by_ref().take(size).collect());
+		match up
+		{
+			None => (*keys, *kids) = (chunk_keys, chunk_kids),
+			Some(sep) => out.push((sep, Arc::new(Node::Branch { keys: chunk_keys, kids: chunk_kids }))),
+		}
+	}
+	out
+}
+
 impl<K: Ord + Clone, V: Clone> PMap<K, V>
 {
 	pub fn new() -> Self
@@ -333,6 +438,44 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V>
 			_ => {}
 		}
 		Some((old, found))
+	}
+
+	/// Insert `entries` (keys absent from the map, strictly increasing) in one pass, in place where no other version shares the nodes:
+	/// each node that gets entries is visited (and, if shared, copied) once, rather than once per entry, so the entries that land near
+	/// each other (one entity's datoms, one transaction's log) share their descents.
+	/// With `prefix` (whether two keys share a prefix, which must group contiguous keys), returns for each entry whether a key that was in
+	/// the map before shares its prefix, when its leaf shows it (None: the run of keys with its prefix reaches the leaf's edge without one)
+	pub fn insert_batch_mut(&mut self, entries: Vec<(K, V)>, prefix: Option<&dyn Fn(&K, &K) -> bool>) -> Vec<Option<bool>>
+	{
+		debug_assert!(entries.windows(2).all(|w| w[0].0 < w[1].0), "the keys must be strictly increasing");
+		let count = entries.len();
+		let Some(root) = &mut self.root
+		else
+		{
+			*self = Self::from_sorted(entries);
+			return if prefix.is_some() { vec![Some(false); count] } else { Vec::new() };
+		};
+		let mut out = Vec::with_capacity(if prefix.is_some() { count } else { 0 });
+		let mut batch = entries.into_iter().peekable();
+		let mut extra = ins_batch(Arc::make_mut(root), &mut batch, None, prefix, &mut out);
+		debug_assert!(batch.peek().is_none(), "the root takes every entry");
+		// The root overflowed: new levels above it, until one node holds the level
+		while !extra.is_empty()
+		{
+			let first = self.root.take().expect("the root");
+			let (mut keys, mut kids) = (Vec::new(), Vec::new());
+			let mut new_keys = Vec::with_capacity(extra.len());
+			let mut new_kids = vec![first];
+			for (sep, node) in extra
+			{
+				new_keys.push(sep);
+				new_kids.push(node);
+			}
+			extra = split_branch(&mut keys, &mut kids, new_keys, new_kids);
+			self.root = Some(Arc::new(Node::Branch { keys, kids }));
+		}
+		self.len += count;
+		out
 	}
 
 	/// The map of `entries`, whose keys must be strictly increasing, built in linear time with every node filled evenly
@@ -632,6 +775,71 @@ mod tests
 		}
 		map.check();
 		assert!(told > 10 * untold, "the leaf should usually tell ({told} told, {untold} not)");
+	}
+
+	// Batches of new keys (small and large, clustered and scattered) against BTreeMap, keeping every version, with the prefix answers
+	// checked against the map before the batch
+	#[test]
+	fn batches_match_btreemap()
+	{
+		let mut rng = Rng::new(31);
+		let mut model: BTreeMap<(u64, u64), u64> = BTreeMap::new();
+		let mut map: PMap<(u64, u64), u64> = PMap::new();
+		let mut versions = Vec::new();
+		let (mut told, mut untold) = (0, 0);
+		for round in 0..300
+		{
+			let size = [1, 2, 5, 20, 40, 200][round % 6];
+			let mut batch = BTreeMap::new();
+			while batch.len() < size
+			{
+				// Clustered on one prefix, or scattered
+				let k = if round % 3 == 0 { (round as u64 % 50, rng.next() % 1000) } else { (rng.next() % 400, rng.next() % 20) };
+				if !model.contains_key(&k)
+				{
+					batch.insert(k, rng.next());
+				}
+			}
+			let before = model.clone();
+			let answers = map.insert_batch_mut(batch.iter().map(|(k, v)| (*k, *v)).collect(), Some(&|a: &(u64, u64), b: &(u64, u64)| a.0 == b.0));
+			assert_eq!(answers.len(), batch.len());
+			for ((k, _), a) in batch.iter().zip(&answers)
+			{
+				match a
+				{
+					Some(a) =>
+					{
+						assert_eq!(*a, before.keys().any(|x| x.0 == k.0), "{k:?}");
+						told += 1;
+					}
+					None => untold += 1,
+				}
+			}
+			model.extend(batch);
+			map.check();
+			assert!(map.iter().map(|(k, v)| (*k, *v)).eq(model.iter().map(|(k, v)| (*k, *v))));
+			// Removals too, so that the tree shrinks between batches
+			for _ in 0..size / 2
+			{
+				let k = *model.keys().nth((rng.next() % model.len() as u64) as usize).unwrap();
+				model.remove(&k);
+				map.remove_mut(&k);
+			}
+			map.check();
+			versions.push((map.clone(), model.clone()));
+		}
+		for (m, b) in &versions
+		{
+			m.check();
+			assert!(m.iter().map(|(k, v)| (*k, *v)).eq(b.iter().map(|(k, v)| (*k, *v))));
+		}
+		assert!(told > 5 * untold, "{told} told, {untold} not");
+		// Into an empty map, and a batch that grows the tree by several levels at once
+		let mut m: PMap<u64, u64> = PMap::new();
+		m.insert_batch_mut(vec![(1, 1), (2, 2)], None);
+		m.insert_batch_mut((3..40_000).map(|k| (k, k)).collect(), None);
+		m.check();
+		assert!(m.iter().map(|(k, _)| *k).eq(1..40_000));
 	}
 
 	// An in-place update of a map copies the nodes it shares with another version, and only those
