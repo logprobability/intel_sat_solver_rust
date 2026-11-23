@@ -9,14 +9,19 @@ rather than a slow machine and a wrong number. It reads the PreToolUse payload
 on stdin and exits 2 -- which blocks the command and hands the message back --
 when an expensive command is not already going through the queue.
 
-The settings entry that runs this checks the file exists first: a missing
-script would exit 2 as well, which is the code for a refusal, and every command
-in a worktree branched from before this hook landed would be blocked -- the one
-that would fix it included.
+The settings entry runs the primary checkout's copy of this file, whichever
+worktree the command is in, so a worktree branched from before the queue landed
+is held to it too; the message names that checkout's queue.sh for the same
+reason. The entry checks the file exists first: a missing script would exit 2
+as well, which is the code for a refusal, and every command would be blocked --
+the one that would fix it included.
 """
 import json
+import os
 import re
 import sys
+
+QUEUE = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../scripts/queue.sh"))
 
 # Anchored at the start of a command rather than searched for anywhere in the
 # line, so a path or a message that merely mentions one of these is left alone.
@@ -43,10 +48,9 @@ EXPENSIVE = re.compile(
 REASON = (
     "This command competes for the machine with the solver runs of other "
     "sessions. Run it through the queue instead:\n"
-    "    scripts/queue.sh <the same command>\n"
-    "(scripts/ is at the root of the repository.) It waits its turn, so run it "
-    "in the background rather than under a short timeout. "
-    "`scripts/queue.sh --status` shows the queue."
+    f"    {QUEUE} <the same command>\n"
+    "It waits its turn, so run it in the background rather than under a short "
+    f"timeout. `{QUEUE} --status` shows the queue."
 )
 
 

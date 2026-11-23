@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=\"$(git rev-parse --show-toplevel 2>/dev/null)/.claude/hooks/queue-guard.py\"; [ ! -f \"$f\" ] || exec python3 \"$f\"",
+            "command": "f=\"$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)/../.claude/hooks/queue-guard.py\"; [ ! -f \"$f\" ] || exec python3 \"$f\"",
             "timeout": 10
           }
         ]

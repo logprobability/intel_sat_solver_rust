@@ -30,6 +30,8 @@ running job is run where it stands rather than queued again.
 
 Forgetting the prefix costs a retry rather than a slow machine: the
 `PreToolUse` hook in `.claude/settings.json` rejects an unqueued build, test or
-solver run and says what to run instead. It reads only the command, so a line
+solver run and says what to run instead -- in a worktree branched from before
+the queue existed as well, where the script to use is the primary checkout's,
+by the path the refusal gives. It reads only the command, so a line
 that merely names one of them and does not run it can be caught as well; the
 answer then is the same, to put it behind the queue.
