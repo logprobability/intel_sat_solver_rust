@@ -685,6 +685,14 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		if l < 0 { Negate(internalL) } else { internalL }
 	}
 
+	// Does E2I(l) index inside m_E2ILitMap? Not for TLit::MIN, whose negation wraps to itself, and not after a failed allocation emptied the map
+	#[inline]
+	pub(crate) fn IsE2IInBounds(&self, l: TLit) -> bool
+	{
+		let externalV = ExternalLit2ExternalVar(l);
+		externalV >= 0 && (externalV as usize) < self.m_E2ILitMap.cap()
+	}
+
 	#[inline(always)]
 	pub(crate) fn GetNextVar(&self) -> TUVar
 	{

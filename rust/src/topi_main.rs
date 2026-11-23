@@ -1491,7 +1491,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		// This is in order not to crash when the user asks for a value beyond m_MaxUserVar,
 		// which can legally happen (e.g., consider the input {4 0} {4 5 6 7 0})
 
-		if ExternalLit2ExternalVar(l) > self.m_Stat.m_MaxUserVar
+		if ExternalLit2ExternalVar(l) > self.m_Stat.m_MaxUserVar || !self.IsE2IInBounds(l)
 		{
 			return TToporLitVal::VAL_DONT_CARE;
 		}
@@ -1520,6 +1520,12 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 	pub fn GetLitDecLevel(&self, l: TLit) -> TLit
 	{
+		// The C++ version reads beyond the literal map for an unknown literal; 0 is returned instead
+		if !self.IsE2IInBounds(l)
+		{
+			return 0;
+		}
+
 		let litInternal = self.E2I(l);
 		debug_assert!(litInternal < self.GetNextLit());
 
