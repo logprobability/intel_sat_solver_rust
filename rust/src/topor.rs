@@ -20,10 +20,7 @@ pub struct CTopor<Ind: TUInd = u32, const Compress: bool = false>
 	pub(crate) m_Topi: Box<CTopi<Ind, Compress>>,
 }
 
-// TUInd must be at least as wide as TLit (since the clause and watch buffers will store literals, amongst others)
-const _: () = assert!(std::mem::size_of::<u32>() >= std::mem::size_of::<TLit>());
-// TUInd must not be wider than size_t
-const _: () = assert!(std::mem::size_of::<u64>() <= std::mem::size_of::<usize>());
+// The width requirements on TUInd are checked, for each of its (sealed) implementations, in topi_types.rs
 
 impl<Ind: TUInd, const Compress: bool> CTopor<Ind, Compress>
 {

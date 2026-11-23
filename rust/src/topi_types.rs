@@ -110,7 +110,13 @@ const _: () = assert!(LitsInPage <= InitEntriesInB);
 
 // The unsigned index into the clause and watch buffers TUInd
 // The solver is designed to be able to work with any index type as long as sizeof(TUInd) >= sizeof(TLit) and sizeof(TUInd) <= sizeof(size_t)
-pub trait TUInd: Copy + Clone + PartialEq + Eq + PartialOrd + Ord + Hash + Default + Debug + Display + LowerHex + Add<Output = Self> + Sub<Output = Self> + AddAssign + SubAssign + 'static
+// The unsafe code relies on that bound, so the trait is sealed: it is implemented for u32 and u64 only, each checked at compile time in impl_tuind
+mod sealed
+{
+	pub trait Sealed {}
+}
+
+pub trait TUInd: sealed::Sealed + Copy + PartialEq + Eq + PartialOrd + Ord + Hash + Default + Debug + Display + LowerHex + Add<Output = Self> + Sub<Output = Self> + AddAssign + SubAssign + 'static
 {
 	const DIGITS: u32;
 	// The number of literal-entries in an index-entry
@@ -139,6 +145,11 @@ macro_rules! impl_tuind
 {
 	($t:ty) =>
 	{
+		// TUInd must be at least as wide as TLit (since the clause and watch buffers will store literals, amongst others) and must not be wider than size_t
+		const _: () = assert!(<$t>::BITS >= TULit::BITS && <$t>::BITS <= usize::BITS);
+
+		impl sealed::Sealed for $t {}
+
 		impl TUInd for $t
 		{
 			const DIGITS: u32 = <$t>::BITS;
@@ -167,7 +178,6 @@ macro_rules! impl_tuind
 
 impl_tuind!(u32);
 impl_tuind!(u64);
-const _: () = assert!(std::mem::size_of::<u64>() <= std::mem::size_of::<usize>());
 
 // A sequence of literals with random access: implemented by spans and by (potentially compressed) clauses
 // This is the equivalent of the TULitSpan template parameter in the C++ version
