@@ -1727,7 +1727,9 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	{
 		if self.m_AssignmentInfo[v as usize].IsAssignedBinary()
 		{
-			Span::new(unsafe { (*self.m_VarInfo.get_ptr(v as usize)).m_BinOtherLitPtr() }, 1)
+			// &m_BinOtherLit: TVarInfo is repr(C) and starts with m_ParentClsInd, whose low bytes hold m_BinOtherLit;
+			// the raw cast avoids forming a mutable reference to the entry from &self
+			Span::new(self.m_VarInfo.get_ptr(v as usize).cast::<TULit>(), 1)
 		}
 		else
 		{

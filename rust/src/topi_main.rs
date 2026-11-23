@@ -13,12 +13,17 @@ extern "C"
 	fn rand() -> std::ffi::c_int;
 }
 
+// time_t is long on the supported Unix platforms (glibc and macOS)
+#[cfg(unix)]
+type time_t = std::ffi::c_long;
+
 #[cfg(unix)]
 extern "C"
 {
-	fn time(tloc: *mut i64) -> i64;
-	// Returns struct tm*, which starts with the int fields: tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year
-	fn localtime(timep: *const i64) -> *const std::ffi::c_int;
+	fn time(tloc: *mut time_t) -> time_t;
+	// Fills result (a struct tm, which starts with the int fields: tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year) and returns it, or null on failure;
+	// unlike localtime, it doesn't share a static buffer, so solvers in different threads don't race
+	fn localtime_r(timep: *const time_t, result: *mut std::ffi::c_int) -> *mut std::ffi::c_int;
 }
 
 // operator<< for a double with the default ostream formatting (that is, %g with 6 significant digits)
@@ -89,11 +94,13 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		ss += &format!("{:p}_{}_", self as *const Self, std::process::id());
 
 		#[cfg(unix)]
+		// SAFETY: tmBuf is larger than struct tm (56 bytes on the supported platforms) and as aligned; localtime_r only writes into it
 		unsafe
 		{
-			let mut now: i64 = 0;
+			let mut now: time_t = 0;
 			time(&mut now);
-			let current = localtime(&now);
+			let mut tmBuf = [0i64; 8];
+			let current: *const std::ffi::c_int = localtime_r(&now, tmBuf.as_mut_ptr().cast());
 			if !current.is_null()
 			{
 				let (tm_sec, tm_min, tm_hour, tm_mday, tm_mon, tm_year) = (*current, *current.add(1), *current.add(2), *current.add(3), *current.add(4), *current.add(5));
