@@ -1,10 +1,32 @@
-//! Datalog-style conjunctive queries over a database value.
+//! Datalog-style queries over a database value.
 //!
 //! A `Query` is assembled clause by clause, and every clause is handed to the query's planner as soon as it is added:
 //! the planner keeps one incremental SAT solver for the whole query and refines the join order within a small conflict budget per clause,
 //! so a good (often optimal) plan already exists when the query is complete. `run` then finishes the optimization and executes the plan as nested loops,
 //! each clause using the index that its bound positions select (EAVT, AVET or AEVT; their history counterparts in a history view,
 //! where a pattern can also match the datom's transaction and added flag, see `Query::pattern_tx`).
+//! The `parse` module reads the same queries from a Datalog text (`Db::q`).
+//!
+//! # Clauses
+//! * A pattern `[e attr v]` (or `[e attr v tx added]`) matches datoms and binds its variables.
+//! * A predicate `l op r` compares two bound terms.
+//! * `not` keeps the rows for which its body has no solution. Its *join* variables (every variable of its body, or the list of `not-join`)
+//!   must be bound when it runs; the body's other variables are its own.
+//! * `or` is the union of its branches' solutions, projected on its join variables (the variables of its branches, which must all use
+//!   the same ones, or the list of `or-join`); the branches' other variables are their own. An `or` whose every branch binds every join
+//!   variable by itself is a *binder*, like a pattern; any other `or` is a *filter*, which needs its join variables bound, like a `not`.
+//!
+//! The SAT planner doesn't look inside `not` and `or`: to it, a filter is a clause that needs its join variables (like a predicate,
+//! so it is pending until they have binders), and a binder is a clause that binds them, at a cost estimated from its branches.
+//! A clause never both needs and binds variables, which keeps the planner's encoding sound (a binder never has requirements of its own).
+//! Each run plans the bodies of `not` and `or` once, with the join variables bound where the clause runs counted as constants,
+//! and runs them in an environment of their own (the join variables only, so a body's own variables never meet the query's).
+//!
+//! # Find specs
+//! `Query::find` takes plain terms and aggregates (`count`, `count-distinct`, `sum`, `min`, `max`, `avg`). As in Datomic, the query
+//! first finds the distinct tuples of every plain, aggregated and `with` term, then groups them by the plain terms and aggregates each
+//! group's column (so `with` variables keep tuples that would otherwise be equal apart). With no matching tuples, there are no rows.
+//! There is no floating-point value type, so `avg` is the integer mean rounded down; `sum` and `avg` take Int values only.
 //!
 //! # Pull
 //! `Db::pull` reads an entity as a tree, by a pattern of attributes: forward ones (a cardinality-one attribute gives one value,
@@ -15,11 +37,15 @@
 //! and a reverse attribute's key is its name with `_` before the local part (`person/_friend`).
 
 use crate::db::{AttrId, AttrStats, Cardinality, Db, Eid, Error, Value, ValueType};
-use crate::planner::{monotone, weight_of_fanout, ClauseShape, Plan, Planner, VarId};
+use crate::planner::{fanout_of_weight, greedy_order, monotone, weight_of_fanout, ClauseShape, Plan, Planner, VarId};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The conflict budget of the refinement that follows every added clause
 const ONLINE_BUDGET: u64 = 1000;
+/// The conflict budget of planning the body of a `not` or the branch of an `or` (once per run)
+const BODY_BUDGET: u64 = 1000;
+/// The estimated fraction of the rows that a `not` keeps
+const NOT_SELECTIVITY: f64 = 0.5;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Term
@@ -58,6 +84,15 @@ impl From<&str> for Term
 	fn from(s: &str) -> Self
 	{
 		Term::Val(s.into())
+	}
+}
+
+fn var_of(t: &Term) -> Option<VarId>
+{
+	match t
+	{
+		Term::Var(x) => Some(*x),
+		Term::Val(_) => None,
 	}
 }
 
@@ -112,6 +147,81 @@ pub enum Clause
 	{
 		op: Cmp, l: Term, r: Term
 	},
+	/// The rows for which the body has no solution (see the module documentation); built by `Query::not`
+	Not
+	{
+		join: Vec<VarId>, body: Vec<Clause>
+	},
+	/// The union of the branches' solutions on the join variables (see the module documentation); built by `Query::or`
+	Or
+	{
+		join: Vec<VarId>, branches: Vec<Vec<Clause>>
+	},
+}
+
+impl Clause
+{
+	pub fn pred(l: impl Into<Term>, op: Cmp, r: impl Into<Term>) -> Clause
+	{
+		Clause::Pred { op, l: l.into(), r: r.into() }
+	}
+
+	// The variables the clause shares with the clauses around it: all of a pattern's or a predicate's, the join variables of not and or
+	fn free_vars(&self, out: &mut BTreeSet<VarId>)
+	{
+		match self
+		{
+			Clause::Pattern { e, v, tx, added, .. } => out.extend([Some(e), Some(v), tx.as_ref(), added.as_ref()].into_iter().flatten().filter_map(var_of)),
+			Clause::Pred { l, r, .. } => out.extend([l, r].into_iter().filter_map(var_of)),
+			Clause::Not { join, .. } | Clause::Or { join, .. } => out.extend(join),
+		}
+	}
+
+	// Every variable the clause mentions, its bodies included
+	fn all_vars(&self, out: &mut BTreeSet<VarId>)
+	{
+		self.free_vars(out);
+		match self
+		{
+			Clause::Not { body, .. } => body.iter().for_each(|c| c.all_vars(out)),
+			Clause::Or { branches, .. } => branches.iter().flatten().for_each(|c| c.all_vars(out)),
+			_ => {}
+		}
+	}
+
+	/// The variables the clause needs bound before it runs, and those it binds (one of them is empty)
+	fn needs_binds(&self) -> (Vec<VarId>, Vec<VarId>)
+	{
+		match self
+		{
+			Clause::Pattern { .. } =>
+			{
+				let mut vs = BTreeSet::new();
+				self.free_vars(&mut vs);
+				(vec![], vs.into_iter().collect())
+			}
+			Clause::Pred { l, r, .. } => ([l, r].into_iter().filter_map(var_of).collect(), vec![]),
+			Clause::Not { join, .. } => (join.clone(), vec![]),
+			Clause::Or { join, branches } =>
+			{
+				let binder = branches.iter().all(|b| unbound_need(b, &BTreeSet::new()).is_none() && join.iter().all(|x| body_binds(b).contains(x)));
+				if binder { (vec![], join.clone()) } else { (join.clone(), vec![]) }
+			}
+		}
+	}
+}
+
+// The variables that the clauses of a body bind
+fn body_binds(body: &[Clause]) -> BTreeSet<VarId>
+{
+	body.iter().flat_map(|c| c.needs_binds().1).collect()
+}
+
+// A variable that a clause of the body needs, but that neither `pre` nor the body binds
+fn unbound_need(body: &[Clause], pre: &BTreeSet<VarId>) -> Option<VarId>
+{
+	let binds = body_binds(body);
+	body.iter().flat_map(|c| c.needs_binds().0).find(|x| !pre.contains(x) && !binds.contains(x))
 }
 
 /// The planner's weights of a pattern, from the attribute's statistics: the fanout is the number of datoms matching per input row
@@ -120,6 +230,90 @@ fn pattern_weights(s: AttrStats) -> [u32; 4]
 	let d = s.datoms as f64;
 	let (e, v) = (s.entities.max(1) as f64, s.values.max(1) as f64);
 	monotone([d, d / e, d / v, d / (e * v)].map(weight_of_fanout))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Agg
+{
+	Count,
+	CountDistinct,
+	Sum,
+	Min,
+	Max,
+	/// The integer mean, rounded down
+	Avg,
+}
+
+impl Agg
+{
+	/// The aggregate's name in the text syntax
+	pub fn name(self) -> &'static str
+	{
+		match self
+		{
+			Agg::Count => "count",
+			Agg::CountDistinct => "count-distinct",
+			Agg::Sum => "sum",
+			Agg::Min => "min",
+			Agg::Max => "max",
+			Agg::Avg => "avg",
+		}
+	}
+
+	pub fn from_name(name: &str) -> Option<Agg>
+	{
+		[Agg::Count, Agg::CountDistinct, Agg::Sum, Agg::Min, Agg::Max, Agg::Avg].into_iter().find(|a| a.name() == name)
+	}
+
+	// The aggregate of a group's column (never empty: a group has at least one tuple)
+	fn apply(self, vals: &[&Value]) -> Result<Value, Error>
+	{
+		let ints = || -> Result<i128, Error> {
+			let mut s: i128 = 0;
+			for v in vals
+			{
+				match v
+				{
+					Value::Int(i) => s += *i as i128,
+					v => return Err(Error::InvalidQuery(format!("{} of the non-integer value {v:?}", self.name()))),
+				}
+			}
+			Ok(s)
+		};
+		Ok(match self
+		{
+			Agg::Count => Value::Int(vals.len() as i64),
+			Agg::CountDistinct => Value::Int(vals.iter().collect::<BTreeSet<_>>().len() as i64),
+			Agg::Min => (*vals.iter().min().expect("a group is not empty")).clone(),
+			Agg::Max => (*vals.iter().max().expect("a group is not empty")).clone(),
+			Agg::Sum => Value::Int(i64::try_from(ints()?).map_err(|_| Error::InvalidQuery("the sum overflows an Int".into()))?),
+			// The mean of Ints lies between them, so it fits
+			Agg::Avg => Value::Int(ints()?.div_euclid(vals.len() as i128) as i64),
+		})
+	}
+}
+
+/// An element of a find spec
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Find
+{
+	Term(Term),
+	Agg(Agg, Term),
+}
+
+/// A clause of a run, with the bodies of `not` and `or` ordered for the variables bound where they run
+enum Step<'a>
+{
+	/// A pattern or a predicate
+	Clause(&'a Clause),
+	Not
+	{
+		join: &'a [VarId], body: Vec<Step<'a>>
+	},
+	Or
+	{
+		join: &'a [VarId], branches: Vec<Vec<Step<'a>>>
+	},
 }
 
 pub struct Query
@@ -150,6 +344,12 @@ impl Query
 		Term::Var(i)
 	}
 
+	/// The name of variable `x` of this query
+	pub fn var_name(&self, x: VarId) -> &str
+	{
+		&self.vars[x]
+	}
+
 	/// The lookup ref [attr v] as a constant entity term (resolved now, as the query's database is fixed); unknown values are an error
 	pub fn lookup(&self, attr: &str, v: impl Into<Value>) -> Result<Term, Error>
 	{
@@ -166,7 +366,8 @@ impl Query
 	/// Add the pattern [e attr v]; returns the clause's index
 	pub fn pattern(&mut self, e: impl Into<Term>, attr: &str, v: impl Into<Term>) -> Result<usize, Error>
 	{
-		self.add_pattern(e.into(), attr, v.into(), None, None)
+		let c = self.pattern_clause(e, attr, v)?;
+		self.add_clause(c)
 	}
 
 	/// Add the pattern [e attr v tx added], which also matches the datom's transaction entity and its added flag
@@ -174,58 +375,212 @@ impl Query
 	/// Returns the clause's index
 	pub fn pattern_tx(&mut self, e: impl Into<Term>, attr: &str, v: impl Into<Term>, tx: impl Into<Term>, added: impl Into<Term>) -> Result<usize, Error>
 	{
-		self.add_pattern(e.into(), attr, v.into(), Some(tx.into()), Some(added.into()))
+		let c = self.pattern_tx_clause(e, attr, v, tx, added)?;
+		self.add_clause(c)
 	}
 
-	fn add_pattern(&mut self, e: Term, attr: &str, v: Term, tx: Option<Term>, added: Option<Term>) -> Result<usize, Error>
+	/// The pattern [e attr v], validated but not added (for the body of a `not` or an `or`)
+	pub fn pattern_clause(&self, e: impl Into<Term>, attr: &str, v: impl Into<Term>) -> Result<Clause, Error>
+	{
+		self.make_pattern(e.into(), attr, v.into(), None, None)
+	}
+
+	/// The pattern [e attr v tx added], validated but not added
+	pub fn pattern_tx_clause(&self, e: impl Into<Term>, attr: &str, v: impl Into<Term>, tx: impl Into<Term>, added: impl Into<Term>) -> Result<Clause, Error>
+	{
+		self.make_pattern(e.into(), attr, v.into(), Some(tx.into()), Some(added.into()))
+	}
+
+	fn make_pattern(&self, e: Term, attr: &str, v: Term, tx: Option<Term>, added: Option<Term>) -> Result<Clause, Error>
 	{
 		let a = self.db.attr_id(attr).ok_or_else(|| Error::UnknownAttr(attr.to_string()))?;
-		let def = self.db.attr(a);
-		let typed = [(Some(&e), ValueType::Ref), (Some(&v), def.value_type), (tx.as_ref(), ValueType::Ref), (added.as_ref(), ValueType::Bool)];
-		for (t, expected) in typed
+		let c = Clause::Pattern { e, a, v, tx, added };
+		self.check(&c)?;
+		Ok(c)
+	}
+
+	/// Add the predicate `l op r`; its variables must be bound by other clauses. Returns the clause's index
+	pub fn pred(&mut self, l: impl Into<Term>, op: Cmp, r: impl Into<Term>) -> Result<usize, Error>
+	{
+		self.add_clause(Clause::pred(l, op, r))
+	}
+
+	fn join_vars(join: &[Term]) -> Result<Vec<VarId>, Error>
+	{
+		let mut out: Vec<VarId> = join.iter().map(|t| var_of(t).ok_or_else(|| Error::InvalidQuery(format!("the join list has the constant {t:?}")))).collect::<Result<_, _>>()?;
+		out.sort_unstable();
+		out.dedup();
+		Ok(out)
+	}
+
+	/// The clause `not` (`join` None: every variable of the body is a join variable) or `not-join` (the variables of `join`), validated but not added
+	pub fn not(&self, join: Option<&[Term]>, body: Vec<Clause>) -> Result<Clause, Error>
+	{
+		let join = match join
 		{
-			if let Some(Term::Val(x)) = t
+			Some(j) => Self::join_vars(j)?,
+			None =>
 			{
-				if x.value_type() != expected
+				let mut vs = BTreeSet::new();
+				body.iter().for_each(|c| c.free_vars(&mut vs));
+				vs.into_iter().collect()
+			}
+		};
+		let c = Clause::Not { join, body };
+		self.check(&c)?;
+		Ok(c)
+	}
+
+	/// The clause `or` (`join` None: the join variables are the branches' variables, which must be the same in every branch)
+	/// or `or-join` (the variables of `join`), validated but not added
+	pub fn or(&self, join: Option<&[Term]>, branches: Vec<Vec<Clause>>) -> Result<Clause, Error>
+	{
+		let join = match join
+		{
+			Some(j) => Self::join_vars(j)?,
+			None =>
+			{
+				let sets: Vec<BTreeSet<VarId>> = branches
+					.iter()
+					.map(|b| {
+						let mut vs = BTreeSet::new();
+						b.iter().for_each(|c| c.free_vars(&mut vs));
+						vs
+					})
+					.collect();
+				if let Some(i) = sets.iter().position(|s| *s != sets[0])
 				{
-					return Err(Error::TypeMismatch { attr: attr.to_string(), expected, got: x.value_type() });
+					let names = |s: &BTreeSet<VarId>| s.iter().map(|&x| self.vars.get(x).map_or("?", |n| n.as_str())).collect::<Vec<_>>().join(" ");
+					return Err(Error::InvalidQuery(format!("the branches of or use different variables: [{}] and [{}] (or-join names the shared ones)", names(&sets[0]), names(&sets[i]))));
 				}
+				sets.into_iter().next().unwrap_or_default().into_iter().collect()
+			}
+		};
+		let c = Clause::Or { join, branches };
+		self.check(&c)?;
+		Ok(c)
+	}
+
+	// Validate a clause, its bodies included: its variables are this query's, its patterns are well-typed, its bodies aren't empty,
+	// and a body's needs are bound by its join variables or its own clauses
+	fn check(&self, c: &Clause) -> Result<(), Error>
+	{
+		let mut vs = BTreeSet::new();
+		c.all_vars(&mut vs);
+		if let Some(x) = vs.into_iter().find(|&x| x >= self.vars.len())
+		{
+			return Err(Error::InvalidQuery(format!("variable #{x} belongs to another query")));
+		}
+		self.check_clause(c)
+	}
+
+	fn check_clause(&self, c: &Clause) -> Result<(), Error>
+	{
+		match c
+		{
+			Clause::Pattern { e, a, v, tx, added } =>
+			{
+				let def = self.db.try_attr(*a).ok_or_else(|| Error::UnknownAttr(format!("#{a}")))?;
+				let typed = [(Some(e), ValueType::Ref), (Some(v), def.value_type), (tx.as_ref(), ValueType::Ref), (added.as_ref(), ValueType::Bool)];
+				for (t, expected) in typed
+				{
+					if let Some(Term::Val(x)) = t
+					{
+						if x.value_type() != expected
+						{
+							return Err(Error::TypeMismatch { attr: def.name.to_string(), expected, got: x.value_type() });
+						}
+					}
+				}
+				Ok(())
+			}
+			Clause::Pred { .. } => Ok(()),
+			Clause::Not { join, body } => self.check_body(body, join, "not"),
+			Clause::Or { branches, .. } =>
+			{
+				if branches.is_empty()
+				{
+					return Err(Error::InvalidQuery("an or without branches".into()));
+				}
+				// A binder's branches bind everything by themselves; a filter's have the join variables bound
+				let (needs, _) = c.needs_binds();
+				branches.iter().try_for_each(|b| self.check_body(b, &needs, "or branch"))
 			}
 		}
-		let var = |t: &Term| match t
+	}
+
+	fn check_body(&self, body: &[Clause], pre: &[VarId], what: &str) -> Result<(), Error>
+	{
+		if body.is_empty()
 		{
-			Term::Var(x) => Some(*x),
-			Term::Val(_) => None,
-		};
-		// The tx and added positions bind their variables, but the cost model only distinguishes the entity and value positions
-		let slots = [var(&e), var(&v)];
-		let binds = [Some(&e), Some(&v), tx.as_ref(), added.as_ref()].into_iter().flatten().filter_map(var).collect();
-		let shape = ClauseShape { slots, needs: vec![], binds, weights: pattern_weights(self.db.stats(a)) };
-		Ok(self.add(Clause::Pattern { e, a, v, tx, added }, shape))
+			return Err(Error::InvalidQuery(format!("an empty {what}")));
+		}
+		body.iter().try_for_each(|c| self.check_clause(c))?;
+		match unbound_need(body, &pre.iter().copied().collect())
+		{
+			Some(x) => Err(Error::Unbound(self.vars[x].clone())),
+			None => Ok(()),
+		}
 	}
 
-	/// Add the predicate `l op r`; its variables must be bound by patterns. Returns the clause's index
-	pub fn pred(&mut self, l: impl Into<Term>, op: Cmp, r: impl Into<Term>) -> usize
+	/// Validate and add a clause (built by `pattern_clause`, `not`, `or`, `Clause::pred`, ...); returns its index
+	pub fn add_clause(&mut self, c: Clause) -> Result<usize, Error>
 	{
-		let (l, r) = (l.into(), r.into());
-		let needs = [&l, &r]
-			.iter()
-			.filter_map(|t| match t
-			{
-				Term::Var(x) => Some(*x),
-				Term::Val(_) => None,
-			})
-			.collect();
-		let shape = ClauseShape { slots: [None, None], needs, binds: vec![], weights: [weight_of_fanout(op.selectivity()); 4] };
-		self.add(Clause::Pred { op, l, r }, shape)
-	}
-
-	fn add(&mut self, clause: Clause, shape: ClauseShape) -> usize
-	{
-		self.clauses.push(clause);
+		self.check(&c)?;
+		let shape = self.shape(&c, &vec![false; self.vars.len()]);
+		self.clauses.push(c);
 		self.planner.add_clause(shape, self.vars.len());
 		self.planner.refine(ONLINE_BUDGET);
-		self.clauses.len() - 1
+		Ok(self.clauses.len() - 1)
+	}
+
+	// The planner's view of a clause, with the variables of `pre` bound beforehand (they count as constants)
+	fn shape(&self, c: &Clause, pre: &[bool]) -> ClauseShape
+	{
+		let free = |vs: Vec<VarId>| -> Vec<VarId> { vs.into_iter().filter(|&x| !pre[x]).collect() };
+		let (needs, binds) = c.needs_binds();
+		let (needs, binds) = (free(needs), free(binds));
+		match c
+		{
+			Clause::Pattern { e, a, v, .. } =>
+			{
+				// The tx and added positions bind their variables, but the cost model only distinguishes the entity and value positions
+				let slot = |t: &Term| var_of(t).filter(|&x| !pre[x]);
+				ClauseShape { slots: [slot(e), slot(v)], needs, binds, weights: pattern_weights(self.db.stats(*a)) }
+			}
+			Clause::Pred { op, .. } => ClauseShape { slots: [None, None], needs, binds, weights: [weight_of_fanout(op.selectivity()); 4] },
+			Clause::Not { .. } => ClauseShape { slots: [None, None], needs, binds, weights: [weight_of_fanout(NOT_SELECTIVITY); 4] },
+			Clause::Or { branches, .. } =>
+			{
+				// The sum of the branches' estimated sizes, each that of its final result in the greedy order (at most one row per input row for a filter)
+				let mut inner = pre.to_vec();
+				for &x in &needs
+				{
+					inner[x] = true;
+				}
+				let mut rows = 0.0;
+				for b in branches
+				{
+					let shapes: Vec<ClauseShape> = b.iter().map(|c| self.shape(c, &inner)).collect();
+					let mut bound = vec![false; pre.len()];
+					let mut log2 = 0.0;
+					for k in greedy_order(&shapes, pre.len())
+					{
+						log2 += fanout_of_weight(shapes[k].weights[shapes[k].mode(&bound)]).log2();
+						for &x in &shapes[k].binds
+						{
+							bound[x] = true;
+						}
+					}
+					rows += log2.exp2();
+				}
+				if binds.is_empty()
+				{
+					rows = rows.min(1.0);
+				}
+				ClauseShape { slots: [None, None], needs, binds, weights: [weight_of_fanout(rows); 4] }
+			}
+		}
 	}
 
 	/// The best plan found so far
@@ -259,34 +614,118 @@ impl Query
 		self.run_in_order(&order, find)
 	}
 
-	pub(crate) fn run_in_order(&self, order: &[usize], find: &[Term]) -> Result<Vec<Vec<Value>>, Error>
+	/// Optimize the plan and run it with a find spec of plain terms and aggregates (see the module documentation);
+	/// returns the rows (one per group), sorted
+	pub fn find(&mut self, spec: &[Find], with: &[Term]) -> Result<Vec<Vec<Value>>, Error>
 	{
-		let mut bindable = vec![false; self.vars.len()];
-		for c in &self.clauses
+		let keys: Vec<Term> = spec.iter().filter_map(|f| if let Find::Term(t) = f { Some(t.clone()) } else { None }).collect();
+		let aggs: Vec<(Agg, Term)> = spec.iter().filter_map(|f| if let Find::Agg(a, t) = f { Some((*a, t.clone())) } else { None }).collect();
+		let cols: Vec<Term> = keys.iter().cloned().chain(aggs.iter().map(|a| a.1.clone())).chain(with.iter().cloned()).collect();
+		let mut groups: BTreeMap<Vec<Value>, Vec<Vec<Value>>> = BTreeMap::new();
+		for mut row in self.run(&cols)?
 		{
-			if let Clause::Pattern { e, v, tx, added, .. } = c
-			{
-				for t in [Some(e), Some(v), tx.as_ref(), added.as_ref()].into_iter().flatten()
-				{
-					if let Term::Var(x) = t
-					{
-						bindable[*x] = true;
-					}
-				}
-			}
-		}
-		let used = self.clauses.iter().flat_map(|c| match c
-		{
-			Clause::Pred { l, r, .. } => vec![l, r],
-			Clause::Pattern { .. } => vec![],
-		});
-		if let Some(Term::Var(x)) = find.iter().chain(used).find(|t| matches!(t, Term::Var(x) if !bindable[*x]))
-		{
-			return Err(Error::Unbound(self.vars[*x].clone()));
+			let rest = row.split_off(keys.len());
+			groups.entry(row).or_default().push(rest);
 		}
 		let mut out = BTreeSet::new();
-		self.step(order, &mut vec![None; self.vars.len()], find, &mut out)?;
+		for (key, tuples) in groups
+		{
+			let (mut key, mut col) = (key.into_iter(), 0);
+			let mut row = Vec::with_capacity(spec.len());
+			for f in spec
+			{
+				row.push(match f
+				{
+					Find::Term(_) => key.next().expect("a key per plain term"),
+					Find::Agg(a, _) =>
+					{
+						let vals: Vec<&Value> = tuples.iter().map(|t| &t[col]).collect();
+						col += 1;
+						a.apply(&vals)?
+					}
+				});
+			}
+			out.insert(row);
+		}
 		Ok(out.into_iter().collect())
+	}
+
+	pub(crate) fn run_in_order(&self, order: &[usize], find: &[Term]) -> Result<Vec<Vec<Value>>, Error>
+	{
+		let n = self.vars.len();
+		if let Some(x) = find.iter().filter_map(var_of).find(|&x| x >= n)
+		{
+			return Err(Error::InvalidQuery(format!("variable #{x} belongs to another query")));
+		}
+		let mut bindable = vec![false; n];
+		for x in self.clauses.iter().flat_map(|c| c.needs_binds().1)
+		{
+			bindable[x] = true;
+		}
+		let needed = find.iter().filter_map(var_of).chain(self.clauses.iter().flat_map(|c| c.needs_binds().0));
+		if let Some(x) = needed.into_iter().find(|&x| !bindable[x])
+		{
+			return Err(Error::Unbound(self.vars[x].clone()));
+		}
+		let steps = self.compile(&self.clauses, order, &mut vec![false; n])?;
+		let mut out = BTreeSet::new();
+		self.exec(&steps, &mut vec![None; n], &mut |env| {
+			out.insert(find.iter().map(|t| Self::eval(t, env).expect("the find variables are bound by the clauses")).collect());
+			true
+		});
+		Ok(out.into_iter().collect())
+	}
+
+	// The steps of running `clauses` in `order`, from the variables of `bound` (which it updates); a clause whose needs aren't bound
+	// where it runs is an error
+	fn compile<'a>(&'a self, clauses: &'a [Clause], order: &[usize], bound: &mut [bool]) -> Result<Vec<Step<'a>>, Error>
+	{
+		let mut steps = Vec::with_capacity(order.len());
+		for &c in order
+		{
+			let clause = &clauses[c];
+			let (needs, binds) = clause.needs_binds();
+			if let Some(&x) = needs.iter().find(|&&x| !bound[x])
+			{
+				return Err(Error::Unbound(self.vars[x].clone()));
+			}
+			// A body runs in an environment of its own, from the join variables that are bound here
+			let inner = |join: &[VarId]| {
+				let mut b = vec![false; bound.len()];
+				for &x in join
+				{
+					b[x] = bound[x];
+				}
+				b
+			};
+			steps.push(match clause
+			{
+				Clause::Pattern { .. } | Clause::Pred { .. } => Step::Clause(clause),
+				Clause::Not { join, body } => Step::Not { join, body: self.compile_body(body, inner(join))? },
+				Clause::Or { join, branches } =>
+				{
+					let pre = inner(join);
+					Step::Or { join, branches: branches.iter().map(|b| self.compile_body(b, pre.clone())).collect::<Result<_, _>>()? }
+				}
+			});
+			for x in binds
+			{
+				bound[x] = true;
+			}
+		}
+		Ok(steps)
+	}
+
+	// Plan a body with the variables of `bound` as constants (with the SAT planner, within a budget), and compile it
+	fn compile_body<'a>(&'a self, body: &'a [Clause], mut bound: Vec<bool>) -> Result<Vec<Step<'a>>, Error>
+	{
+		let mut planner = Planner::new();
+		for c in body
+		{
+			planner.add_clause(self.shape(c, &bound), bound.len());
+		}
+		let order = planner.refine(BODY_BUDGET).order.clone();
+		self.compile(body, &order, &mut bound)
 	}
 
 	fn eval(t: &Term, env: &[Option<Value>]) -> Option<Value>
@@ -317,23 +756,34 @@ impl Query
 		}
 	}
 
-	fn step(&self, order: &[usize], env: &mut Vec<Option<Value>>, find: &[Term], out: &mut BTreeSet<Vec<Value>>) -> Result<(), Error>
+	// The environment of a body: the join variables' values only
+	fn inner_env(env: &[Option<Value>], join: &[VarId]) -> Vec<Option<Value>>
 	{
-		let Some((&c, rest)) = order.split_first()
+		let mut inner = vec![None; env.len()];
+		for &x in join
+		{
+			inner[x] = env[x].clone();
+		}
+		inner
+	}
+
+	// Run the steps from `env`, calling `emit` on every solution; stops as soon as `emit` returns false, and returns false then
+	fn exec(&self, steps: &[Step], env: &mut Vec<Option<Value>>, emit: &mut dyn FnMut(&[Option<Value>]) -> bool) -> bool
+	{
+		let Some((step, rest)) = steps.split_first()
 		else
 		{
-			out.insert(find.iter().map(|t| Self::eval(t, env).expect("the find variables are bound by the patterns")).collect());
-			return Ok(());
+			return emit(env);
 		};
-		match &self.clauses[c]
+		match step
 		{
-			Clause::Pattern { e, a, v, tx, added } =>
+			Step::Clause(Clause::Pattern { e, a, v, tx, added }) =>
 			{
 				let eid = match Self::eval(e, env)
 				{
 					Some(Value::Ref(x)) => Some(x),
 					// A non-entity value in the entity position matches nothing
-					Some(_) => return Ok(()),
+					Some(_) => return true,
 					None => None,
 				};
 				// The index scan of the view (the bound tx and added terms filter its rows)
@@ -345,31 +795,66 @@ impl Query
 						&& Self::unify(v, d.v, env, &mut newly)
 						&& tx.as_ref().map_or(true, |t| Self::unify(t, Value::Ref(d.tx), env, &mut newly))
 						&& added.as_ref().map_or(true, |t| Self::unify(t, Value::Bool(d.added), env, &mut newly));
-					if ok
-					{
-						self.step(rest, env, find, out)?;
-					}
+					let go = !ok || self.exec(rest, env, emit);
 					for x in newly
 					{
 						env[x] = None;
 					}
+					if !go
+					{
+						return false;
+					}
 				}
-				Ok(())
+				true
 			}
-			Clause::Pred { op, l, r } =>
+			Step::Clause(Clause::Pred { op, l, r }) =>
 			{
-				let unbound = |t: &Term| match t
+				let lv = Self::eval(l, env).expect("compile checked that the predicate's variables are bound");
+				let rv = Self::eval(r, env).expect("compile checked that the predicate's variables are bound");
+				!op.holds(&lv, &rv) || self.exec(rest, env, emit)
+			}
+			Step::Clause(_) => unreachable!("compile turns not and or into their own steps"),
+			Step::Not { join, body } =>
+			{
+				// The body has a solution exactly when its run stops at the first one
+				let found = !self.exec(body, &mut Self::inner_env(env, join), &mut |_| false);
+				found || self.exec(rest, env, emit)
+			}
+			Step::Or { join, branches } =>
+			{
+				// With every join variable bound, one solution of one branch decides
+				let decided = join.iter().all(|&x| env[x].is_some());
+				let mut tuples = BTreeSet::new();
+				for b in branches
 				{
-					Term::Var(x) => Error::Unbound(self.vars[*x].clone()),
-					Term::Val(_) => unreachable!("a constant is always bound"),
-				};
-				let lv = Self::eval(l, env).ok_or_else(|| unbound(l))?;
-				let rv = Self::eval(r, env).ok_or_else(|| unbound(r))?;
-				if op.holds(&lv, &rv)
-				{
-					self.step(rest, env, find, out)?;
+					self.exec(b, &mut Self::inner_env(env, join), &mut |inner| {
+						tuples.insert(join.iter().map(|&x| inner[x].clone().expect("every branch binds the join variables that aren't bound")).collect::<Vec<_>>());
+						!decided
+					});
+					if decided && !tuples.is_empty()
+					{
+						break;
+					}
 				}
-				Ok(())
+				for t in tuples
+				{
+					let mut newly = Vec::new();
+					for (&x, val) in join.iter().zip(t)
+					{
+						let ok = Self::unify(&Term::Var(x), val, env, &mut newly);
+						debug_assert!(ok, "a branch keeps the join variables' values");
+					}
+					let go = self.exec(rest, env, emit);
+					for x in newly
+					{
+						env[x] = None;
+					}
+					if !go
+					{
+						return false;
+					}
+				}
+				true
 			}
 		}
 	}
@@ -608,7 +1093,7 @@ mod tests
 		q.pattern(f.clone(), "person/follows", ff.clone()).unwrap();
 		q.pattern(ff.clone(), "person/name", name.clone()).unwrap();
 		q.pattern(ff.clone(), "person/age", age.clone()).unwrap();
-		q.pred(age.clone(), Cmp::Gt, 40);
+		q.pred(age.clone(), Cmp::Gt, 40).unwrap();
 		q.pattern(p.clone(), "person/city", city.clone()).unwrap();
 		q.pattern(p.clone(), "person/name", "p7").unwrap();
 		let got = q.run(&[name.clone(), age.clone(), city.clone()]).unwrap();
@@ -665,7 +1150,7 @@ mod tests
 		let mut q = db.query();
 		let (p, age) = (q.var("?p"), q.var("?age"));
 		// The predicate arrives before its binder: it is pending, and the query can't run yet
-		q.pred(age.clone(), Cmp::Lt, 10);
+		q.pred(age.clone(), Cmp::Lt, 10).unwrap();
 		assert_eq!(q.plan().pending, vec![0]);
 		assert_eq!(q.run(&[p.clone()]).err(), Some(Error::Unbound("?p".into())));
 		q.pattern(p.clone(), "person/age", age.clone()).unwrap();
@@ -808,6 +1293,371 @@ mod tests
 		assert!(q.clauses().is_empty());
 		// The planner estimates a history view with the history's statistics
 		assert!(db.history().stats(tag_a).datoms > db.stats(tag_a).datoms);
+	}
+
+	type Row = BTreeMap<VarId, Value>;
+
+	// The reference semantics, bottom-up over a set of (e, a, v) facts: a body is the natural join of its binders' relations
+	// (patterns and binding ors) with the seed, then filtered by its predicates, nots and filtering ors
+	fn naive_body(facts: &BTreeSet<(Eid, AttrId, Value)>, body: &[Clause], seed: BTreeSet<Row>) -> BTreeSet<Row>
+	{
+		let mut cur = seed;
+		let binder = |c: &&Clause| matches!(c, Clause::Pattern { .. } | Clause::Or { .. }) && c.needs_binds().0.is_empty();
+		for c in body.iter().filter(binder)
+		{
+			let rel = naive_rel(facts, c);
+			let mut next = BTreeSet::new();
+			for a in &cur
+			{
+				for b in &rel
+				{
+					if b.iter().all(|(k, v)| a.get(k).map_or(true, |w| w == v))
+					{
+						next.insert(a.iter().chain(b).map(|(k, v)| (*k, v.clone())).collect());
+					}
+				}
+			}
+			cur = next;
+		}
+		let project = |row: &Row, join: &[VarId]| -> BTreeSet<Row> { [join.iter().map(|x| (*x, row[x].clone())).collect()].into() };
+		for c in body.iter().filter(|c| !binder(c))
+		{
+			cur.retain(|row| match c
+			{
+				Clause::Pred { op, l, r } =>
+				{
+					let ev = |t: &Term| match t
+					{
+						Term::Val(v) => v.clone(),
+						Term::Var(x) => row[x].clone(),
+					};
+					op.holds(&ev(l), &ev(r))
+				}
+				Clause::Not { join, body } => naive_body(facts, body, project(row, join)).is_empty(),
+				Clause::Or { join, branches } => branches.iter().any(|b| !naive_body(facts, b, project(row, join)).is_empty()),
+				Clause::Pattern { .. } => unreachable!(),
+			});
+		}
+		cur
+	}
+
+	// The relation of a binder over its variables
+	fn naive_rel(facts: &BTreeSet<(Eid, AttrId, Value)>, c: &Clause) -> BTreeSet<Row>
+	{
+		match c
+		{
+			Clause::Pattern { e, a, v, tx: None, added: None } =>
+			{
+				let mut out = BTreeSet::new();
+				for (fe, _, fv) in facts.iter().filter(|f| f.1 == *a)
+				{
+					let mut row = Row::new();
+					let mut ok = true;
+					for (t, val) in [(e, Value::Ref(*fe)), (v, fv.clone())]
+					{
+						match t
+						{
+							Term::Val(c) => ok &= *c == val,
+							Term::Var(x) => ok &= row.insert(*x, val.clone()).map_or(true, |old| old == val),
+						}
+					}
+					if ok
+					{
+						out.insert(row);
+					}
+				}
+				out
+			}
+			Clause::Or { join, branches } => branches
+				.iter()
+				.flat_map(|b| naive_body(facts, b, [Row::new()].into()))
+				.map(|row| join.iter().map(|x| (*x, row[x].clone())).collect())
+				.collect(),
+			_ => unreachable!("a binder is a pattern (without tx and added) or a binding or"),
+		}
+	}
+
+	// A random clause over the attributes of `random_conn`, with entity variables ?a ?b ?c, Int variables ?x ?y and the tag variable ?t
+	fn random_clause(q: &mut Query, rng: &mut Rng, depth: u32, ids: &[Eid], pattern_only: bool) -> Option<Clause>
+	{
+		let pick = |q: &mut Query, names: &[&str], rng: &mut Rng| q.var(names[(rng.next() % names.len() as u64) as usize]);
+		let kind = if pattern_only || depth == 0 && rng.next() % 4 != 0 { 0 } else { rng.next() % if depth == 0 { 2 } else { 6 } };
+		match kind
+		{
+			// Patterns and ors, twice as likely as predicates and nots
+			0 | 4 =>
+			{
+				let e = pick(q, &["?a", "?b", "?c"], rng);
+				let attr = ["n", "tag", "ref", "best", "n", "ref"][(rng.next() % 6) as usize];
+				let constant = rng.next() % 3 == 0;
+				let v = match attr
+				{
+					"n" if constant => Term::Val(Value::Int((rng.next() % 4) as i64)),
+					"n" => pick(q, &["?x", "?y"], rng),
+					"tag" if constant => Term::Val(["a", "b", "c"][(rng.next() % 3) as usize].into()),
+					"tag" => q.var("?t"),
+					_ if constant => Term::Val(Value::Ref(ids[(rng.next() % ids.len() as u64) as usize])),
+					_ => pick(q, &["?a", "?b", "?c"], rng),
+				};
+				q.pattern_clause(e, attr, v).ok()
+			}
+			1 if rng.next() % 3 == 0 =>
+			{
+				let (l, r) = (pick(q, &["?a", "?b", "?c"], rng), pick(q, &["?a", "?b", "?c"], rng));
+				Some(Clause::pred(l, Cmp::Ne, r))
+			}
+			1 =>
+			{
+				let op = [Cmp::Eq, Cmp::Ne, Cmp::Lt, Cmp::Le, Cmp::Gt, Cmp::Ge][(rng.next() % 6) as usize];
+				Some(Clause::pred(pick(q, &["?x", "?y"], rng), op, (rng.next() % 4) as i64))
+			}
+			_ =>
+			{
+				// A body or branch starts with a pattern
+				let body = |q: &mut Query, rng: &mut Rng| -> Option<Vec<Clause>> {
+					let mut b = vec![random_clause(q, rng, depth - 1, ids, true)?];
+					for _ in 0..rng.next() % 2
+					{
+						b.push(random_clause(q, rng, depth - 1, ids, false)?);
+					}
+					Some(b)
+				};
+				let first = body(q, rng)?;
+				let mut vs = BTreeSet::new();
+				first.iter().for_each(|c| c.free_vars(&mut vs));
+				let join: Option<Vec<Term>> = (rng.next() % 4 != 0).then(|| vs.iter().filter(|_| rng.next() % 2 == 0).map(|&x| Term::Var(x)).collect());
+				if kind == 2
+				{
+					q.not(join.as_deref(), first).ok()
+				}
+				else
+				{
+					let second = body(q, rng)?;
+					q.or(join.as_deref(), vec![first, second]).ok()
+				}
+			}
+		}
+	}
+
+	// Random queries with not, not-join, filtering and binding or (nested too), in every clause order, against the bottom-up reference
+	#[test]
+	fn not_and_or_match_a_naive_evaluator()
+	{
+		use crate::db::tests::{random_conn, replay};
+		let (conn, reports) = random_conn(53, 60);
+		let db = conn.db();
+		let log: Vec<_> = reports.iter().flat_map(|r| &r.tx_data).collect();
+		let facts: BTreeSet<(Eid, AttrId, Value)> = replay(log.iter().copied()).into_keys().collect();
+		let ids: Vec<Eid> = facts.iter().map(|f| f.0).collect::<BTreeSet<_>>().into_iter().collect();
+		let mut rng = Rng::new(17);
+		// Queries run, by the kind of clause they contain, with a non-empty answer
+		let (mut tested, mut nots, mut filters, mut binders, mut nested) = (0, 0, 0, 0, 0);
+		for _ in 0..2000
+		{
+			let mut q = db.query();
+			let mut clauses = Vec::new();
+			for _ in 0..2 + rng.next() % 3
+			{
+				match random_clause(&mut q, &mut rng, 2, &ids, false)
+				{
+					Some(c) => clauses.push(c),
+					None => break,
+				}
+			}
+			if clauses.iter().any(|c| q.add_clause(c.clone()).is_err()) || clauses.len() < 2
+			{
+				continue;
+			}
+			let mut find: Vec<VarId> = clauses.iter().flat_map(|c| c.needs_binds().1).collect::<BTreeSet<_>>().into_iter().collect();
+			if find.is_empty()
+			{
+				continue;
+			}
+			find.truncate(3);
+			let terms: Vec<Term> = find.iter().map(|&x| Term::Var(x)).collect();
+			let Ok(got) = q.run(&terms)
+			else
+			{
+				continue;
+			};
+			let want = sorted(naive_body(&facts, &clauses, [Row::new()].into()).iter().map(|row| find.iter().map(|x| row[x].clone()).collect()));
+			assert_eq!(got, want, "clauses {clauses:?}");
+			let mut valid = 0;
+			for order in permutations(clauses.len())
+			{
+				match q.run_in_order(&order, &terms)
+				{
+					Ok(r) =>
+					{
+						assert_eq!(r, got, "order {order:?} of {clauses:?}");
+						valid += 1;
+					}
+					Err(Error::Unbound(_)) => {}
+					Err(e) => panic!("{e:?}"),
+				}
+			}
+			assert!(valid > 0);
+			if got.is_empty()
+			{
+				continue;
+			}
+			tested += 1;
+			let mut kinds = Vec::new();
+			fn walk(c: &Clause, depth: u32, kinds: &mut Vec<(u32, &'static str)>)
+			{
+				let (kind, inner): (&'static str, Vec<&Clause>) = match c
+				{
+					Clause::Not { body, .. } => ("not", body.iter().collect()),
+					Clause::Or { branches, .. } => (if c.needs_binds().1.is_empty() { "filter" } else { "binder" }, branches.iter().flatten().collect()),
+					_ => return,
+				};
+				kinds.push((depth, kind));
+				inner.into_iter().for_each(|d| walk(d, depth + 1, kinds));
+			}
+			clauses.iter().for_each(|c| walk(c, 0, &mut kinds));
+			nots += kinds.iter().any(|k| k.1 == "not") as usize;
+			filters += kinds.iter().any(|k| k.1 == "filter") as usize;
+			binders += kinds.iter().any(|k| k.1 == "binder") as usize;
+			nested += kinds.iter().any(|k| k.0 > 0) as usize;
+		}
+		assert!(tested >= 150 && nots >= 30 && filters >= 30 && binders >= 25 && nested >= 25, "too few: {tested} {nots} {filters} {binders} {nested}");
+	}
+
+	#[test]
+	fn not_and_or_examples()
+	{
+		let conn = social(30);
+		let db = conn.db();
+		let id = |n: &str| db.attr_id(n).unwrap();
+		let people: Vec<Eid> = db.attr_datoms(id("person/name")).map(|(e, _)| e).collect();
+		let city = |e: Eid| db.values(e, id("person/city")).next().unwrap().clone();
+		let age = |e: Eid| match db.values(e, id("person/age")).next() { Some(Value::Int(a)) => *a, _ => unreachable!() };
+		let follows = |e: Eid| db.values(e, id("person/follows")).map(|v| if let Value::Ref(f) = v { *f } else { unreachable!() }).collect::<Vec<_>>();
+		let r = |e: Eid| vec![Value::Ref(e)];
+
+		// A filter that arrives before its binder is pending, like a predicate, and is placed after the binder once there is one
+		let mut q = db.query();
+		let (p, f) = (q.var("?p"), q.var("?f"));
+		let body = vec![q.pattern_clause(f.clone(), "person/city", "Haifa").unwrap(), q.pattern_clause(p.clone(), "person/follows", f.clone()).unwrap()];
+		let not = q.not(Some(&[p.clone()]), body).unwrap();
+		assert!(matches!(&not, Clause::Not { join, .. } if *join == vec![0]));
+		q.add_clause(not).unwrap();
+		assert_eq!(q.plan().pending, vec![0]);
+		assert_eq!(q.run(&[p.clone()]).err(), Some(Error::Unbound("?p".into())));
+		q.pattern(p.clone(), "person/city", "Austin").unwrap();
+		assert!(q.plan().pending.is_empty());
+		assert_eq!(q.plan().order, vec![1, 0]);
+		// The people of Austin who follow nobody in Haifa (the body's ?f is its own)
+		let want = sorted(people.iter().filter(|&&e| city(e) == Value::from("Austin") && follows(e).iter().all(|&g| city(g) != Value::from("Haifa"))).map(|&e| r(e)));
+		assert!(!want.is_empty() && want.len() < people.len() / 3);
+		assert_eq!(q.run(&[p.clone()]).unwrap(), want);
+		assert_eq!(q.run_in_order(&[0, 1], &[p.clone()]).err(), Some(Error::Unbound("?p".into())));
+
+		// A binding or as the only binder, and a filtering or (one branch doesn't bind ?p)
+		let mut q = db.query();
+		let (p, a) = (q.var("?p"), q.var("?a"));
+		let young = vec![q.pattern_clause(p.clone(), "person/age", a.clone()).unwrap(), Clause::pred(a.clone(), Cmp::Lt, 20)];
+		let haifa = vec![q.pattern_clause(p.clone(), "person/city", "Haifa").unwrap()];
+		let or = q.or(Some(&[p.clone()]), vec![young.clone(), haifa.clone()]).unwrap();
+		assert_eq!(or.needs_binds(), (vec![], vec![0]));
+		q.add_clause(or).unwrap();
+		let want = sorted(people.iter().filter(|&&e| age(e) < 20 || city(e) == Value::from("Haifa")).map(|&e| r(e)));
+		assert_eq!(q.run(&[p.clone()]).unwrap(), want);
+		let mut q = db.query();
+		let (p, a) = (q.var("?p"), q.var("?a"));
+		let filter = q.or(Some(&[p.clone()]), vec![vec![Clause::pred(p.clone(), Cmp::Eq, Value::Ref(people[3]))], haifa.clone()]).unwrap();
+		assert_eq!(filter.needs_binds(), (vec![0], vec![]));
+		q.add_clause(filter).unwrap();
+		q.pattern(p.clone(), "person/age", a.clone()).unwrap();
+		assert_eq!(q.plan().order, vec![1, 0]);
+		let want = sorted(people.iter().filter(|&&e| e == people[3] || city(e) == Value::from("Haifa")).map(|&e| r(e)));
+		assert_eq!(q.run(&[p.clone()]).unwrap(), want);
+
+		// Validation
+		let mut q = db.query();
+		let (p, a, n, other) = (q.var("?p"), q.var("?a"), q.var("?n"), Term::Var(7));
+		let name = q.pattern_clause(p.clone(), "person/name", n.clone()).unwrap();
+		let aged = q.pattern_clause(p.clone(), "person/age", a.clone()).unwrap();
+		assert!(matches!(q.or(None, vec![vec![name.clone()], vec![aged.clone()]]), Err(Error::InvalidQuery(_))));
+		assert!(matches!(q.not(None, vec![]), Err(Error::InvalidQuery(_))));
+		assert!(matches!(q.or(None, vec![]), Err(Error::InvalidQuery(_))));
+		assert!(matches!(q.or(Some(&[p.clone()]), vec![vec![]]), Err(Error::InvalidQuery(_))));
+		assert!(matches!(q.not(Some(&[Term::from(1)]), vec![aged.clone()]), Err(Error::InvalidQuery(_))));
+		// A body's predicate on a variable that only the query outside binds is unbound in the body
+		assert_eq!(q.not(Some(&[p.clone()]), vec![name.clone(), Clause::pred(a.clone(), Cmp::Gt, 3)]).err(), Some(Error::Unbound("?a".into())));
+		assert!(matches!(q.pred(other.clone(), Cmp::Gt, 3), Err(Error::InvalidQuery(_))));
+		assert!(matches!(q.pattern(other.clone(), "person/age", 3), Err(Error::InvalidQuery(_))));
+		assert!(matches!(q.run(&[Term::Var(99)]), Err(Error::InvalidQuery(_))));
+		assert!(q.clauses().is_empty());
+	}
+
+	// Aggregates against a hand grouping of the plain answer
+	#[test]
+	fn aggregates_match_a_grouping()
+	{
+		use crate::db::tests::random_conn;
+		// The ages of the people followed from each city, apart by the followed person (?f) or not
+		let conn = social(60);
+		let db = conn.db();
+		let mut q = db.query();
+		let (c, p, f, v) = (q.var("?c"), q.var("?p"), q.var("?f"), q.var("?v"));
+		q.pattern(p.clone(), "person/city", c.clone()).unwrap();
+		q.pattern(p.clone(), "person/follows", f.clone()).unwrap();
+		q.pattern(f.clone(), "person/age", v.clone()).unwrap();
+		let e = c;
+		let rows = q.run(&[e.clone(), v.clone(), f.clone()]).unwrap();
+		let aggs = [Agg::Count, Agg::CountDistinct, Agg::Sum, Agg::Min, Agg::Max, Agg::Avg];
+		let spec: Vec<Find> = [Find::Term(e.clone())].into_iter().chain(aggs.iter().map(|&a| Find::Agg(a, v.clone()))).collect();
+		let mut distinct_count_differs = false;
+		for with in [vec![f.clone()], vec![]]
+		{
+			// The tuples are distinct over [?e ?v] plus the with variables
+			let tuples: BTreeSet<Vec<Value>> = rows.iter().map(|r| r[..2 + with.len()].to_vec()).collect();
+			let mut groups: BTreeMap<Value, Vec<i64>> = BTreeMap::new();
+			for t in &tuples
+			{
+				let Value::Int(n) = t[1] else { unreachable!() };
+				groups.entry(t[0].clone()).or_default().push(n);
+			}
+			let want: Vec<Vec<Value>> = groups
+				.iter()
+				.map(|(k, ns)| {
+					let distinct = ns.iter().collect::<BTreeSet<_>>().len() as i64;
+					distinct_count_differs |= distinct != ns.len() as i64;
+					let sum: i64 = ns.iter().sum();
+					[k.clone()].into_iter().chain([ns.len() as i64, distinct, sum, *ns.iter().min().unwrap(), *ns.iter().max().unwrap(), sum.div_euclid(ns.len() as i64)].map(Value::Int)).collect()
+				})
+				.collect();
+			assert_eq!(want.len(), 3);
+			assert_eq!(q.find(&spec, &with).unwrap(), want, "with {with:?}");
+		}
+		assert!(distinct_count_differs, "the with variable should keep equal values apart");
+		// Without a plain term: one group, or no row at all
+		assert_eq!(q.find(&[Find::Agg(Agg::Count, f.clone())], &[]).unwrap(), vec![vec![Value::Int(rows.iter().map(|r| &r[2]).collect::<BTreeSet<_>>().len() as i64)]]);
+		let (conn, _) = random_conn(61, 60);
+		let db = conn.db();
+		let mut empty = db.query();
+		let x = empty.var("?x");
+		empty.pattern(x.clone(), "n", 999).unwrap();
+		assert!(empty.find(&[Find::Agg(Agg::Count, x.clone())], &[]).unwrap().is_empty());
+		// Aggregates in any position, of any type for min and max; sum and avg take Ints only
+		let mut q = db.query();
+		let (e, t) = (q.var("?e"), q.var("?t"));
+		q.pattern(e.clone(), "tag", t.clone()).unwrap();
+		let pairs = q.run(&[e.clone(), t.clone()]).unwrap();
+		let mut want: BTreeMap<Value, (Value, i64)> = BTreeMap::new();
+		for p in &pairs
+		{
+			let w = want.entry(p[0].clone()).or_insert((p[1].clone(), 0));
+			w.0 = w.0.clone().max(p[1].clone());
+			w.1 += 1;
+		}
+		let want: Vec<Vec<Value>> = sorted(want.into_iter().map(|(k, (m, n))| vec![m, k, Value::Int(n)]));
+		assert_eq!(q.find(&[Find::Agg(Agg::Max, t.clone()), Find::Term(e.clone()), Find::Agg(Agg::Count, t.clone())], &[]).unwrap(), want);
+		assert!(matches!(q.find(&[Find::Agg(Agg::Sum, t.clone())], &[]), Err(Error::InvalidQuery(_))));
+		assert_eq!(Agg::Avg.apply(&[&Value::Int(-1), &Value::Int(0)]), Ok(Value::Int(-1)));
+		assert!(matches!(Agg::Sum.apply(&[&Value::Int(i64::MAX), &Value::Int(1)]), Err(Error::InvalidQuery(_))));
+		assert_eq!(Agg::Sum.apply(&[&Value::Int(i64::MAX), &Value::Int(1), &Value::Int(-2)]), Ok(Value::Int(i64::MAX - 1)));
 	}
 
 	fn val(v: impl Into<Value>) -> PullValue

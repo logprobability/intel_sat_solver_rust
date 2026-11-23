@@ -4,8 +4,9 @@
 //!   (a set of assertions and retractions, with upserts, lookup refs, `retract_entity` and a reified transaction entity) and returns a new value,
 //!   and `Conn` keeps every past value (`as_of`) at the cost of the changed index paths only. Every value also holds its history
 //!   (every assertion and retraction, with its transaction), which the `history()` and `since(t)` views expose.
-//! * `query`: Datalog-style conjunctive queries (patterns and comparison predicates, over any view), planned online while they are assembled,
-//!   and `Db::pull`, which reads an entity as a tree.
+//! * `query`: Datalog-style queries (patterns, comparison predicates, `not`/`not-join`, `or`/`or-join`, over any view), planned online while
+//!   they are assembled, with aggregates in the find spec; and `Db::pull`, which reads an entity as a tree.
+//! * `parse`: the text syntax of queries (a subset of Datomic's Datalog, in EDN), read into the query builder (`Db::q`).
 //! * `planner`: the incremental SAT encoding of the join-order problem (see its documentation).
 //! * `pmap`: the persistent sorted map under the indexes.
 //!
@@ -22,20 +23,26 @@
 //! let mut q = conn.db().query();
 //! let (p, name, age) = (q.var("?p"), q.var("?name"), q.var("?age"));
 //! q.pattern(p.clone(), "person/age", age.clone()).unwrap();
-//! q.pred(age.clone(), Cmp::Gt, 40);
+//! q.pred(age.clone(), Cmp::Gt, 40).unwrap();
 //! q.pattern(p.clone(), "person/name", name.clone()).unwrap();
 //! assert_eq!(q.run(&[name]).unwrap(), vec![vec![Value::from("Bob")]]);
 //! assert!(q.plan().optimal);
+//!
+//! // The same query as text, with an input and an aggregate
+//! let text = "[:find (count ?p) :in $ ?min :where [?p :person/age ?age] [(> ?age ?min)] (not [?p :person/name \"Carol\"])]";
+//! assert_eq!(conn.db().q(text, &[Value::from(20)]).unwrap(), vec![vec![Value::from(2)]]);
 //! ```
 
 pub mod db;
+pub mod parse;
 pub mod planner;
 pub mod pmap;
 pub mod query;
 
 pub use db::{Attr, AttrId, AttrStats, Cardinality, Conn, Datom, Db, Eid, Entity, Error, Tx, TxReport, TxValue, Unique, Value, ValueType, T, TX_INSTANT};
+pub use parse::TextQuery;
 pub use planner::{Plan, PlanSource};
-pub use query::{Clause, Cmp, Pull, PullValue, Pulled, Query, Term};
+pub use query::{Agg, Clause, Cmp, Find, Pull, PullValue, Pulled, Query, Term};
 
 #[cfg(test)]
 pub(crate) mod testutil

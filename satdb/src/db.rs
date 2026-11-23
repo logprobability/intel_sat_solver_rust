@@ -210,10 +210,15 @@ pub enum Error
 	InstantBackwards { previous: i64, got: i64 },
 	/// A transaction against a history or `since` view, or a pull from a history view
 	FilteredDb,
-	/// A variable used by a predicate or in the find list, but bound by no pattern of the query
+	/// A variable that must be bound (by a predicate, a `not`, a filtering `or`, or the find list) but that no clause binds before it is needed
 	Unbound(String),
 	/// The SAT planner was disabled after a solver error; the message is the solver's explanation
 	Planner(String),
+	/// A query that is malformed beyond its terms' types: a variable of another query, `or` branches over different variables,
+	/// an empty `not` or `or`, the wrong number of inputs, or an aggregate over values it can't combine
+	InvalidQuery(String),
+	/// A syntax error in a text query, at a 1-based line and column (in characters)
+	Parse { line: usize, col: usize, msg: String },
 }
 
 impl fmt::Display for Error
@@ -237,8 +242,10 @@ impl fmt::Display for Error
 			Error::CardinalityConflict { e, attr, values } => write!(f, "entity {e} gets two values of {attr}: {:?} and {:?}", values.0, values.1),
 			Error::InstantBackwards { previous, got } => write!(f, "transaction instant {got} is before the previous one, {previous}"),
 			Error::FilteredDb => write!(f, "a history or since view can't be transacted against, and a history view can't be pulled from"),
-			Error::Unbound(v) => write!(f, "variable {v} is bound by no pattern"),
+			Error::Unbound(v) => write!(f, "variable {v} is not bound where it is needed"),
 			Error::Planner(m) => write!(f, "planner error: {m}"),
+			Error::InvalidQuery(m) => write!(f, "invalid query: {m}"),
+			Error::Parse { line, col, msg } => write!(f, "parse error at {line}:{col}: {msg}"),
 		}
 	}
 }
@@ -583,6 +590,12 @@ impl Db
 	pub fn attr(&self, a: AttrId) -> &Attr
 	{
 		self.attrs.get(&a).expect("attribute ids come from this database")
+	}
+
+	/// The attribute with id `a`, if this database defines it
+	pub fn try_attr(&self, a: AttrId) -> Option<&Attr>
+	{
+		self.attrs.get(&a)
 	}
 
 	/// The transaction entity of basis `t` (None for t = 0 and for a future t)
@@ -1206,7 +1219,7 @@ pub(crate) mod tests
 		let mut q = conn.db().query();
 		let (t, i) = (q.var("?tx"), q.var("?i"));
 		q.pattern(t.clone(), TX_INSTANT, i.clone()).unwrap();
-		q.pred(i.clone(), crate::Cmp::Ge, 100);
+		q.pred(i.clone(), crate::Cmp::Ge, 100).unwrap();
 		let got = q.run(&[t, i]).unwrap();
 		assert_eq!(got, vec![vec![Value::Ref(r1.tx), Value::Int(100)], vec![Value::Ref(r2.tx), Value::Int(100)], vec![Value::Ref(r3.tx), Value::Int(250)]]);
 	}

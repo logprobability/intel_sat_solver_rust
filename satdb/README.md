@@ -27,8 +27,22 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   validated before anything is pulled.
 * **Persistent indexes** (`src/pmap.rs`). A treap with `Arc`-shared nodes and hash-of-key priorities: an update copies one root-to-leaf path,
   and the tree's shape depends on its key set only.
-* **Queries** (`src/query.rs`). Datalog-style conjunctions of patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`)
-  and comparison predicates, over any view, run as nested loops, each pattern using the index selected by its bound positions.
+* **Queries** (`src/query.rs`). Datalog-style queries over any view: patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`),
+  comparison predicates, `not`/`not-join` and `or`/`or-join` (nested to any depth), run as nested loops, each pattern using the index selected by its bound positions.
+  * `not` keeps the rows for which its body has no solution; its join variables (all of its body's, or the `not-join` list) must be bound when it runs,
+    and the body's other variables are its own. `or` is the union of its branches on its join variables (the branches' variables, which must be
+    the same in every branch, or the `or-join` list). An `or` whose every branch binds every join variable by itself *binds* them, like a pattern;
+    any other `or` is a filter, which needs them bound, like a `not`.
+  * To the SAT planner, a filter is a clause that needs its join variables (like a predicate: pending until they have binders) and a binding `or`
+    is a clause that binds them, at a cost estimated from its branches; no clause both needs and binds, which keeps the encoding sound.
+    Each run plans the bodies once (with the SAT planner, within a budget), counting the join variables bound where they run as constants,
+    and runs them in an environment of their own.
+  * Find specs (`Query::find`) take plain terms and the aggregates `count`, `count-distinct`, `sum`, `min`, `max` and `avg`, grouped by the plain terms,
+    over the distinct tuples of the find and `with` variables, as in Datomic. There is no floating-point type, so `avg` is the integer mean rounded down.
+* **Text queries** (`src/parse.rs`). `Db::q(text, inputs)` reads a subset of Datomic's Datalog in EDN into the builder, clause by clause (so it is planned
+  as it is read): `[:find ?a (count ?b) :with ?c :in $ ?x :where [?e :attr ?v] [(> ?v ?x)] (not ...) (or-join [?e] ... (and ...))]`, with `_`,
+  2- to 5-element patterns, lookup refs `[:attr value]`, string, integer and boolean constants, and scalar inputs, which become constants of the query.
+  Syntax errors carry their line and column; keywords only name attributes (there is no keyword value type).
 * **The planner** (`src/planner.rs`). It chooses the join order with one incremental SAT solver per query, *while the query is being assembled*:
   every added clause extends the encoding (nothing is retracted) and is followed by a short, conflict-bounded refinement, so a good plan exists
   before the query is complete, and `run` finishes the optimization. The module documentation has the details; in short:
@@ -48,14 +62,21 @@ The crate depends on the solver by path (`../rust`), with the solver's profiles 
 
     cargo test              # unit tests, incl. the planner against brute force (every order of random queries of up to 6 clauses),
                             # transactions and retract_entity against naive reference models, the history and since views of
-                            # every past value against the transactions' logs, history queries and pull against brute force
+                            # every past value against the transactions' logs, history queries and pull against brute force,
+                            # random queries with (nested) not and or in every clause order against a bottom-up relational
+                            # evaluator, aggregates against a hand grouping, and text queries against the builder
     cargo test --release
 
 ## Status and next steps
 
 This is a start. What is missing, roughly in order of value:
 
-* Rules/recursion, aggregates, `not`/`or` clauses, and a Datalog text syntax (queries are built through the Rust API).
+* Query language: rules and recursion; `or-join` with required variables (`[[?a] ?b]`: a clause that both needs and binds, which the planner's
+  encoding would have to support: a binder's boundness justified only when its own requirements hold, pending computed as a fixpoint, and the
+  brute-force test extended to such clauses); attribute variables in patterns; function and binding expressions (`[(f ?x) ?y]`);
+  collection, tuple and relation inputs and `%` rules in `:in`; scalar/collection find specs (`.`, `...`) and pull in the find spec;
+  a floating-point value type (for a true `avg`, and `median`/`variance`). The cost model doesn't see inside `not` and `or`
+  (a `not` has a fixed selectivity, a binding `or` the cost of its branches with nothing bound).
 * Time: `as_of` on a `Db` (today `Conn` keeps every past value; the history indexes would allow a filter instead) and by transaction
   entity or instant, a transaction-log API (Datomic's `tx-range`), and the planner's estimates for a `since` view (it uses the whole database's).
   In a history view, the current-state accessors (`values`, `lookup`, ...) still read the current datoms; only scans and queries see the history.

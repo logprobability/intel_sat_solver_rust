@@ -39,6 +39,12 @@ pub(crate) fn weight_of_fanout(f: f64) -> u32
 	((l * SCALE).round() as i64 + SHIFT) as u32
 }
 
+/// The fanout that a weight stands for (the inverse of `weight_of_fanout`, up to its rounding and clamping)
+pub(crate) fn fanout_of_weight(w: u32) -> f64
+{
+	((w as i64 - SHIFT) as f64 / SCALE).exp2()
+}
+
 /// Make mode weights non-increasing as slots become bound
 pub(crate) fn monotone(mut w: [u32; 4]) -> [u32; 4]
 {
@@ -64,7 +70,7 @@ pub(crate) struct ClauseShape
 
 impl ClauseShape
 {
-	fn mode(&self, bound: &[bool]) -> usize
+	pub(crate) fn mode(&self, bound: &[bool]) -> usize
 	{
 		let b = |s: Option<VarId>| s.map_or(true, |v| bound[v]);
 		b(self.slots[0]) as usize | (b(self.slots[1]) as usize) << 1
