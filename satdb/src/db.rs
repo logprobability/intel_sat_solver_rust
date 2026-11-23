@@ -680,7 +680,8 @@ pub(crate) struct TxRecord
 
 impl TxReport
 {
-	/// The record of this transaction for the durable log
+	/// The record of this transaction for the durable log (the tests compare it with what the connection logged)
+	#[cfg(test)]
 	pub(crate) fn record(&self) -> TxRecord
 	{
 		let (before, after) = (&self.db_before, &self.db_after);
@@ -693,6 +694,53 @@ impl TxReport
 		};
 		let changes = |added: bool| self.tx_data[1..].iter().filter(|d| d.added == added).map(|d| (d.e, d.a, d.v.clone())).collect();
 		TxRecord { basis_t: after.basis_t, tx: self.tx, next_eid: after.next_eid, instant, attrs, retracted: changes(false), asserted: changes(true) }
+	}
+}
+
+/// A transaction that `Db::plan` accepted: the value with its schema, basis and entity ids updated (still sharing the indexes of the value
+/// before it), and the changes that `finish` applies, which can't fail
+struct Planned
+{
+	db: Db,
+	tx: Eid,
+	instant: i64,
+	retracted: Vec<(Eid, AttrId, Value)>,
+	asserted: Vec<(Eid, AttrId, Value)>,
+	tempids: Vec<Eid>,
+	lookups: Vec<Eid>,
+	tx_id: u64,
+}
+
+impl Planned
+{
+	/// The record of the transaction for the durable log, given the value before it
+	fn record(&self, before: &Db) -> TxRecord
+	{
+		let after = &self.db;
+		// The attributes the transaction defined or altered
+		let attrs = (0..after.attrs.len() as AttrId).filter(|&a| before.try_attr(a) != Some(after.attr(a))).map(|a| (a, after.attr(a).clone())).collect();
+		TxRecord {
+			basis_t: after.basis_t,
+			tx: self.tx,
+			next_eid: after.next_eid,
+			instant: self.instant,
+			attrs,
+			retracted: self.retracted.clone(),
+			asserted: self.asserted.clone(),
+		}
+	}
+
+	/// Apply the changes: in place, for the indexes that no other value shares (see `pmap`)
+	fn finish(self, db_before: Db) -> TxReport
+	{
+		let Planned { mut db, tx, instant, retracted, asserted, tempids, lookups, tx_id } = self;
+		db.apply(tx, instant, &retracted, &asserted);
+		let instant_attr = db.attr_id(TX_INSTANT).expect("built in");
+		let datom = |(e, a, v): (Eid, AttrId, Value), added: bool| Datom { e, a, v, tx, added };
+		let mut tx_data = vec![datom((tx, instant_attr, Value::Instant(instant)), true)];
+		tx_data.extend(retracted.into_iter().map(|d| datom(d, false)));
+		tx_data.extend(asserted.into_iter().map(|d| datom(d, true)));
+		TxReport { db_before, db_after: db, tx, tempids, lookups, tx_data, tx_id }
 	}
 }
 
@@ -1141,6 +1189,13 @@ impl Db
 
 	pub fn transact(&self, tx: &Tx) -> Result<TxReport, Error>
 	{
+		Ok(self.plan(tx)?.finish(self.clone()))
+	}
+
+	// Phases 1 to 5 and the checks of 6 (see the module documentation): everything that can fail, without changing any index.
+	// The planned value shares this one's indexes until `Planned::finish` applies the changes
+	fn plan(&self, tx: &Tx) -> Result<Planned, Error>
+	{
 		if self.history || self.since != 0 || self.upto.is_some()
 		{
 			return Err(Error::FilteredDb);
@@ -1365,7 +1420,7 @@ impl Db
 			prev = Some(d);
 		}
 
-		// Phase 6: apply, then check the unique attributes
+		// Phase 6: the changes, and the unique attributes checked on the result before anything is applied
 		let mut retracted: BTreeSet<(Eid, AttrId, Value)> = rets.into_iter().filter(|(e, a, v)| self.has(*e, *a, v)).collect();
 		for (e, a, v) in &adds
 		{
@@ -1375,21 +1430,22 @@ impl Db
 			}
 		}
 		let asserted: Vec<(Eid, AttrId, Value)> = adds.into_iter().filter(|(e, a, v)| !self.has(*e, *a, v)).collect();
-		let retracted: Vec<(Eid, AttrId, Value)> = retracted.into_iter().collect();
-		db.apply(tx_eid, instant, &retracted, &asserted);
-		for (_, a, v) in &asserted
+		// The holders of a unique value after the transaction: those before it that keep it, and those that get it
+		let mut gets: HashMap<(AttrId, &Value), Vec<Eid>> = HashMap::new();
+		for (e, a, v) in asserted.iter().filter(|(_, a, _)| db.attr(*a).unique.is_some())
 		{
-			if db.attr(*a).unique.is_some() && db.entities(*a, v).nth(1).is_some()
+			gets.entry((*a, v)).or_default().push(*e);
+		}
+		for ((a, v), new) in &gets
+		{
+			let kept = self.entities(*a, v).filter(|x| !retracted.contains(&(*x, *a, (*v).clone()))).count();
+			if kept + new.len() > 1
 			{
-				return Err(Error::UniqueConflict { attr: db.attr_name(*a), value: v.clone() });
+				return Err(Error::UniqueConflict { attr: db.attr_name(*a), value: (*v).clone() });
 			}
 		}
-		let instant_attr = db.attr_id(TX_INSTANT).expect("built in");
-		let datom = |(e, a, v): (Eid, AttrId, Value), added: bool| Datom { e, a, v, tx: tx_eid, added };
-		let mut tx_data = vec![datom((tx_eid, instant_attr, Value::Instant(instant)), true)];
-		tx_data.extend(retracted.into_iter().map(|d| datom(d, false)));
-		tx_data.extend(asserted.into_iter().map(|d| datom(d, true)));
-		Ok(TxReport { db_before: self.clone(), db_after: db, tx: tx_eid, tempids, lookups, tx_data, tx_id: tx.id })
+		drop(gets);
+		Ok(Planned { db, tx: tx_eid, instant, retracted: retracted.into_iter().collect(), asserted, tempids, lookups, tx_id: tx.id })
 	}
 
 	fn define(&mut self, def: &Attr) -> Result<(), Error>
@@ -1801,15 +1857,24 @@ impl Conn
 		self.db.clone()
 	}
 
-	/// Apply a transaction; on a durable connection, it returns once the transaction's record is appended to the log and synced
+	/// Apply a transaction; on a durable connection, it returns once the transaction's record is appended to the log and synced.
+	///
+	/// The history already keeps every past value (each change is stored with its transaction: the *fat-node* method of partial
+	/// persistence), so the connection doesn't also keep the value before the transaction by path copying: it plans the transaction
+	/// (everything that can fail), lets go of its value, and applies the changes to the indexes in place, unless something else
+	/// (a value a caller holds, a report) still shares them. The report's `db_before` is an `as_of` view of the new value.
 	pub fn transact(&mut self, tx: &Tx) -> Result<TxReport, Error>
 	{
-		let report = self.db.transact(tx)?;
+		let planned = self.db.plan(tx)?;
 		// Durable before it is visible: a transaction whose append fails isn't committed
 		if let Some(log) = &mut self.log
 		{
-			log.append(&report.record())?;
+			log.append(&planned.record(&self.db))?;
 		}
+		let t = self.db.basis_t;
+		self.db = Db::default();
+		let mut report = planned.finish(Db::default());
+		report.db_before = report.db_after.as_of(t).expect("an earlier basis");
 		self.db = report.db_after.clone();
 		Ok(report)
 	}
@@ -2908,7 +2973,7 @@ pub(crate) mod tests
 		// An alteration is recorded for the durable log, and replays to the same value
 		let mut tx = Tx::new();
 		tx.alter_attr(Attr::new("person/email", ValueType::Str, Cardinality::One));
-		let rep = conn.transact(&tx).unwrap();
+		let rep = conn.db().transact(&tx).unwrap();
 		let email = conn.db().attr_id("person/email").unwrap();
 		assert_eq!(rep.record().attrs, vec![(email, Attr::new("person/email", ValueType::Str, Cardinality::One))]);
 		assert_same_db(&rep.db_before.clone().replay(&rep.record()).unwrap(), &rep.db_after, "replayed alteration");
