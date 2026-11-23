@@ -288,7 +288,7 @@ impl TULitSpan for Span<TULit>
 }
 
 // The custom min_element of the solver: the index of the first element in [first, last) with the minimal value (or last, if the range is empty)
-#[inline(always)]
+#[inline]
 pub fn min_element<S: TULitSpan, V: PartialOrd>(lits: S, mut first: usize, last: usize, mut get_val: impl FnMut(TULit) -> V) -> usize
 {
 	if first == last
@@ -313,7 +313,7 @@ pub fn min_element<S: TULitSpan, V: PartialOrd>(lits: S, mut first: usize, last:
 }
 
 // The custom max_element of the solver: the index of the first element in [first, last) with the maximal value (or last, if the range is empty)
-#[inline(always)]
+#[inline]
 pub fn max_element<S: TULitSpan, V: PartialOrd>(lits: S, mut first: usize, last: usize, mut get_val: impl FnMut(TULit) -> V) -> usize
 {
 	if first == last
@@ -338,7 +338,7 @@ pub fn max_element<S: TULitSpan, V: PartialOrd>(lits: S, mut first: usize, last:
 }
 
 // std::min_element with a "less" comparator: the index of the first minimal element in [first, last) (or last, if the range is empty)
-#[inline(always)]
+#[inline]
 pub fn std_min_element<S: TULitSpan>(lits: S, mut first: usize, last: usize, mut less: impl FnMut(TULit, TULit) -> bool) -> usize
 {
 	if first == last
@@ -360,7 +360,7 @@ pub fn std_min_element<S: TULitSpan>(lits: S, mut first: usize, last: usize, mut
 }
 
 // Moves the elements in [first, last), for which p doesn't hold, to the beginning of the range by swapping; returns the index of the new logical end
-#[inline(always)]
+#[inline]
 pub fn move_if<S: TULitSpan>(lits: S, mut first: usize, last: usize, mut p: impl FnMut(TULit) -> bool) -> usize
 {
 	while first != last && !p(lits.get(first))
@@ -819,7 +819,7 @@ impl TCompressedClss
 	}
 
 	// The first existing hash-id, which is greater than or equal to i; BCTableSize stands for end()
-	#[inline(always)]
+	#[inline]
 	pub fn lower_bound(&self, mut i: usize) -> usize
 	{
 		while i < BCTableSize && self.m_Table[i].is_null()

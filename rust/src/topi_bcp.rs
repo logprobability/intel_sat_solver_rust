@@ -485,7 +485,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 	// The DisEmplaceBack lambda of ProcessDelayedImplication, where the statistics to increment is
 	// m_Stat.m_DelayedImplicationsTrigerring, if isTrigerring holds, and m_Stat.m_DelayedImplicationsPropagated, otherwise
-	#[inline(always)]
+	#[inline]
 	fn DisEmplaceBack(&mut self, diL: TULit, otherWatch: TULit, parentClsInd: Ind, isTrigerring: bool)
 	{
 		debug_assert!(self.NV(2) || self.P(&("+++++++++++++++ ProcessDelayedImplication adding new literal: diL=".to_string() +
@@ -505,7 +505,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	}
 
 	// The SwapWatchWithMaxNonWLIfRequired lambda of ProcessDelayedImplication
-	#[inline(always)]
+	#[inline]
 	fn SwapWatchWithMaxNonWLIfRequired(&mut self, ciParentClsInd: Ind, ciSpan: TSpanTULit, watchInd: bool)
 	{
 		let cls = self.Cls(ciParentClsInd);
