@@ -404,11 +404,10 @@ impl CStringStream
 }
 
 // Returns the variable list and the error message (empty, if there is no error)
-fn ReadCommaSeparatedVarList(errMsg: &mut String, s: &[u8]) -> Vec<TLit>
+// The C++ version returns the list and the error message (empty if none) in an output parameter
+fn ReadCommaSeparatedVarList(s: &[u8]) -> Result<Vec<TLit>, String>
 {
 	let mut varList: Vec<TLit> = Vec::new();
-	// The outer stream of the C++ version, which holds the error message
-	let mut ssOuter = String::new();
 
 	// try
 	{
@@ -433,16 +432,13 @@ fn ReadCommaSeparatedVarList(errMsg: &mut String, s: &[u8]) -> Vec<TLit>
 				None =>
 				{
 					// catch (...)
-					ssOuter += &format!("c ERROR: couldn't convert {} to a variable list\n", String::from_utf8_lossy(s));
-					break;
+					return Err(format!("c ERROR: couldn't convert {} to a variable list\n", String::from_utf8_lossy(s)));
 				}
 			}
 		}
 	}
 
-	*errMsg = ssOuter;
-
-	varList
+	Ok(varList)
 }
 
 // The line, which is currently being parsed (a 0-terminated C string in the C++ version)
@@ -673,59 +669,30 @@ impl<'a> CToporTool<'a>
 		}
 	}
 
-	fn ReadBoolParam(errMsg: &mut String, paramValStr: &str) -> bool
+	// The C++ versions return the value and the error message (empty if none) in an output parameter
+	fn ReadBoolParam(paramValStr: &str) -> Result<bool, String>
 	{
-		let mut intVal = 0;
-		let mut ss = String::new();
 		match stoi(paramValStr)
 		{
-			Some(v) => intVal = v,
-			None => ss += &format!("c ERROR: couldn't convert {} to an integer\n", paramValStr),
+			None => Err(format!("c ERROR: couldn't convert {} to an integer\n", paramValStr)),
+			Some(intVal @ (0 | 1)) => Ok(intVal != 0),
+			Some(_) => Err(format!("c ERROR: {} must be 0 or 1\n", paramValStr)),
 		}
-
-		if intVal != 0 && intVal != 1
-		{
-			ss += &format!("c ERROR: {} must be 0 or 1\n", paramValStr);
-		}
-
-		*errMsg = ss;
-
-		intVal != 0
 	}
 
-	fn Read0to2Param(errMsg: &mut String, paramValStr: &str) -> u8
+	fn Read0to2Param(paramValStr: &str) -> Result<u8, String>
 	{
-		let mut intVal = 0;
-		let mut ss = String::new();
 		match stoi(paramValStr)
 		{
-			Some(v) => intVal = v,
-			None => ss += &format!("c ERROR: couldn't convert {} to an integer\n", paramValStr),
+			None => Err(format!("c ERROR: couldn't convert {} to an integer\n", paramValStr)),
+			Some(intVal @ 0..=2) => Ok(intVal as u8),
+			Some(_) => Err(format!("c ERROR: {} must be 0 or 1 or 2\n", paramValStr)),
 		}
-
-		if intVal != 0 && intVal != 1 && intVal != 2
-		{
-			ss += &format!("c ERROR: {} must be 0 or 1 or 2\n", paramValStr);
-		}
-
-		*errMsg = ss;
-
-		intVal as u8
 	}
 
-	fn ReadULongParam(errMsg: &mut String, paramValStr: &str) -> u64
+	fn ReadULongParam(paramValStr: &str) -> Result<u64, String>
 	{
-		let mut ulVal = 0;
-		let mut ss = String::new();
-		match stoul(paramValStr)
-		{
-			Some(v) => ulVal = v,
-			None => ss += &format!("c ERROR: couldn't convert {} to an unsigned long\n", paramValStr),
-		}
-
-		*errMsg = ss;
-
-		ulVal
+		stoul(paramValStr).ok_or_else(|| format!("c ERROR: couldn't convert {} to an unsigned long\n", paramValStr))
 	}
 
 	// Returns true iff there is an error
@@ -744,138 +711,56 @@ impl<'a> CToporTool<'a>
 			if paramNameStr.as_bytes().get(..std::cmp::min(ttPrefixLen, paramNameStr.len())) == Some(b"/topor_tool/")
 			{
 				let param = &paramNameStr[ttPrefixLen..];
-				if param == "bin_drat_file"
-				{
-					self.dratName = paramValStr.to_string();
-					self.isDratBinary = true;
-					coutln!(self.out, "c /topor_tool/bin_drat_file {}", self.dratName);
-				}
-				else if param == "text_drat_file"
-				{
-					self.dratName = paramValStr.to_string();
-					self.isDratBinary = false;
-					coutln!(self.out, "c /topor_tool/text_drat_file {}", self.dratName);
-				}
-				else if param == "drat_sort_every_clause"
-				{
-					coutln!(self.out, "c /topor_tool/drat_sort_every_clause {}", paramValStr);
-					let mut errMsg = String::new();
-					self.dratSortEveryClause = Self::ReadBoolParam(&mut errMsg, paramValStr);
-					if !errMsg.is_empty()
-					{
-						cout!(self.out, "{}", errMsg);
-						return true;
-					}
-				}
-				else if param == "print_model"
-				{
-					coutln!(self.out, "c /topor_tool/print_model {}", paramValStr);
-					let mut errMsg = String::new();
-					self.printModel = Self::ReadBoolParam(&mut errMsg, paramValStr);
-					if !errMsg.is_empty()
-					{
-						cout!(self.out, "{}", errMsg);
-						return true;
-					}
-				}
-				else if param == "print_ucore"
-				{
-					coutln!(self.out, "c /topor_tool/print_ucore {}", paramValStr);
-					let mut errMsg = String::new();
-					self.printUcore = Self::ReadBoolParam(&mut errMsg, paramValStr);
-					if !errMsg.is_empty()
-					{
-						cout!(self.out, "{}", errMsg);
-						return true;
-					}
-				}
-				else if param == "verify_model"
-				{
-					coutln!(self.out, "c /topor_tool/verify_model {}", paramValStr);
-					let mut errMsg = String::new();
-					self.verifyModel = Self::ReadBoolParam(&mut errMsg, paramValStr);
-					if !errMsg.is_empty()
-					{
-						cout!(self.out, "{}", errMsg);
-						return true;
-					}
-				}
-				else if param == "verify_ucore"
-				{
-					coutln!(self.out, "c /topor_tool/verify_ucore {}", paramValStr);
-					let mut errMsg = String::new();
-					self.verifyUcore = Self::ReadBoolParam(&mut errMsg, paramValStr);
-					if !errMsg.is_empty()
-					{
-						cout!(self.out, "{}", errMsg);
-						return true;
-					}
-				}
-				else if param == "ignore_file_params"
-				{
-					coutln!(self.out, "c /topor_tool/ignore_file_params {}", paramValStr);
-					let mut errMsg = String::new();
-					self.ignoreFileParams = Self::ReadBoolParam(&mut errMsg, paramValStr);
-					if !errMsg.is_empty()
-					{
-						cout!(self.out, "{}", errMsg);
-						return true;
-					}
-				}
-				else if param == "solver_mode"
-				{
-					coutln!(self.out, "c /topor_tool/solver_mode {}", paramValStr);
-					let mut errMsg = String::new();
-					self.type_indexing_and_compression = Self::Read0to2Param(&mut errMsg, paramValStr);
-					if !errMsg.is_empty()
-					{
-						cout!(self.out, "{}", errMsg);
-						return true;
-					}
 
-					if !self.AllToporsNull()
+				// Echoes the parameter, then stores the value read into the field, or prints the error and fails
+				macro_rules! ReadParam
+				{
+					($field:expr, $read:expr) =>
+					{{
+						coutln!(self.out, "c /topor_tool/{} {}", param, paramValStr);
+						match $read
+						{
+							Ok(val) => $field = val,
+							Err(errMsg) =>
+							{
+								cout!(self.out, "{}", errMsg);
+								return true;
+							}
+						}
+					}};
+				}
+
+				match param
+				{
+					"bin_drat_file" | "text_drat_file" =>
 					{
-						coutln!(self.out, "c topor_tool ERROR: /topor_tool/solver_mode should be provided before any other parameters");
+						self.dratName = paramValStr.to_string();
+						self.isDratBinary = param == "bin_drat_file";
+						coutln!(self.out, "c /topor_tool/{} {}", param, self.dratName);
+					}
+					"drat_sort_every_clause" => ReadParam!(self.dratSortEveryClause, Self::ReadBoolParam(paramValStr)),
+					"print_model" => ReadParam!(self.printModel, Self::ReadBoolParam(paramValStr)),
+					"print_ucore" => ReadParam!(self.printUcore, Self::ReadBoolParam(paramValStr)),
+					"verify_model" => ReadParam!(self.verifyModel, Self::ReadBoolParam(paramValStr)),
+					"verify_ucore" => ReadParam!(self.verifyUcore, Self::ReadBoolParam(paramValStr)),
+					"ignore_file_params" => ReadParam!(self.ignoreFileParams, Self::ReadBoolParam(paramValStr)),
+					"solver_mode" =>
+					{
+						ReadParam!(self.type_indexing_and_compression, Self::Read0to2Param(paramValStr));
+						if !self.AllToporsNull()
+						{
+							coutln!(self.out, "c topor_tool ERROR: /topor_tool/solver_mode should be provided before any other parameters");
+							return true;
+						}
+					}
+					"allsat_models_number" => ReadParam!(self.allsatModels, Self::ReadULongParam(paramValStr)),
+					"allsat_blocking_variables" => ReadParam!(self.blockingVars, ReadCommaSeparatedVarList(paramValStr.as_bytes())),
+					"allsat_blocking_variables_file_alg" => ReadParam!(self.allsatBlockingFromInstanceAlg, Self::ReadULongParam(paramValStr)),
+					_ =>
+					{
+						coutln!(self.out, "c ERROR: unrecognized /topor_tool/ parameter: {}", paramNameStr);
 						return true;
 					}
-				}
-				else if param == "allsat_models_number"
-				{
-					coutln!(self.out, "c /topor_tool/allsat_models_number {}", paramValStr);
-					let mut errMsg = String::new();
-					self.allsatModels = Self::ReadULongParam(&mut errMsg, paramValStr);
-					if !errMsg.is_empty()
-					{
-						cout!(self.out, "{}", errMsg);
-						return true;
-					}
-				}
-				else if param == "allsat_blocking_variables"
-				{
-					coutln!(self.out, "c /topor_tool/allsat_blocking_variables {}", paramValStr);
-					let mut errMsg = String::new();
-					self.blockingVars = ReadCommaSeparatedVarList(&mut errMsg, paramValStr.as_bytes());
-					if !errMsg.is_empty()
-					{
-						cout!(self.out, "{}", errMsg);
-						return true;
-					}
-				}
-				else if param == "allsat_blocking_variables_file_alg"
-				{
-					coutln!(self.out, "c /topor_tool/allsat_blocking_variables_file_alg {}", paramValStr);
-					let mut errMsg = String::new();
-					self.allsatBlockingFromInstanceAlg = Self::ReadULongParam(&mut errMsg, paramValStr);
-					if !errMsg.is_empty()
-					{
-						cout!(self.out, "{}", errMsg);
-						return true;
-					}
-				}
-				else
-				{
-					coutln!(self.out, "c ERROR: unrecognized /topor_tool/ parameter: {}", paramNameStr);
-					return true;
 				}
 			}
 			else
@@ -1069,9 +954,16 @@ impl<'a> CToporTool<'a>
 			// A comment
 			if self.allsatModels > 1 && self.allsatBlockingFromInstanceAlg > 0 && self.blockingVars.is_empty()
 			{
-				let mut errMsg = String::new();
 				let blockingVarsStr: &[u8] = if l.len >= 2 { &l.line[2..] } else { &[] };
-				self.blockingVars = ReadCommaSeparatedVarList(&mut errMsg, blockingVarsStr);
+				let errMsg = match ReadCommaSeparatedVarList(blockingVarsStr)
+				{
+					Ok(blockingVars) =>
+					{
+						self.blockingVars = blockingVars;
+						String::new()
+					}
+					Err(errMsg) => errMsg,
+				};
 				if !errMsg.is_empty() || self.blockingVars.is_empty()
 				{
 					return Err("c topor_tool ERROR: expected the first comment to contain blocking variables at line number ".to_string() + &lineNum.to_string() + ". Error message: " + &errMsg);
