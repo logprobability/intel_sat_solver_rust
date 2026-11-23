@@ -68,14 +68,14 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     records are replayed. Any other checkpoint is silently ignored and the log replayed in full: the log holds the data, the checkpoint is a cache.
     The rebuild is a second implementation of the indexes, which the tests compare with `transact`'s at every basis of random workloads.
 
-    Timings (release, transactions of 20 assertions, `cargo test --release open_timings -- --ignored --nocapture`; opening by replay costs
-    the path-copying inserts into every index, about 25 µs per datom at 50k transactions, which the bulk build avoids):
+    Timings (release, transactions of 20 assertions, `cargo test --release open_timings -- --ignored --nocapture`; opening by replay
+    inserts into every index, in place since replay owns the value, about 6 µs per datom at 50k transactions; the bulk build avoids that):
 
     | transactions | log      | open by replay | checkpoint written | open from the checkpoint |
     |--------------|----------|----------------|--------------------|--------------------------|
-    | 1,000        | 0.5 MB   | 139 ms         | 16 ms (0.7 MB)     | 16 ms                    |
-    | 10,000       | 5.0 MB   | 3.96 s         | 62 ms (6.9 MB)     | 252 ms                   |
-    | 50,000       | 25.1 MB  | 25.8 s         | 441 ms (34.5 MB)   | 1.20 s                   |
+    | 1,000        | 0.5 MB   | 36 ms          | 11 ms (0.7 MB)     | 10 ms                    |
+    | 10,000       | 5.0 MB   | 877 ms         | 44 ms (6.9 MB)     | 116 ms                   |
+    | 50,000       | 25.1 MB  | 6.12 s         | 242 ms (34.5 MB)   | 676 ms                   |
 * **Pull** (`src/query.rs`). `Db::pull(pattern, eid)` reads an entity as a tree (`Pulled`): attribute lists, the wildcard (which pulls
   components recursively, stopping at cycles), nested patterns for Ref attributes, and reverse refs through VAET (`Pull::reverse`, key `ns/_name`).
   Cardinality-one attributes and reverse components give one value, the others a list; absent attributes are left out. The pattern is
@@ -83,8 +83,37 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   `Pull::recurse(depth)` pulls the referenced entities by the enclosing pattern again, to a depth or (None) until an entity repeats on the
   path, where it stays a Ref (Datomic's `{:attr ...}` and `{:attr 3}`). `Db::pull_str` reads a pattern in Datomic's EDN syntax
   (`[:person/name * :person/_friend [:person/aka :limit 2 :as "aliases"] {:person/friend [:person/name]} {:person/boss ...}]`).
-* **Persistent indexes** (`src/pmap.rs`). A treap with `Arc`-shared nodes and hash-of-key priorities: an update copies one root-to-leaf path,
-  and the tree's shape depends on its key set only.
+* **Persistent indexes** (`src/pmap.rs`). A persistent B+-tree, as in DataScript's persistent-sorted-set and Rust's `im`, instead of the
+  first version's binary treap:
+  * wide nodes (`B` = 32 entries per leaf, 32 children per branch; 16 and 64 were measured and are slower), so an update copies about
+    log₃₂ n nodes rather than log₂ n, and scans read contiguous arrays;
+  * classic B+ separators (deletions never touch them), merging or rebalancing below half full, every leaf at one depth;
+  * in-place updates of nodes that no other version shares (`insert_mut`/`remove_mut` through `Arc::make_mut`: the "transient" idea of
+    Clojure, or the reuse of Perceus), so a transaction copies each path it touches once (the previous value stays valid) and then
+    updates it in place, and log replay, which owns its value, copies nothing;
+  * linear-time bulk loading with evenly filled nodes (`from_sorted`), which checkpoints use.
+
+  The tests check the tree's invariants after every operation of random workloads against `BTreeMap`, with every version kept and
+  compared again at the end, and that an in-place update copies exactly the nodes another version shares.
+
+  Timings (release, `cargo test --release index_timings -- --ignored --nocapture`, transactions of 20 assertions, a quarter of them on new entities):
+
+  | | treap | B+-tree, copying updates | B+-tree, in-place updates |
+  |---|---|---|---|
+  | 10,000 transactions | 5.21 s | 2.44 s | 1.36 s |
+  | 50,000 transactions | 31.9 s | 21.6 s | 14.8 s |
+  | 7,085 point reads (10k) | 6.9 ms | 3.5 ms | 3.0 ms |
+  | scan of an attribute (10k) | 1.5 ms | 0.59 ms | 0.52 ms |
+  | opening a log of 50k by replay | 25.8 s | | 6.12 s |
+  | opening it from a checkpoint | 1.20 s | | 0.68 s |
+
+  What a transaction still pays is copying, once, every leaf it touches in each of the nine indexes (the value before it stays valid, as
+  `TxReport::db_before`): with wide leaves that copy is most of the remaining time. A write-buffered tree (a persistent Bε-tree, which
+  batches updates in its branches) would cut it further.
+  The history and `as_of` are the dictionary case of retroactive data structures (Demaine, Iacono and Langerman, 2004/2007): each datom
+  is stored with the times it was asserted and retracted, which answers queries about any past time (their Theorem 6 remark). Changing the
+  past (inserting a transaction at an earlier time) would need their rollback method here, since cardinality-one and uniqueness make the
+  operations non-commutative.
 * **Queries** (`src/query.rs`). Datalog-style queries over any view: patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`),
   comparison predicates, `not`/`not-join` and `or`/`or-join` (nested to any depth) and rule calls (see Rules), run as nested loops, each pattern using the index selected by its bound positions.
   * `not` keeps the rows for which its body has no solution; its join variables (all of its body's, or the `not-join` list) must be bound when it runs,

@@ -876,8 +876,8 @@ impl Db
 		let (mut attrs, mut attr_ids) = (PMap::new(), PMap::new());
 		for ((a, _), def) in self.schema.iter().filter(|((_, at), _)| *at <= t)
 		{
-			attrs = attrs.insert(*a, def.clone());
-			attr_ids = attr_ids.insert(def.name.clone(), *a);
+			attrs.insert_mut(*a, def.clone());
+			attr_ids.insert_mut(def.name.clone(), *a);
 		}
 		// Transaction t + 1's entity is the first id it allocated (before its tempids)
 		let next_eid = self.txs.get(&(t + 1)).copied().unwrap_or(self.next_eid);
@@ -1164,7 +1164,7 @@ impl Db
 		// The transaction's entity is the first id it allocates (before its tempids): `as_of` relies on it for the next entity id of a past basis
 		let tx_eid = db.next_eid;
 		db.next_eid += 1;
-		db.txs = db.txs.insert(db.basis_t, tx_eid);
+		db.txs.insert_mut(db.basis_t, tx_eid);
 
 		// Phase 2: the lookup refs, against the data before the transaction (db has only its schema changes so far)
 		let lookups = tx
@@ -1450,17 +1450,17 @@ impl Db
 				prev = Some((v, *e));
 			}
 		}
-		self.schema = self.schema.insert((a, self.basis_t), def.clone());
-		self.attrs = self.attrs.insert(a, def.clone());
+		self.schema.insert_mut((a, self.basis_t), def.clone());
+		self.attrs.insert_mut(a, def.clone());
 		Ok(())
 	}
 
 	fn add_attr(&mut self, def: Attr)
 	{
 		let a = self.attrs.len() as AttrId;
-		self.attr_ids = self.attr_ids.insert(def.name.clone(), a);
-		self.schema = self.schema.insert((a, self.basis_t), def.clone());
-		self.attrs = self.attrs.insert(a, def);
+		self.attr_ids.insert_mut(def.name.clone(), a);
+		self.schema.insert_mut((a, self.basis_t), def.clone());
+		self.attrs.insert_mut(a, def);
 	}
 
 	fn attr_name(&self, a: AttrId) -> String
@@ -1490,8 +1490,9 @@ impl Db
 
 	/// Apply a transaction read back from the durable log: the database the transaction that wrote `rec` produced, if `self` is the database before it.
 	/// A record that doesn't fit (its basis, entity ids, schema, value types, a retraction of an absent datom, an assertion of a present one,
-	/// or a result that breaks cardinality or uniqueness) is refused with an explanation, so a corrupt record never produces an inconsistent value
-	pub(crate) fn replay(&self, rec: &TxRecord) -> Result<Db, String>
+	/// or a result that breaks cardinality or uniqueness) is refused with an explanation, so a corrupt record never produces an inconsistent value.
+	/// It consumes `self`, so the indexes, which no other value shares, are updated in place (log replay copies no paths)
+	pub(crate) fn replay(self, rec: &TxRecord) -> Result<Db, String>
 	{
 		debug_assert!(!self.history && self.since == 0 && self.upto.is_none(), "the log replays unfiltered values");
 		if rec.basis_t != self.basis_t + 1
@@ -1506,7 +1507,7 @@ impl Db
 		{
 			return Err(format!("instant {} before {}", rec.instant, self.instant));
 		}
-		let mut db = self.clone();
+		let mut db = self;
 		// The schema history records changes by basis
 		db.basis_t = rec.basis_t;
 		if rec.attrs.windows(2).any(|w| w[0].0 >= w[1].0)
@@ -1557,7 +1558,7 @@ impl Db
 		db.basis_t = rec.basis_t;
 		db.next_eid = rec.next_eid;
 		db.instant = rec.instant;
-		db.txs = db.txs.insert(rec.basis_t, rec.tx);
+		db.txs.insert_mut(rec.basis_t, rec.tx);
 		db.apply(rec.tx, rec.instant, &rec.retracted, &rec.asserted);
 		for (e, a, v) in &rec.asserted
 		{
@@ -1696,13 +1697,13 @@ impl Db
 		s.datoms += 1;
 		s.entities += self.values(e, a).next().is_none() as u64;
 		s.values += self.entities(a, v).next().is_none() as u64;
-		self.stats = self.stats.insert(a, s);
-		self.eavt = self.eavt.insert((e, a, v.clone()), tx);
-		self.aevt = self.aevt.insert((a, e, v.clone()), tx);
-		self.avet = self.avet.insert((a, v.clone(), e), tx);
+		self.stats.insert_mut(a, s);
+		self.eavt.insert_mut((e, a, v.clone()), tx);
+		self.aevt.insert_mut((a, e, v.clone()), tx);
+		self.avet.insert_mut((a, v.clone(), e), tx);
 		if let Value::Ref(r) = v
 		{
-			self.vaet = self.vaet.insert((*r, a, e), tx);
+			self.vaet.insert_mut((*r, a, e), tx);
 		}
 		self.log(e, a, v, tx, true);
 	}
@@ -1714,18 +1715,18 @@ impl Db
 		{
 			return false;
 		}
-		self.eavt = self.eavt.remove(&(e, a, v.clone()));
-		self.aevt = self.aevt.remove(&(a, e, v.clone()));
-		self.avet = self.avet.remove(&(a, v.clone(), e));
+		self.eavt.remove_mut(&(e, a, v.clone()));
+		self.aevt.remove_mut(&(a, e, v.clone()));
+		self.avet.remove_mut(&(a, v.clone(), e));
 		if let Value::Ref(r) = v
 		{
-			self.vaet = self.vaet.remove(&(*r, a, e));
+			self.vaet.remove_mut(&(*r, a, e));
 		}
 		let mut s = self.stats(a);
 		s.datoms -= 1;
 		s.entities -= self.values(e, a).next().is_none() as u64;
 		s.values -= self.entities(a, v).next().is_none() as u64;
-		self.stats = self.stats.insert(a, s);
+		self.stats.insert_mut(a, s);
 		self.log(e, a, v, tx, false);
 		true
 	}
@@ -1737,15 +1738,15 @@ impl Db
 		s.datoms += 1;
 		s.entities += self.haevt.seek(|k| (k.0, k.1) < (a, e)).next().map_or(true, |(k, _)| (k.0, k.1) != (a, e)) as u64;
 		s.values += self.havet.seek(|k| (k.0, &k.1) < (a, v)).next().map_or(true, |(k, _)| (k.0, &k.1) != (a, v)) as u64;
-		self.hstats = self.hstats.insert(a, s);
-		self.heavt = self.heavt.insert((e, a, v.clone(), tx, added), ());
-		self.haevt = self.haevt.insert((a, e, v.clone(), tx, added), ());
-		self.havet = self.havet.insert((a, v.clone(), e, tx, added), ());
+		self.hstats.insert_mut(a, s);
+		self.heavt.insert_mut((e, a, v.clone(), tx, added), ());
+		self.haevt.insert_mut((a, e, v.clone(), tx, added), ());
+		self.havet.insert_mut((a, v.clone(), e, tx, added), ());
 		if let Value::Ref(r) = v
 		{
-			self.hvaet = self.hvaet.insert((*r, a, e, tx, added), ());
+			self.hvaet.insert_mut((*r, a, e, tx, added), ());
 		}
-		self.tlog = self.tlog.insert((tx, e, a, v.clone(), added), ());
+		self.tlog.insert_mut((tx, e, a, v.clone(), added), ());
 	}
 }
 
@@ -2910,7 +2911,7 @@ pub(crate) mod tests
 		let rep = conn.transact(&tx).unwrap();
 		let email = conn.db().attr_id("person/email").unwrap();
 		assert_eq!(rep.record().attrs, vec![(email, Attr::new("person/email", ValueType::Str, Cardinality::One))]);
-		assert_same_db(&rep.db_before.replay(&rep.record()).unwrap(), &rep.db_after, "replayed alteration");
+		assert_same_db(&rep.db_before.clone().replay(&rep.record()).unwrap(), &rep.db_after, "replayed alteration");
 	}
 
 	#[test]
@@ -3104,5 +3105,63 @@ pub(crate) mod tests
 			assert_eq!(view.transact(&Tx::new()).err(), Some(Error::FilteredDb));
 		}
 		assert_eq!(latest.as_of(latest.basis_t()).unwrap().upto, None);
+	}
+
+	// Throughput of the indexes (release: cargo test --release index_timings -- --ignored --nocapture): transactions of 20 assertions
+	// (a quarter on new entities), then reads of the current value, of a past one (as_of) and a full scan
+	#[test]
+	#[ignore]
+	fn index_timings()
+	{
+		for txs in [10_000, 50_000]
+		{
+			let mut conn = Conn::new();
+			let mut tx = Tx::new();
+			tx.define("n", ValueType::Int, Cardinality::One).define("tag", ValueType::Str, Cardinality::Many).define("ref", ValueType::Ref, Cardinality::Many);
+			conn.transact(&tx).unwrap();
+			let mut rng = Rng::new(3);
+			let mut eids: Vec<Eid> = Vec::new();
+			let t = std::time::Instant::now();
+			for _ in 1..txs
+			{
+				let mut tx = Tx::new();
+				for _ in 0..20
+				{
+					let e = if eids.is_empty() || rng.next() % 4 == 0 { tx.temp() } else { Entity::Id(eids[(rng.next() % eids.len() as u64) as usize]) };
+					match rng.next() % 3
+					{
+						0 => tx.add(e, "n", (rng.next() % 1000) as i64),
+						1 => tx.add(e, "tag", ["a", "b", "c", "d"][(rng.next() % 4) as usize]),
+						_ if !eids.is_empty() => tx.add(e, "ref", Entity::Id(eids[(rng.next() % eids.len() as u64) as usize])),
+						_ => tx.add(e, "n", 0),
+					};
+				}
+				if let Ok(r) = conn.transact(&tx)
+				{
+					eids.extend(r.tempids.iter().copied());
+				}
+			}
+			let transact = t.elapsed();
+			let db = conn.db();
+			let (n, tag) = (db.attr_id("n").unwrap(), db.attr_id("tag").unwrap());
+			let t = std::time::Instant::now();
+			let mut hits = 0usize;
+			for (i, e) in eids.iter().enumerate().step_by(7)
+			{
+				hits += db.values(*e, n).count() + db.entities(tag, &Value::from(["a", "b", "c", "d"][i % 4])).take(10).count();
+			}
+			let reads = t.elapsed();
+			let past = db.as_of(db.basis_t() / 2).unwrap();
+			let t = std::time::Instant::now();
+			for e in eids.iter().take(eids.len() / 2).step_by(7)
+			{
+				hits += past.values(*e, n).count();
+			}
+			let past_reads = t.elapsed();
+			let t = std::time::Instant::now();
+			hits += db.attr_datoms(tag).count();
+			let scan = t.elapsed();
+			println!("{txs} transactions ({} entities): transact {transact:?}; {} point reads {reads:?}; as-of reads {past_reads:?}; scan {scan:?} ({hits})", eids.len(), eids.len() / 7);
+		}
 	}
 }
