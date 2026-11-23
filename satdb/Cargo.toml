@@ -1,0 +1,26 @@
+[package]
+name = "satdb"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A Datomic-inspired immutable database whose query planner runs on the Intel(R) SAT Solver"
+
+[dependencies]
+intel_sat_solver = { path = "../rust" }
+
+# Not a member of any workspace
+[workspace]
+
+# The solver relies on wrap-around unsigned arithmetic, and the profiles of a dependency don't apply to it, so mirror the solver's profiles here
+[profile.dev]
+overflow-checks = false
+opt-level = 1
+
+[profile.test]
+overflow-checks = false
+opt-level = 1
+
+[profile.release]
+overflow-checks = false
+opt-level = 3
+debug-assertions = false
