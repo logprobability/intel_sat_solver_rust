@@ -131,8 +131,16 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
 
   Changing the past (inserting a transaction at an earlier time) would need the paper's rollback method here, since cardinality-one and
   uniqueness make the operations non-commutative. What a small transaction pays now is the tree work itself (comparisons, shifting entries
-  within leaves, a descent per datom and index); a write-buffered tree (a persistent Bε-tree, which keeps pending changes in its branches)
-  is the next step for scattered writes.
+  within leaves, a descent per datom and index).
+
+  A write-buffered tree was tried and measured, and isn't used: `src/bemap.rs` is a persistent Bε-tree (Brodal and Fagerberg 2003, made
+  practical by Bender, Farach-Colton et al.'s write-optimized trees; Demaine's part in this line is the cache-oblivious B-tree with Bender and
+  Farach-Colton), with message buffers in the branches, whole-buffer flushes and merged iteration, tested against `BTreeMap` like `pmap`.
+  Against the B+-tree on 1M scattered keys (`cargo test --release bemap_vs_pmap -- --ignored --nocapture`, best buffer size 256 of
+  128-2048): insertions 0.91-1.85x as fast (about 1.35x typically), point reads 1.44-1.79x slower, scans 2.3-5.3x slower. A transaction
+  reads the indexes as it plans and queries scan them, and the statistics need what an insertion sees at its leaf, so the gain on writes
+  doesn't pay for the cost on reads: in memory, a B+-tree insertion costs only its descent and a short shift in a leaf, which is what the
+  buffers amortize, while the Bε-tree's real advantage is in block transfers, which an in-memory index doesn't make.
 * **Queries** (`src/query.rs`). Datalog-style queries over any view: patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`),
   comparison predicates, `not`/`not-join` and `or`/`or-join` (nested to any depth) and rule calls (see Rules), run as nested loops, each pattern using the index selected by its bound positions.
   * `not` keeps the rows for which its body has no solution; its join variables (all of its body's, or the `not-join` list) must be bound when it runs,
