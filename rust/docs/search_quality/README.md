@@ -32,7 +32,8 @@ A parameter is set on the command line as `<path> <value>` after the instance, o
 
 * Library: `HintPhase(lit)`, `HintScore(var, score)`, `GetSavedPhase(var)`, `GetVarScore(var)`, `ReadHints(text)`, `WriteHints()` on `CTopor`. In-instance commands: `lh <Lit>`, `ls <Var> <Score>`.
 * File format: `v <Lit> ... 0` lines for phases, `b <Var> <Score>` lines for scores.
-* Hints apply at the next `Solve` and are overwritten by phase saving, so in an incremental sequence they have to be renewed before every query.
+* Hints apply at the next `Solve` and are overwritten by phase saving, so in an incremental sequence they have to be renewed before every query. Renewing is free of side effects: the solver keeps one pending hint
+  per variable (the latest). A phase hint for a variable, which the assumptions of the next query hold, is not lost: it is applied by the first later query, in which the variable is free, unless a newer hint replaces it.
 
 **Target phases and rephasing.**
 
@@ -109,13 +110,27 @@ How to read it:
 * **What did not help:** every extension on the planner instances; correct phase advice on the planner instances; per-family tuning (it overfits); the family oracle (phases from another planner instance by variable index: sometimes 2372 to 66, sometimes 2939 to 10394); target phases on refutations; vivification on satisfiable or random formulas (within noise, more CPU time).
 * **Not done:** stable/focused restart alternation; hints through IPASIR; vivification of original clauses.
 * **Known limitations of the extensions**, none of which affects an answer:
-  * a phase hint for a variable assigned at the assumption level is dropped; hints for variables the solver never sees stay pending for its lifetime;
+  * a hint for a variable the solver never sees stays pending for the solver's lifetime (one entry per such variable, however often it is hinted); a phase hint for a variable assigned at level 0 is dropped, since the variable keeps its value;
   * `/phase/target/on 2` behaves as 1 under numeric restarts and as 0 under LBD restarts;
-  * a vivification round is not interruptible by a timeout or the stop callback (it is bounded by its propagation budget), and its bookkeeping uses standard containers, so an allocation failure inside a round aborts instead of returning an error status;
-  * up to about 9% of the DRAT deletion lines of vivified clauses name a clause the solver has since rewritten in place; a checker ignores them, and the proofs verify.
-* **Proof checking** with the extensions on was done with drat-trim by the implementer of vivification (78 of 78) and with forward RUP checkers by the reviewers; the drat-trim result was not reproduced independently. Hints and target phases add or delete no clauses.
+  * a vivification round is stopped between two clauses, not inside the test of a clause (a test is a handful of decisions with their propagation); the solver reads its clocks at every 1000th test of a timeout,
+    in a round as in the search, so a timeout is noticed with that granularity;
+  * the DRAT deletion lines are exact only if `/inprocessing/vivify/on` is set before the first query and stays set: while it is off, the solver (as the C++ one) doesn't tell the proof about the literals,
+    which simplification removes from a clause in place, and a later deletion of such a clause names a clause the proof doesn't hold (a checker ignores it; the proof still verifies).
+* **Fixed since the first version of the extensions** (the tests are in `src/tests/ext_hints.rs`, `ext_vivify.rs` and `cov_buffers.rs`):
+  * a phase hint for a variable held by the assumptions was dropped: it now waits for the first query, in which the variable is free; re-hinting before every query grew the pending store without bound: there is now one entry per variable, the latest;
+  * a vivification round could not be interrupted: it now serves the interrupt flag, the StopNow callback and both timeouts before every clause, with the solver at level 0 and every clause attached;
+  * the bookkeeping of a round used standard containers, so a failed allocation aborted the process: it is now held by the solver's `CVector`/`CDynArray`, reserved before the round changes anything, and a failure yields `STATUS_ALLOC_FAILED` (`RET_MEM_OUT`);
+    the set of the clauses tried in vain was a hash set of up to 2^22 entries: it is now an open-addressing table over a `CDynArray` of 2^20 entries (16 Mb) at most;
+  * some deletion lines of vivified clauses named a clause the proof didn't hold (74 of 7085 on 11 generated instances, 5 of 16820 on the regression instances with a round after every conflict): the cause was not the round but `SimplifyIfRequired`,
+    which removes the literals falsified at level 0 from a clause in place without writing to the proof (harmless in the C++ solver, which writes no deletions). With vivification on, the proof is now told
+    (the shortened clause is added, the original deleted), and every deletion names a clause of the proof: 0 of 21118 and 0 of 16829 on the same instances, and `drat-trim` reports no ignored deletion. The proofs with the extension off are unchanged (byte-identical to C++);
+  * `cargo test --release` failed (on `main` too) in 9 tests, which rely on the debug assertions of the solver: `tests::cov_buffers::bc_decompress` expected their panics, and 8 tests
+    (`cov_core::alloc_failures_in_add_user_clause_and_solve`, `alloc_failures_more`, `contradiction_in_the_initial_bcp`, `wl_assert_consistency_failures`, `wl_direct` and `fuzz::fuzz_alloc_failures_mode_0/1/2`)
+    drive the solver into states, which only an assertion stops (without them 5 of the 8 end in a segmentation fault, as the C++ solver would with `NDEBUG`). The helper of `bc_decompress` now expects a panic only where
+    debug assertions exist, and the 8 tests (and the two memory-out sweeps of `ext_vivify.rs`, which are of the same kind) are ignored in a build without them. `cargo test --release` passes.
+* **Proof checking** with the extensions on was done with drat-trim by the implementer of vivification (78 of 78) and with forward RUP checkers by the reviewers; after the fix of the deletion lines, the proofs of the 8 unsatisfiable
+  ones of the 11 generated instances above were verified by `drat-trim` again (8 of 8, no warning), and the forward RUP checker of the tests now asserts that every deletion names a clause of the proof. Hints and target phases add or delete no clauses.
 * The generic fuzz harness excludes the extension parameters (they would remap its seed-searched scenarios); the extensions are fuzzed by their own tests and by `TOPOR_FUZZ_EXTRA_PARAMS`.
-* `cargo test --release` crashes in `tests::cov_buffers::bc_decompress`, which relies on debug assertions; this predates the extensions. `cargo test` passes.
 
 ## Recommended configuration
 
@@ -130,4 +145,4 @@ How to read it:
 2. **Find where the planner's conflicts are** before adding search features: per query, split by answer (SAT, UNSAT, budget-limited). The oracle experiment says most of them are in queries no model can advise, which points at refutation-side work (learnt-clause quality and retention across queries, the conflict budgets themselves) and away from phases.
 3. **Measure hint carry-over inside the planner**, where consecutive queries are related: with `lf` removed, re-hinting before every query took two of the recordings from 14466 to 11004 and from 5062 to 136 conflicts, but `lf` overrides hints, so this needs the planner to hint instead of fix some polarities.
 4. **Average over perturbations** in the harness (several `flip_factor` or initial-order variants per configuration, median reported), so that fragile instances stop dominating single-run comparisons.
-5. If vivification is to be used in a product setting: make a round interruptible and move its containers to the solver's fallible ones.
+5. If vivification is to be used in a product setting: measure the cost of a round under many assumptions (they are taken off the trail and propagated again), and consider reusing the trail between consecutive clauses.

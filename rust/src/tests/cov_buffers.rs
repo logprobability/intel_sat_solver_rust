@@ -503,10 +503,10 @@ fn ResetStatus<Ind: TUInd, const Compress: bool>(topi: &CTopi<Ind, Compress>)
 	topi.SetStatus(TToporStatus::STATUS_UNDECIDED, String::new());
 }
 
-// Runs f, which is expected to fail an assertion of the solver
+// Runs f, which is expected to fail an assertion of the solver; the assertions of the solver are debug assertions (as in C++ with NDEBUG), so without them f is expected to run to its end
 fn ExpectAssertionFailure(f: impl FnOnce())
 {
-	assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err());
+	assert_eq!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err(), cfg!(debug_assertions));
 }
 
 // The inline members of the solver class over the state after an interrupted query: the explicit clause buffer

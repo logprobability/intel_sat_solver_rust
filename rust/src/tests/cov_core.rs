@@ -768,6 +768,7 @@ fn debug_model()
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "relies on the debug assertions of the solver: without them it proceeds past a failed assertion, as the C++ solver does with NDEBUG")]
 fn alloc_failures_in_add_user_clause_and_solve()
 {
 	// Every allocation of an AddUserClause invocation, which introduces new variables beyond the allocated ones, fails in turn
@@ -1111,6 +1112,7 @@ fn conflicts_while_assigning_assumptions()
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "relies on the debug assertions of the solver: without them it proceeds past a failed assertion, as the C++ solver does with NDEBUG")]
 fn contradiction_in_the_initial_bcp()
 {
 	// isAssump: the decision variable of the first level is crafted to be an assumption variable (the flag is never set at the beginning of Solve otherwise)
@@ -1282,6 +1284,7 @@ fn wl_assert_consistency_on_consistent_states()
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "relies on the debug assertions of the solver: without them it proceeds past a failed assertion, as the C++ solver does with NDEBUG")]
 fn wl_assert_consistency_failures()
 {
 	// Every crafted inconsistency is discovered by both WLAssertNoMissedImplications and the heavy WLAssertConsistency
@@ -1362,6 +1365,7 @@ fn wl_assert_consistency_failures()
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "relies on the debug assertions of the solver: without them it proceeds past a failed assertion, as the C++ solver does with NDEBUG")]
 fn wl_direct()
 {
 	let mut topi = WlSolver();
@@ -1546,6 +1550,7 @@ fn WithEveryAllocFailing<R>(prepare: &dyn Fn() -> TTopi, f: &dyn Fn(&mut TTopi) 
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "relies on the debug assertions of the solver: without them it proceeds past a failed assertion, as the C++ solver does with NDEBUG")]
 fn alloc_failures_more()
 {
 	let MemOuts = |res: &Vec<(TToporReturnVal, TTopi)>| res.iter().filter(|(r, topi)| *r == TToporReturnVal::RET_MEM_OUT && topi.IsError()).count();

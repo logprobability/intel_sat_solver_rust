@@ -131,9 +131,12 @@ runs all the fuzz scenarios with the given parameters set first, that is, with t
   but stays free to flip it, and phase saving overwrites the hint as usual. A polarity fixed by `FixPolarity` wins for as long as it is in force. Requires `/phase/hints/on 1`.
 * `CTopor::HintScore(v, score)` boosts the decision score of `v` by `/decision/score_hints/mult` times `score` at the next query, through the machinery of `BoostScore`.
   Ignored, if the parameter is 0 (the default).
-* The hints are applied by the next `Solve` right before its search loop (a hint for a variable, which doesn't exist yet, waits for it; if a hinted variable is still assigned
+* The hints are applied by the next `Solve` right before its search loop (if a hinted variable is still assigned
   above the assumptions by the previous query, the solver backtracks to the assumptions first, as a restart does).
-  In a sequence of queries a hint lasts only until phase saving overwrites it, so it is given again before the query it is meant for
+  One hint of a kind is recorded per variable, and a newer hint replaces the one, which hasn't been applied yet, so hinting again before every query never grows the record beyond the number of the distinct variables hinted.
+  A hint, which the next `Solve` can't apply, waits: a hint for a variable, which doesn't exist yet, waits for the variable; a phase hint for a variable held by the assumptions of the query
+  (an assumption, or a variable they imply) waits for the first later query, in which the variable is free, and then overrides the phase saved in the meantime. A phase hint for a variable assigned at level 0 is dropped.
+  In a sequence of queries an applied hint lasts only until phase saving overwrites it, so it is given again before the query it is meant for
   (`docs/search_quality/ceiling.md` measures what the hints can and cannot buy).
   `CTopor::GetSavedPhase(v)` and `CTopor::GetVarScore(v)` read the state to carry over; `CTopor::WriteHints()` / `ReadHints(text)` do it in the hints-file format.
 * The executable: `/topor_tool/hints_file <file>` reads a hints file before the first query, `/topor_tool/write_hints_file <file>` writes one after every query
@@ -168,8 +171,13 @@ Every clause it adds is implied by the formula, so the answers, the models, the 
   (with the lower of the two glues and the activity of the old clause). A unit clause is propagated at level 0; a clause, which wasn't shortened, isn't tried again.
 * `/inprocessing/vivify/effort F` (0.1): a round may propagate F times the literals, which the search has propagated since the previous round (the rounds of short queries are skipped, and their budget is carried over).
   `/inprocessing/vivify/max_glue G`: only the clauses of the glue G at most are candidates.
-* The proof: the new clause is added before the old one is deleted (`d ...`; the only deletions the solver writes), and the new-learnt-clause callback is given the new clause.
+* The proof: the new clause is added before the old one is deleted (`d ...`), and the new-learnt-clause callback is given the new clause. Every deletion names a clause of the proof:
+  while the extension is on, the DRAT file is also told, when simplification removes the literals falsified at level 0 from a learnt clause in place (the shortened clause is added, the original one is deleted;
+  the C++ solver, and this one with the extension off, write nothing then). These are the only deletions the solver writes.
   The conflicts and the decisions of the statistics are those of the search; the saved phases, the user's polarities and the decision heap are not touched.
+* A round ends before its next clause, when the query is asked to stop: an interrupt or a stop request of the StopNow callback makes `Solve` return right away, as between two decisions of the search,
+  and a global or a local timeout is reported by the search loop right after the round. The memory of a round is held by the solver's own containers: a failed allocation gives `RET_MEM_OUT`, as anywhere else in the solver,
+  and the record of the clauses, which were tried in vain, is bounded (2^20 hashes, 16 Mb).
 * Statistics: `m_ExtVivifyRounds`, `m_ExtVivifyTried`, `m_ExtVivifyShortened`, `m_ExtVivifyLitsRemoved`, `m_ExtVivifyUnits` and `m_ExtVivifyPropagations` of `GetStatistics()`; if the extension is on, the statistics lines
   are followed by `c ToporExt VivifyRounds <N> Tried <N> Shortened <N> LitsRemoved <N> Units <N> Props <N> SearchProps <N>`.
 * Measurements and the recommended setting: `docs/search_quality/vivification.md`.

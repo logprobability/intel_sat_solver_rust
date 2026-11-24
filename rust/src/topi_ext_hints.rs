@@ -11,17 +11,74 @@
 // The hints are recorded when given and applied by the next Solve right before its search loop: all the variables exist by then, the initial BCP has been carried out
 // and the initial polarities of the new variables (/decision/polarity/init_strategy) have been set, so that the hints override them.
 // A hint is advice only: it changes neither the clauses nor the proof, so a wrong hint can only cost time.
+//
+// One hint of a kind is recorded per variable: a newer hint replaces the recorded one, which hasn't been applied yet (so the record is bounded by the number of the distinct variables hinted).
+// A recorded hint is applied by the first Solve, which can apply it, and is forgotten then:
+//	a score hint, once the solver knows the variable;
+//	a phase hint, once the solver knows the variable and the variable is unassigned at that point of Solve, where a variable assigned by the previous query above the assumptions counts as unassigned
+//	(the solver backtracks to the assumptions to apply the hint). A variable assigned at level 0 keeps its value forever, so its phase hint is forgotten. A variable held by the assumptions of the query
+//	(an assumption or implied by the assumptions) holds its value rather than a saved phase, so its phase hint stays recorded for the first later Solve, which finds the variable unassigned
+//	(the hint then overrides the phase saved in the meantime, unless a newer hint has replaced it).
 
 use crate::topi::*;
 use crate::topor::CTopor;
+use std::collections::HashMap;
 use std::io::Write;
 
-// The hints, which haven't been applied yet (external literals and variables, since the internal ones may not exist yet or may be renumbered)
+// The recorded hints of one kind: one per external variable, in the order in which the variables were first hinted (the order of the application, so that it doesn't depend on the hash function)
+pub(crate) struct CExtHintsPending<T>
+{
+	// (the external variable, its hint)
+	pub(crate) m_Hints: Vec<(TLit, T)>,
+	// The index in m_Hints of the hint of a variable
+	m_IndOfVar: HashMap<TLit, usize>,
+}
+
+impl<T> Default for CExtHintsPending<T>
+{
+	fn default() -> Self
+	{
+		CExtHintsPending { m_Hints: Vec::new(), m_IndOfVar: HashMap::new() }
+	}
+}
+
+impl<T> CExtHintsPending<T>
+{
+	pub(crate) fn is_empty(&self) -> bool
+	{
+		self.m_Hints.is_empty()
+	}
+
+	// Record the hint of the variable; the latest hint wins
+	pub(crate) fn Set(&mut self, vExternal: TLit, hint: T)
+	{
+		match self.m_IndOfVar.get(&vExternal)
+		{
+			Some(&i) => self.m_Hints[i].1 = hint,
+			None =>
+			{
+				self.m_IndOfVar.insert(vExternal, self.m_Hints.len());
+				self.m_Hints.push((vExternal, hint));
+			}
+		}
+	}
+
+	// Move the recorded hints out
+	pub(crate) fn Take(&mut self) -> Vec<(TLit, T)>
+	{
+		self.m_IndOfVar.clear();
+		std::mem::take(&mut self.m_Hints)
+	}
+}
+
+// The hints, which haven't been applied yet (by external variables, since the internal ones may not exist yet or may be renumbered)
 #[derive(Default)]
 pub(crate) struct CExtHints
 {
-	pub(crate) m_PendingPhases: Vec<TLit>,
-	pub(crate) m_PendingScores: Vec<(TLit, f64)>,
+	// The hinted polarity: is the variable hinted to be negative?
+	pub(crate) m_PendingPhases: CExtHintsPending<bool>,
+	// The hinted score
+	pub(crate) m_PendingScores: CExtHintsPending<f64>,
 }
 
 impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
@@ -33,6 +90,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	}
 
 	// Hint that the solver should try the polarity of lExternal first, when it decides on its variable (see the top of the file)
+	// The hint replaces a hint for the same variable, which hasn't been applied yet, and it is applied by the first Solve, which finds the variable known and not held by a level-0 assignment
+	// (the hint is dropped then) or by the assumptions (the hint waits for a later Solve then)
 	// Returns false, iff the hint is ignored (the parameter is off or the literal is illegal)
 	pub fn HintPhase(&mut self, lExternal: TLit) -> bool
 	{
@@ -45,11 +104,12 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		{
 			let _ = writeln!(dumpFile, "lh {}", lExternal);
 		}
-		self.m_ExtHints.m_PendingPhases.push(lExternal);
+		self.m_ExtHints.m_PendingPhases.Set(lExternal.abs(), lExternal < 0);
 		true
 	}
 
 	// Hint that the initial decision score of vExternal should be boosted by /decision/score_hints/mult * score (see the top of the file)
+	// The hint replaces a hint for the same variable, which hasn't been applied yet (the boosts of the hints, which have been applied, add up)
 	// Returns false, iff the hint is ignored (the parameter is off, the variable is illegal or the score isn't a positive number)
 	pub fn HintScore(&mut self, vExternal: TLit, score: f64) -> bool
 	{
@@ -62,11 +122,12 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		{
 			let _ = writeln!(dumpFile, "ls {} {}", vExternal, score);
 		}
-		self.m_ExtHints.m_PendingScores.push((vExternal, score));
+		self.m_ExtHints.m_PendingScores.Set(vExternal, score);
 		true
 	}
 
-	// The hook of Solve: apply the recorded hints, whose variables exist; the others stay recorded for the next Solve
+	// The hook of Solve: apply the recorded hints, which can be applied; the others (those of the variables, which don't exist, and the phases of the variables held by the assumptions)
+	// stay recorded for the next Solve
 	pub(crate) fn ExtHintsApplyPending(&mut self)
 	{
 		if self.m_ExtHints.m_PendingPhases.is_empty() && self.m_ExtHints.m_PendingScores.is_empty()
@@ -74,37 +135,39 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			return;
 		}
 
-		let pendingPhases = std::mem::take(&mut self.m_ExtHints.m_PendingPhases);
+		let pendingPhases = self.m_ExtHints.m_PendingPhases.Take();
 
 		// A variable which is still assigned above the assumptions (by the previous query) holds its value rather than a saved polarity,
 		// so backtrack to the assumptions first, precisely as a restart does
 		let assumpDecLevel = self.m_DecLevelOfLastAssignedAssumption;
-		if pendingPhases.iter().any(|&l| { let lv = self.ExtHintsE2IVar(l.abs()); lv != BadULit && self.IsAssigned(lv) && self.GetAssignedDecLevel(lv) > assumpDecLevel })
+		if pendingPhases.iter().any(|&(vExternal, _)| { let lv = self.ExtHintsE2IVar(vExternal); lv != BadULit && self.IsAssigned(lv) && self.GetAssignedDecLevel(lv) > assumpDecLevel })
 		{
 			self.Backtrack(assumpDecLevel as TLit, false, false);
 		}
 
-		for l in pendingPhases
+		for (vExternal, isNegative) in pendingPhases
 		{
-			let lv = self.ExtHintsE2IVar(l.abs());
-			if lv == BadULit
+			let lv = self.ExtHintsE2IVar(vExternal);
+			if lv == BadULit || (self.IsAssigned(lv) && self.GetAssignedDecLevel(lv) != 0)
 			{
-				self.m_ExtHints.m_PendingPhases.push(l);
+				// The variable doesn't exist yet, or it is held by the assumptions (it is assigned, and neither above them nor at level 0): the hint waits
+				self.m_ExtHints.m_PendingPhases.Set(vExternal, isNegative);
 			}
 			else if !self.IsAssigned(lv)
 			{
 				// The external variable may be mapped to a negated internal literal
-				self.m_AssignmentInfo[GetVar(lv) as usize].set_m_IsNegated(IsNeg(lv) != (l < 0));
+				self.m_AssignmentInfo[GetVar(lv) as usize].set_m_IsNegated(IsNeg(lv) != isNegative);
 			}
+			// (a variable assigned at level 0 never gets to use a saved phase: its hint is dropped)
 		}
 
 		let mult = self.m_Params.m_ParamScoreHintsMult.get();
-		for (vExternal, score) in std::mem::take(&mut self.m_ExtHints.m_PendingScores)
+		for (vExternal, score) in self.m_ExtHints.m_PendingScores.Take()
 		{
 			let lv = self.ExtHintsE2IVar(vExternal);
 			if lv == BadULit
 			{
-				self.m_ExtHints.m_PendingScores.push((vExternal, score));
+				self.m_ExtHints.m_PendingScores.Set(vExternal, score);
 			}
 			else
 			{
@@ -149,12 +212,18 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 impl<Ind: TUInd, const Compress: bool> CTopor<Ind, Compress>
 {
 	// Hint the polarity of the variable |l| to l without fixing it: l seeds the saved phase, which the solver is free to overwrite; ignored unless /phase/hints/on is 1
+	// One hint is recorded per variable (the latest one), and the next Solve applies it, unless its variable
+	//	(1) is unknown to the solver: the hint waits for the variable;
+	//	(2) is assigned at level 0: the hint is dropped, since the variable keeps its value;
+	//	(3) is an assumption of that query or implied by its assumptions: the hint waits for the first later Solve, where the variable is free, and overrides the phase saved in the meantime
+	//	    (give the variable a new hint or let the solver decide by then: a new hint replaces the waiting one)
 	pub fn HintPhase(&mut self, l: TLit) -> bool
 	{
 		self.m_Topi.HintPhase(l)
 	}
 
 	// Boost the initial decision score of v by /decision/score_hints/mult * score at the next Solve; ignored if the parameter is 0
+	// One hint is recorded per variable (the latest one); a hint for a variable, which is unknown to the solver, waits for the variable
 	pub fn HintScore(&mut self, v: TLit, score: f64) -> bool
 	{
 		self.m_Topi.HintScore(v, score)

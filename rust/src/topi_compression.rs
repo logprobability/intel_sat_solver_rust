@@ -780,6 +780,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 						}
 
 						// Now we need to remove the globally falsified literals and let the clause be
+						// Rust-only extension (topi_ext_vivify.rs): the DRAT file follows the removal from a learnt clause (nothing, unless /inprocessing/vivify/on is set)
+						self.ExtVivifyOnGloballyFalsifiedLitsRemoval(clsInd);
 
 						// If the globally falsified literal is one of the watches, swap it
 						for currWatchI in 0..=1usize

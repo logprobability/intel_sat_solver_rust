@@ -588,27 +588,206 @@ fn proof_write_failures()
 		assert_eq!(DratText(&sink), "");
 		assert!(LearntLongs(&mut s).contains(&vec![1, 2, 3, 4, 5, 6]));
 		assert!(s.IsError());
+
+		// The lines of a simplified clause (see simplification_is_reported_to_the_proof; the round is skipped: it has no budget): the deletion can't be written, or the simplified clause can't
+		for failAfter in ["1 2 3 4 0\n".len() + 3, 3]
+		{
+			let sink = CSharedSink { m_Buf: Default::default(), m_FailAfter: Some(written + failAfter) };
+			let (mut s, sink) = CraftWithSink::<Ind, Compress>(sink, &[VivifyOn[0], VivifyOn[1], VivifyOn[2], ("/inprocessing/vivify/effort", 1e-9)], false, &[&[1, 2, 3, 4, 5, 6]], &[1, 2, 3, 4, 5], 5, 0., false);
+			s.AddClause(&[-5]);
+			s.m_Topi.m_ImplicationsTillNextSimplify = 0;
+			assert_eq!(SolveWithBudget(&mut s, &[]), TToporReturnVal::RET_DRAT_FILE_PROBLEM);
+			assert_eq!(DratText(&sink).lines().count(), (failAfter > 3) as usize);
+			assert_eq!(Stat(&s), [0; 6]);
+			assert!(s.IsError());
+		}
 	}
 	ForAllModes!(Test);
 }
 
-// The hashes of the clauses, which were tried in vain, are dropped, once there are too many of them
+// The hashes of the clauses, which were tried in vain, are dropped, once there are too many of them: the set of the hashes is bounded
 #[test]
 fn tried_clauses_are_forgotten_eventually()
 {
+	use crate::topi_ext_vivify::{CExtVivifyTried, ExtVivifyMaxTried};
 	let (mut s, _) = Craft::<u32, false>(&VivifyOn, false, &[&[1, 2, 3, 4, 5]], &[1, 2, 3, 4], 4, 0., false);
 	assert_eq!(SolveWithBudget(&mut s, &[]), RetSat);
-	assert_eq!((Counts(&s), s.m_Topi.m_ExtVivify.m_Tried.len()), ([1, 0, 0, 0], 1));
+	assert_eq!((Counts(&s), s.m_Topi.m_ExtVivify.m_Tried.size()), ([1, 0, 0, 0], 1));
 	assert_eq!(SolveWithBudget(&mut s, &[]), RetSat);
-	assert_eq!((Counts(&s), s.m_Topi.m_ExtVivify.m_Tried.len()), ([1, 0, 0, 0], 1));
-	s.m_Topi.m_ExtVivify.m_Tried.extend(0..=crate::topi_ext_vivify::ExtVivifyMaxTried as u64);
+	assert_eq!((Counts(&s), s.m_Topi.m_ExtVivify.m_Tried.size()), ([1, 0, 0, 0], 1));
+	// The set is full of other hashes: the clause is tried again, and its hash is then the only one
+	let mut tried = CExtVivifyTried::default();
+	assert!(!tried.contains(1));
+	for hash in 1..=ExtVivifyMaxTried as u64
+	{
+		// (the multiplier is odd, so the hashes differ, and none of them is 0)
+		assert!(tried.insert(hash.wrapping_mul(0x9E3779B97F4A7C15)));
+	}
+	assert_eq!(tried.size(), ExtVivifyMaxTried);
+	assert!((1..=1000u64).all(|hash| tried.contains(hash.wrapping_mul(0x9E3779B97F4A7C15))) && !tried.contains(12345));
+	// (a hash, which the set holds, is not added again)
+	assert!(tried.insert(0x9E3779B97F4A7C15));
+	assert_eq!(tried.size(), ExtVivifyMaxTried);
+	s.m_Topi.m_ExtVivify.m_Tried = tried;
 	assert_eq!(SolveWithBudget(&mut s, &[]), RetSat);
-	assert_eq!((Counts(&s), s.m_Topi.m_ExtVivify.m_Tried.len()), ([2, 0, 0, 0], 1));
+	assert_eq!((Counts(&s), s.m_Topi.m_ExtVivify.m_Tried.size()), ([2, 0, 0, 0], 1));
+	assert!(!s.m_Topi.m_ExtVivify.m_Tried.contains(0x9E3779B97F4A7C15));
+	assert_eq!(SolveWithBudget(&mut s, &[]), RetSat);
+	assert_eq!((Counts(&s), s.m_Topi.m_ExtVivify.m_Tried.size()), ([2, 0, 0, 0], 1));
+}
+
+// A request to stop the query, which arrives during a round, ends the round before its next clause, as it ends the search before its next decision:
+// an interrupt and a stop request of the StopNow callback make Solve return right away, and a timeout is reported by the loop of Solve after its next conflict analysis
+#[test]
+fn a_round_is_interruptible()
+{
+	use std::cell::Cell;
+	use std::sync::atomic::Ordering;
+
+	fn Test<Ind: TUInd, const Compress: bool>()
+	{
+		let clss: [&[TLit]; 2] = [&[1, 2, 4, 7], &[1, 2, 4, -7]];
+		let learnt = [1, 2, 3, 4, 5, 6];
+		// A round was started, no clause was tried, and the learnt clause is still there
+		fn AssertStopped<Ind: TUInd, const Compress: bool>(s: &mut CTopor<Ind, Compress>, learnt: &[TLit])
+		{
+			assert_eq!(Stat(s), [1, 0, 0, 0, 0, 0]);
+			assert_eq!(LearntLongs(s), [learnt.to_vec()]);
+			assert_eq!(s.m_Topi.m_DecLevel, 0);
+		}
+
+		// The StopNow callback: the loop of Solve asks it before inprocessing (the first call), and the round asks it before every clause (the second call)
+		let (mut s, _) = Craft::<Ind, Compress>(&VivifyOn, false, &clss, &learnt, 6, 0., false);
+		let calls: Rc<Cell<u32>> = Default::default();
+		let callsCb = calls.clone();
+		s.SetCbStopNow(Some(Box::new(move ||
+		{
+			callsCb.set(callsCb.get() + 1);
+			if callsCb.get() == 2 { TStopTopor::VAL_STOP } else { TStopTopor::VAL_CONTINUE }
+		})));
+		assert_eq!(SolveWithBudget(&mut s, &[5]), TToporReturnVal::RET_USER_INTERRUPT);
+		assert_eq!(calls.get(), 2);
+		assert_eq!(*s.m_Topi.m_StatusExplanation.borrow(), "Interrupt by the StopNow callback");
+		AssertStopped(&mut s, &learnt);
+		// The solver goes on: the next query starts with a round, which isn't stopped
+		assert_eq!(SolveWithBudget(&mut s, &[5]), RetSat);
+		AssertModel(&s, &clss);
+		assert_eq!(Counts(&s), [1, 1, 3, 0]);
+		assert_eq!(LearntLongs(&mut s), [[1, 2, 4]]);
+		assert_eq!(s.GetLitValue(5), Sat);
+		assert!(calls.get() > 3);
+
+		// The interrupt: it arrives during the first iteration of the loop of Solve, after the loop has tested it (here: from the StopNow callback, which the loop asks right after that test)
+		let (mut s, _) = Craft::<Ind, Compress>(&VivifyOn, false, &clss, &learnt, 6, 0., false);
+		let interruptNow = s.GetInterruptNowHandle();
+		let interruptNowCb = interruptNow.clone();
+		s.SetCbStopNow(Some(Box::new(move ||
+		{
+			interruptNowCb.store(true, Ordering::Relaxed);
+			TStopTopor::VAL_CONTINUE
+		})));
+		assert_eq!(SolveWithBudget(&mut s, &[5, -1]), TToporReturnVal::RET_USER_INTERRUPT);
+		assert_eq!(*s.m_Topi.m_StatusExplanation.borrow(), "Interrupt by the Interrupt callback");
+		assert!(!interruptNow.load(Ordering::Relaxed));
+		AssertStopped(&mut s, &learnt);
+		s.SetCbStopNow(None);
+		assert_eq!(SolveWithBudget(&mut s, &[5, -1]), RetSat);
+		AssertModel(&s, &clss);
+		assert_eq!(Counts(&s), [1, 1, 3, 0]);
+		assert_eq!((s.GetLitValue(5), s.GetLitValue(1)), (Sat, Unsat));
+
+		// The timeouts expire during the first iteration of the loop of Solve, before the round (the StopNow callback sleeps through them, when the loop asks it): the round tries no clause,
+		// and the loop reports the timeout after its first decision. The clocks are read at every test (otherwise at every 1000th one)
+		for isGlobal in [false, true]
+		{
+			let (mut s, _) = Craft::<Ind, Compress>(&VivifyOn, false, &clss, &learnt, 6, 0., false);
+			let calls: Rc<Cell<u32>> = Default::default();
+			let callsCb = calls.clone();
+			s.SetCbStopNow(Some(Box::new(move ||
+			{
+				callsCb.set(callsCb.get() + 1);
+				if callsCb.get() == 1
+				{
+					std::thread::sleep(std::time::Duration::from_millis(400));
+				}
+				TStopTopor::VAL_CONTINUE
+			})));
+			s.Backtrack(0);
+			let stat = &mut s.m_Topi.m_Stat;
+			stat.m_Implications += 1;
+			stat.m_OverallTime.SetTestModuloFactor(1);
+			stat.m_TimeSinceLastSolveStart.SetTestModuloFactor(1);
+			if isGlobal
+			{
+				stat.m_OverallTime.Reset();
+				stat.m_OverallTime.SetTimeout(0.2);
+			}
+			let ret = s.Solve(&[5], if isGlobal { NoTimeout } else { (0.2, false) }, u64::MAX);
+			assert_eq!(ret, if isGlobal { TToporReturnVal::RET_TIMEOUT_GLOBAL } else { TToporReturnVal::RET_TIMEOUT_LOCAL });
+			// The loop asked the callback once, and the round asked it once
+			assert_eq!(calls.get(), 2);
+			assert_eq!(Stat(&s), [1, 0, 0, 0, 0, 0]);
+			assert_eq!(LearntLongs(&mut s), [learnt.to_vec()]);
+		}
+	}
+	ForAllModes!(Test);
+}
+
+// SimplifyIfRequired removes the literals falsified at level 0 from a learnt clause in place: with vivification on, the proof gets the shortened clause and the deletion of the original one,
+// so that the deletion of the clause by a later round names the clause as the proof holds it
+#[test]
+fn simplification_is_reported_to_the_proof()
+{
+	fn Test<Ind: TUInd, const Compress: bool>()
+	{
+		// The learnt clause 1 2 3 4 5 stays in the first round. Then 5 is falsified at level 0; the next round skips the clause (its hash is known), and simplification removes 5 from it
+		// (and from the clause of the user, which the proof doesn't hold)
+		let Simplified = |params: &[(&str, f64)], isDratBinary: bool| -> (CTopor<Ind, Compress>, TSink)
+		{
+			let (mut s, sink) = Craft::<Ind, Compress>(params, isDratBinary, &[&[1, 2, 3, 4, 5, 6]], &[1, 2, 3, 4, 5], 5, 0., false);
+			assert_eq!(SolveWithBudget(&mut s, &[]), RetSat);
+			assert!(isDratBinary || DratText(&sink).is_empty());
+			s.AddClause(&[-5]);
+			s.m_Topi.m_ImplicationsTillNextSimplify = 0;
+			assert_eq!(SolveWithBudget(&mut s, &[]), RetSat);
+			assert_eq!(LearntLongs(&mut s), [[1, 2, 3, 4]]);
+			(s, sink)
+		};
+		let (mut s, sink) = Simplified(&VivifyOn, false);
+		assert_eq!(Counts(&s), [1, 0, 0, 0]);
+		let ProofClss = |sink: &TSink| -> Vec<(bool, Vec<TLit>)> { DratText(sink).lines().map(|l| (l.starts_with('d'), Sorted(l.split_whitespace().filter_map(|t| t.parse().ok()).filter(|l| *l != 0).collect()))).collect() };
+		assert_eq!(ProofClss(&sink), [(false, vec![1, 2, 3, 4]), (true, vec![1, 2, 3, 4, 5])]);
+		// The next round tries the clause as simplification has left it and shortens it: the clause deleted is the one the proof holds
+		s.AddClause(&[1, 2, 7]);
+		s.AddClause(&[1, 2, -7]);
+		assert_eq!(SolveWithBudget(&mut s, &[]), RetSat);
+		assert_eq!(Counts(&s), [2, 1, 2, 0]);
+		assert_eq!(ProofClss(&sink)[2..], [(false, vec![1, 2]), (true, vec![1, 2, 3, 4])]);
+
+		// A binary proof: a and d records
+		let (_, sink) = Simplified(&VivifyOn, true);
+		let mut records: Vec<Vec<u8>> = sink.m_Buf.borrow().split(|b| *b == 0).filter(|r| !r.is_empty()).map(|r| { let mut r = r.to_vec(); r[1..].sort(); r }).collect();
+		records.sort();
+		assert_eq!(records, [vec![b'a', 2, 4, 6, 8], vec![b'd', 2, 4, 6, 8, 10]]);
+
+		// Without the extension the proof says nothing about the removal, as that of the C++ solver
+		let (_, sink) = Simplified(&VivifyOn[..2], false);
+		assert_eq!(DratText(&sink), "");
+		// Likewise if there is no proof to write (the hook has nothing to do)
+		let (mut s, _) = Craft::<Ind, Compress>(&VivifyOn, false, &[&[1, 2, 3, 4, 5, 6]], &[1, 2, 3, 4, 5], 5, 0., false);
+		s.m_Topi.m_OpenedDratFile = None;
+		s.AddClause(&[-5]);
+		s.m_Topi.m_ImplicationsTillNextSimplify = 0;
+		assert_eq!(SolveWithBudget(&mut s, &[]), RetSat);
+		assert_eq!(s.GetActiveLongLearntClss(), 1);
+	}
+	ForAllModes!(Test);
 }
 
 // Memory-out during the rounds: every allocation of a fuzz scenario with vivification on is made to fail in turn (see FuzzAllocFailures in fuzz.rs: whatever happens after
 // the injected failure is tolerated, as long as the process survives)
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "relies on the debug assertions of the solver: without them it proceeds past a failed assertion, as the C++ solver does with NDEBUG")]
 fn alloc_failures_during_rounds()
 {
 	use crate::topor_dyn_array::alloc_fault;
@@ -636,7 +815,191 @@ fn alloc_failures_during_rounds()
 	let _ = TakeExtStats();
 }
 
-// The clauses of the formula, the proof so far and a naive unit propagation: every clause added to the proof must be RUP at the time it is added
+// Memory-out in the allocations of the extension itself, each of which is made to fail (on its own, and together with all the allocations after it): the status is that of any other memory-out,
+// nothing has been changed by then, and the solver reports the memory-out from then on. The hooks are invoked directly, so that every allocation is one of the extension
+// (the test doesn't depend on what the solver proper does after an allocation of its own fails)
+#[test]
+fn alloc_failures_of_the_extension_directly()
+{
+	use crate::topor_dyn_array::alloc_fault;
+
+	fn OnlyLearntInd<Ind: TUInd, const Compress: bool>(s: &mut CTopor<Ind, Compress>) -> Ind
+	{
+		let t = &mut s.m_Topi;
+		let mut res = vec![];
+		let mut clsInd = t.ClsLoopFirst(true);
+		while !t.ClsLoopCompleted()
+		{
+			if !t.ClsChunkDeleted(clsInd) && t.ClsGetIsLearnt(clsInd)
+			{
+				res.push(clsInd);
+			}
+			clsInd = t.ClsLoopNext();
+		}
+		assert_eq!(res.len(), 1);
+		res[0]
+	}
+
+	// The hook of the given kind over a solver at level 0 with one long learnt clause, as at the start of a query: a round, which shortens the clause (0), a round, which doesn't (1),
+	// or the hook of the simplification of the clause (2); failAt: the allocation, which fails, and whether it is the only one
+	// Returns the number of the allocations
+	fn Run<Ind: TUInd, const Compress: bool>(kind: u8, failAt: Option<(u64, bool)>, expected: &str) -> u64
+	{
+		let (clss, learnt): (&[&[TLit]], &[TLit]) = if kind == 0 { (&[&[1, 2, 4, 7], &[1, 2, 4, -7]], &[1, 2, 3, 4, 5, 6]) } else { (&[&[1, 2, 3, 4, 5]], &[1, 2, 3, 4]) };
+		let (mut s, sink) = Craft::<Ind, Compress>(&VivifyOn, false, clss, learnt, learnt.len(), 0., false);
+		s.m_Topi.m_Stat.m_Implications += 1;
+		s.m_Topi.m_Status.set(TToporStatus::STATUS_UNDECIDED);
+		let clsInd = OnlyLearntInd(&mut s);
+		let proofBefore = sink.m_Buf.borrow().len();
+		let allocsBefore = alloc_fault::allocs_so_far();
+		match failAt
+		{
+			Some((allocs, true)) => alloc_fault::fail_only(allocs),
+			Some((allocs, false)) => alloc_fault::fail_after(allocs),
+			None => (),
+		}
+		if kind == 2 { s.m_Topi.ExtVivifyOnGloballyFalsifiedLitsRemoval(clsInd) } else { s.m_Topi.ExtVivifyIfRequired() };
+		alloc_fault::never_fail();
+		let allocs = alloc_fault::allocs_so_far() - allocsBefore;
+		if failAt.is_some()
+		{
+			assert_eq!(*s.m_Topi.m_StatusExplanation.borrow(), expected);
+			assert!(s.m_Topi.m_Status.get() == TToporStatus::STATUS_ALLOC_FAILED && s.IsError());
+			// The clause is as it has been, and it is watched; nothing was written to the proof; the solver is at level 0
+			assert_eq!(LearntLongs(&mut s), [Sorted(learnt.to_vec())]);
+			let (w0, w1) = (s.m_Topi.Cls(clsInd).get(0), s.m_Topi.Cls(clsInd).get(1));
+			assert!(s.m_Topi.WLGetLongWatchInd(w0, clsInd) != usize::MAX && s.m_Topi.WLGetLongWatchInd(w1, clsInd) != usize::MAX);
+			assert_eq!(sink.m_Buf.borrow().len(), proofBefore);
+			assert_eq!(s.m_Topi.m_DecLevel, 0);
+			assert_eq!(Stat(&s)[2..5], [0, 0, 0]);
+			assert_eq!(Solve(&mut s, &[]), TToporReturnVal::RET_MEM_OUT);
+		}
+		else
+		{
+			assert!(!s.IsError());
+		}
+		allocs
+	}
+
+	fn Test<Ind: TUInd, const Compress: bool>()
+	{
+		let reserve = ["m_SavedPhases", "m_Lits", "m_NewLits", "m_Stack", "m_UserLits"].map(|b| format!("Couldn't ReserveExactly : m_ExtVivify.{} in ExtVivifyReserve", b));
+		// A round: the candidates and the buffers are reserved before the round changes anything; the hashes of the clauses tried in vain grow, after such a clause has been re-attached
+		let cands = "Couldn't reserve the candidates of vivification".to_string();
+		let hashes = "Couldn't reserve the hashes of the clauses tried by vivification".to_string();
+		let roundAllocs = [vec![cands.clone()], reserve.to_vec(), vec![hashes]].concat();
+		// (a round, which doesn't shorten the clause, allocates nothing else; a round, which does, doesn't add a hash, and the solver proper allocates for the new clause)
+		assert_eq!(Run::<Ind, Compress>(1, None, ""), 7);
+		assert!(Run::<Ind, Compress>(0, None, "") >= 6);
+		for isOnly in [false, true]
+		{
+			for (failAt, expected) in roundAllocs.iter().enumerate()
+			{
+				// (once an allocation has failed, the later ones aren't attempted)
+				assert_eq!(Run::<Ind, Compress>(1, Some((failAt as u64, isOnly)), expected), failAt as u64 + 1);
+				if failAt < 6
+				{
+					assert_eq!(Run::<Ind, Compress>(0, Some((failAt as u64, isOnly)), expected), failAt as u64 + 1);
+				}
+			}
+			// The hook of simplification reserves the buffers, if no round has done it
+			for (failAt, expected) in reserve.iter().enumerate()
+			{
+				assert_eq!(Run::<Ind, Compress>(2, Some((failAt as u64, isOnly)), expected), failAt as u64 + 1);
+			}
+		}
+	}
+	ForAllModes!(Test);
+}
+
+// Memory-out in the allocations of the extension itself: every allocation of a query, which starts with a round (or with a simplification, which the proof is told about), is made to fail in turn,
+// both on its own and together with all the allocations after it. A failure of an allocation of the extension makes the status that of any other memory-out, and leaves the clauses in place
+#[test]
+#[cfg_attr(not(debug_assertions), ignore = "relies on the debug assertions of the solver: without them it proceeds past a failed assertion, as the C++ solver does with NDEBUG")]
+fn alloc_failures_of_the_extension()
+{
+	use crate::topor_dyn_array::alloc_fault;
+	use std::collections::BTreeSet;
+
+	fn Test<Ind: TUInd, const Compress: bool>() -> BTreeSet<String>
+	{
+		let mut explanations = BTreeSet::new();
+		// The scenarios: a round, which shortens a clause; a round, which doesn't; no round (there is no budget for it) and a simplification of a learnt clause
+		for scenario in 0..3
+		{
+			// The number of the allocations of the query, its return value and the explanation of its status
+			let Run = |failAt: Option<(u64, bool)>| -> (u64, TToporReturnVal, String)
+			{
+				let (mut s, _) = match scenario
+				{
+					0 => Craft::<Ind, Compress>(&VivifyOn, false, &[&[1, 2, 4, 7], &[1, 2, 4, -7]], &[1, 2, 3, 4, 5, 6], 6, 0., false),
+					1 => Craft::<Ind, Compress>(&VivifyOn, false, &[&[1, 2, 3, 4, 5]], &[1, 2, 3, 4], 4, 0., false),
+					_ => Craft::<Ind, Compress>(&[VivifyOn[0], VivifyOn[1], VivifyOn[2], ("/inprocessing/vivify/effort", 1e-9)], false, &[&[1, 2, 3, 4, 5, 6]], &[1, 2, 3, 4, 5], 5, 0., false),
+				};
+				let learntBefore = LearntLongs(&mut s);
+				if scenario == 2
+				{
+					s.AddClause(&[-5]);
+					s.m_Topi.m_ImplicationsTillNextSimplify = 0;
+				}
+				s.Backtrack(0);
+				s.m_Topi.m_Stat.m_Implications += 1;
+				let allocsBefore = alloc_fault::allocs_so_far();
+				match failAt
+				{
+					Some((allocs, true)) => alloc_fault::fail_only(allocs),
+					Some((allocs, false)) => alloc_fault::fail_after(allocs),
+					None => (),
+				}
+				// (a failure of an allocation of the solver proper may be anything but a crash of the process, see FuzzAllocFailures in fuzz.rs)
+				let ret = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Solve(&mut s, &[])));
+				alloc_fault::never_fail();
+				let allocs = alloc_fault::allocs_so_far() - allocsBefore;
+				let explanation = s.m_Topi.m_StatusExplanation.borrow().clone();
+				if explanation.starts_with("Couldn't") && explanation.contains("ivif")
+				{
+					// A failure of the extension: the solver reports a memory-out, and the learnt clause is still there (simplified or not)
+					assert_eq!(ret.as_ref().ok(), Some(&TToporReturnVal::RET_MEM_OUT), "{}", explanation);
+					assert!(s.IsError());
+					assert_eq!(s.m_Topi.m_DecLevel, 0);
+					let learnt = LearntLongs(&mut s);
+					assert!(learnt == learntBefore || (scenario == 2 && learnt == [[1, 2, 3, 4]]), "{}: {:?}", explanation, learnt);
+				}
+				(allocs, ret.unwrap_or(TToporReturnVal::RET_MEM_OUT), explanation)
+			};
+
+			let (allocs, ret, _) = Run(None);
+			assert_eq!(ret, RetSat);
+			assert!(allocs > 5);
+			for isOnly in [false, true]
+			{
+				for failAt in 0..allocs
+				{
+					let (_, ret, explanation) = Run(Some((failAt, isOnly)));
+					if ret == TToporReturnVal::RET_MEM_OUT
+					{
+						explanations.insert(explanation);
+					}
+				}
+			}
+		}
+		explanations
+	}
+
+	for explanations in [Test::<u32, false>(), Test::<u64, false>(), Test::<u64, true>()]
+	{
+		// Every allocation of the extension has failed
+		for expected in ["Couldn't reserve the candidates of vivification", "Couldn't reserve the hashes of the clauses tried by vivification", "Couldn't ReserveExactly : m_ExtVivify.m_SavedPhases in ExtVivifyReserve",
+			"Couldn't ReserveExactly : m_ExtVivify.m_Lits in ExtVivifyReserve", "Couldn't ReserveExactly : m_ExtVivify.m_NewLits in ExtVivifyReserve", "Couldn't ReserveExactly : m_ExtVivify.m_Stack in ExtVivifyReserve",
+			"Couldn't ReserveExactly : m_ExtVivify.m_UserLits in ExtVivifyReserve"]
+		{
+			assert!(explanations.contains(expected), "{}: {:?}", expected, explanations);
+		}
+	}
+}
+
+// The clauses of the formula, the proof so far and a naive unit propagation: every clause added to the proof must be RUP at the time it is added,
+// and every clause deleted must be one of the clauses (that is, the proof follows every change the solver makes to a learnt clause, which is deleted later), if m_IsDeletionExact
 struct CRupChecker
 {
 	m_Vars: usize,
@@ -644,6 +1007,8 @@ struct CRupChecker
 	// The number of bytes of the proof, which have been checked
 	m_Checked: usize,
 	m_Deleted: u64,
+	// Vivification has been on throughout (the proof isn't told about the literals simplification removes from a clause, while vivification is off)
+	m_IsDeletionExact: bool,
 }
 
 impl CRupChecker
@@ -706,10 +1071,13 @@ impl CRupChecker
 			let c = Sorted(c);
 			if isDeletion
 			{
-				// A deletion follows the addition of a clause over a proper subset of the literals (a deleted clause, whose literals the solver has changed in the meantime, is not found; it stays)
+				// A deletion follows the addition of a clause over a proper subset of the literals
 				let last = self.m_Clss.last().unwrap();
 				assert!(last.len() < c.len() && last.iter().all(|l| c.contains(l)), "{}: {} after {:?}", context, line, last);
-				if let Some(i) = self.m_Clss.iter().position(|d| *d == c)
+				let i = self.m_Clss.iter().position(|d| *d == c);
+				// (a deleted clause, from which simplification removed literals, while vivification was off, is not found; it stays)
+				assert!(i.is_some() || !self.m_IsDeletionExact, "{}: the clause deleted by {} is not in the proof", context, line);
+				if let Some(i) = i
 				{
 					self.m_Clss.swap_remove(i);
 					self.m_Deleted += 1;
@@ -813,7 +1181,7 @@ fn vivification_never_changes_an_answer()
 		{
 			s.AddClause(c);
 		}
-		let mut rup = CRupChecker { m_Vars: vars as usize, m_Clss: clss.iter().map(|c| Sorted(c.clone())).collect(), m_Checked: 0, m_Deleted: 0 };
+		let mut rup = CRupChecker { m_Vars: vars as usize, m_Clss: clss.iter().map(|c| Sorted(c.clone())).collect(), m_Checked: 0, m_Deleted: 0, m_IsDeletionExact: true };
 		for query in 0..6
 		{
 			if rand.Next(4) == 0
@@ -824,7 +1192,9 @@ fn vivification_never_changes_an_answer()
 			if rand.Next(6) == 0
 			{
 				// Vivification is turned off and on between the queries
-				s.SetParam("/inprocessing/vivify/on", rand.Next(2) as f64);
+				let isOn = rand.Next(2);
+				s.SetParam("/inprocessing/vivify/on", isOn as f64);
+				rup.m_IsDeletionExact &= isOn == 1;
 			}
 			let assumps: Vec<TLit> = (0..rand.Next(5)).map(|_| rand.Lit(vars)).collect();
 			let ret = Solve(&mut s, &assumps);
@@ -916,7 +1286,7 @@ fn vivification_agrees_with_the_solver_without_it()
 			s.AddClause(c);
 			reference.AddClause(c);
 		}
-		let mut rup = CRupChecker { m_Vars: vars as usize, m_Clss: clss.iter().map(|c| Sorted(c.clone())).collect(), m_Checked: 0, m_Deleted: 0 };
+		let mut rup = CRupChecker { m_Vars: vars as usize, m_Clss: clss.iter().map(|c| Sorted(c.clone())).collect(), m_Checked: 0, m_Deleted: 0, m_IsDeletionExact: true };
 		for query in 0..4
 		{
 			let assumps: Vec<TLit> = (0..rand.Next(4)).map(|_| rand.Lit(vars)).collect();

@@ -130,18 +130,21 @@ fn FuzzAllocFailures(solverMode: u8)
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "relies on the debug assertions of the solver: without them it proceeds past a failed assertion, as the C++ solver does with NDEBUG")]
 fn fuzz_alloc_failures_mode_0()
 {
 	FuzzAllocFailures(0);
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "relies on the debug assertions of the solver: without them it proceeds past a failed assertion, as the C++ solver does with NDEBUG")]
 fn fuzz_alloc_failures_mode_1()
 {
 	FuzzAllocFailures(1);
 }
 
 #[test]
+#[cfg_attr(not(debug_assertions), ignore = "relies on the debug assertions of the solver: without them it proceeds past a failed assertion, as the C++ solver does with NDEBUG")]
 fn fuzz_alloc_failures_mode_2()
 {
 	FuzzAllocFailures(2);

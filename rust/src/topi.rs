@@ -180,7 +180,7 @@ pub struct CTopi<Ind: TUInd, const Compress: bool>
 	// Rust-only extension (topi_ext_target_phase.rs): the state of target/best-phase saving and rephasing
 	pub(crate) m_ExtTargetPhase: crate::topi_ext_target_phase::CExtTargetPhase,
 	// Rust-only extension (topi_ext_vivify.rs): the state of the vivification of learnt clauses
-	pub(crate) m_ExtVivify: crate::topi_ext_vivify::CExtVivify,
+	pub(crate) m_ExtVivify: crate::topi_ext_vivify::CExtVivify<Ind>,
 
 	// Literal currently propagated by BCP
 	pub(crate) m_CurrentlyPropagatedLit: TULit,

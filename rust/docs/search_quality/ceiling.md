@@ -76,6 +76,11 @@ Geometric means of the conflicts ratio to the run without hints (`(x + 1) / (bas
      hinted once before the first query, the model is overwritten by phase saving during the earlier queries (`planner_large_query.nolf`: 14466 -> 15241 conflicts),
      hinted before every query, the final query takes 0 conflicts (14466 -> 11004, which is the two conflict budgets; `planner_small_refinements.nolf`: 5062 -> 136).
      With `lf` in force, even that barely helps (14926 -> 12656, 6724 -> 6600, 7562 -> 7667). In incremental use a hint has to be renewed per query.
+     (Renewing costs nothing but the calls: the solver keeps one pending hint per variable, the latest one, so the pending store is bounded by the number of the distinct variables hinted,
+     also for the variables the solver never gets to know. A phase hint for a variable, which the assumptions of the next query hold (an assumption or a variable implied by the assumptions), can't be applied by that query,
+     since the variable holds its value rather than a saved phase: the hint stays pending and is applied by the first later query, in which the variable is free, where it overrides the phase saved in the meantime,
+     unless a newer hint for the variable has replaced it. A hint for a variable assigned at level 0 is dropped. In the first version such a hint was dropped silently, and every repeated hint for an unknown variable was stored;
+     the measurements of this document don't depend on either: their hinted variables exist, and the runs hint a variable once per query.)
    * **The base runs of the planner's final queries are not a trustworthy reference.** On the clause-only single queries, 39 of 45 runs with *random* score hints take 0 conflicts
      (all 15 for two of the three instances), where the base runs take 2372, 4961 and 4412; on `planner_large_query.plain`, a single `lb` (BoostScore) of an arbitrary variable does the same with the unmodified solver.
      With `lf` in force, the random perturbation (0.297) is as good as the oracle (0.285). These queries are easy, and the default decision order happens to be a bad one for them,

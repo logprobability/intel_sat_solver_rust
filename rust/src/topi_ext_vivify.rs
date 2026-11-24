@@ -14,49 +14,149 @@
 //
 // The effort is bounded by /inprocessing/vivify/effort: a round may propagate that fraction of the literals, which the search has propagated since the previous round.
 // A clause, which wasn't shortened, isn't tried again (the hashes of such clauses are held; a stale or a colliding hash can only cost a missed or a repeated attempt).
+// A round also ends between two clauses (so, at level 0, with every clause attached), when the query is asked to stop: on an interrupt or a stop request of the StopNow callback,
+// which are served precisely as the loop of Solve serves them (Solve returns right after the hook), and on a global or a local timeout, which the loop of Solve then reports after its next conflict analysis, as usual.
+//
+// The memory of the extension is held by the containers of the solver (CDynArray, CVector), and it is reserved before a round changes anything (but for the hashes, which grow after a clause has been
+// re-attached): a failure to allocate makes the status STATUS_ALLOC_FAILED, as everywhere in the solver, and leaves the clauses and the trail consistent.
+//
+// The proof: besides the additions of the new clauses (written as those of any learnt clause), the DRAT file gets the deletions of the clauses replaced. The solver proper writes no deletions,
+// and SimplifyIfRequired removes the literals falsified at level 0 from a clause in place without a word to the proof, where a deletion of the clause as it is stored would then name a clause,
+// which the proof doesn't hold (a proof checker ignores such a deletion). So, if the extension is on, the hook of SimplifyIfRequired writes the shortened learnt clause and deletes the original one:
+// the proof holds every long learnt clause as the solver stores it, and a deletion always names a clause of the proof (if the parameter is on throughout; nothing is written while it is off).
 //
 // Only BCP, Assign and Backtrack touch the trail, so their invariants hold throughout. What they change besides the trail is restored: the saved phases (backtracking saves
 // the phase of every variable it unassigns), and the record of the earliest falsified assumption (Assign updates it, when a decision or an implication of a round contradicts an assumption,
 // which is not on the trail during the round). Neither conflicts nor decisions are counted, and the decision heap is not touched (the round doesn't use Decide).
 // The answers stay correct, since every clause added is implied by the formula; the search changes, but only through the clauses.
 //
-// Off by default: without /inprocessing/vivify/on the hook of InprocessIfRequired returns after testing the parameter
-// (the other hook, in Solve right after InprocessIfRequired, returns from the query, if the parameter is on and the round has decided it).
+// Off by default: without /inprocessing/vivify/on the hooks of InprocessIfRequired and SimplifyIfRequired return after testing the parameter
+// (the third hook, in Solve right after InprocessIfRequired, returns from the query, if the parameter is on and the round has decided or stopped it).
 
 use crate::topi::*;
-use std::collections::HashSet;
+use crate::ReserveExactly;
 use std::io::Write;
+use std::sync::atomic::Ordering;
+
+// A set of non-0 hashes: open addressing with linear probing over an array of the solver, whose capacity is a power of 2 and at least twice the number of the hashes (0 marks a free slot)
+#[derive(Default)]
+pub(crate) struct CExtVivifyTried
+{
+	m_Slots: CDynArray<u64>,
+	m_Size: usize,
+}
+
+impl CExtVivifyTried
+{
+	pub(crate) fn size(&self) -> usize
+	{
+		self.m_Size
+	}
+
+	// The slot of the hash, if the set holds it, and the free slot it would go to otherwise (the array isn't empty)
+	fn Slot(&self, hash: u64) -> usize
+	{
+		let mask = self.m_Slots.cap() - 1;
+		let mut i = hash as usize & mask;
+		while self.m_Slots[i] != 0 && self.m_Slots[i] != hash
+		{
+			i = (i + 1) & mask;
+		}
+		i
+	}
+
+	pub(crate) fn contains(&self, hash: u64) -> bool
+	{
+		self.m_Slots.cap() != 0 && self.m_Slots[self.Slot(hash)] == hash
+	}
+
+	// Returns false, iff the memory for the hash couldn't be allocated (the set is intact then)
+	// The set never holds more than ExtVivifyMaxTried hashes (so its array never has more than twice as many slots): once it is full, it is emptied
+	pub(crate) fn insert(&mut self, hash: u64) -> bool
+	{
+		if self.contains(hash)
+		{
+			return true;
+		}
+		if self.m_Size >= ExtVivifyMaxTried
+		{
+			self.m_Slots.memset(0);
+			self.m_Size = 0;
+		}
+		if 2 * (self.m_Size + 1) > self.m_Slots.cap()
+		{
+			let mut slots = CDynArray::<u64>::new(0);
+			slots.reserve_exactly_init(if self.m_Slots.cap() == 0 { ExtVivifyTriedInitCap } else { 2 * self.m_Slots.cap() }, 0);
+			if slots.uninitialized_or_erroneous()
+			{
+				return false;
+			}
+			let prevSlots = std::mem::replace(&mut self.m_Slots, slots);
+			for i in 0..prevSlots.cap()
+			{
+				if prevSlots[i] != 0
+				{
+					let slot = self.Slot(prevSlots[i]);
+					self.m_Slots[slot] = prevSlots[i];
+				}
+			}
+		}
+		let slot = self.Slot(hash);
+		self.m_Slots[slot] = hash;
+		self.m_Size += 1;
+		true
+	}
+}
+
+// A candidate of a round: the glue, the activity and the index of the clause
+type TExtVivifyCand<Ind> = (TUV, f32, Ind);
 
 // The state of the extension (the counters are in m_Stat)
-#[derive(Default)]
-pub(crate) struct CExtVivify
+pub(crate) struct CExtVivify<Ind: TUInd>
 {
 	// The number of literals propagated by the search (that is, not by vivification) till the latest round
 	pub(crate) m_SearchPropsAtLastRound: u64,
 	// The hashes of the clauses, which were tried and not shortened
-	pub(crate) m_Tried: HashSet<u64>,
-	// The buffers of a round: the literals of the candidate clause, the new clause and the stack of the implication-cone traversal
-	m_Lits: Vec<TULit>,
-	m_NewLits: Vec<TULit>,
-	m_Stack: Vec<TUVar>,
+	pub(crate) m_Tried: CExtVivifyTried,
+	// The buffers of a round, which are kept between the rounds. The candidates:
+	m_Cands: CVector<TExtVivifyCand<Ind>>,
+	// The rest have the capacity of the number of the variables (ExtVivifyReserve): the saved phases of the search by variable,
+	m_SavedPhases: CDynArray<bool>,
+	// the literals of the candidate clause, the new clause, the stack of the implication-cone traversal (every variable is pushed once at most)
+	m_Lits: CVector<TULit>,
+	m_NewLits: CVector<TULit>,
+	m_Stack: CVector<TUVar>,
+	// and the external literals of a clause for the DRAT file
+	m_UserLits: CVector<TLit>,
+}
+
+impl<Ind: TUInd> Default for CExtVivify<Ind>
+{
+	fn default() -> Self
+	{
+		CExtVivify { m_SearchPropsAtLastRound: 0, m_Tried: Default::default(), m_Cands: Default::default(), m_SavedPhases: Default::default(), m_Lits: Default::default(), m_NewLits: Default::default(), m_Stack: Default::default(), m_UserLits: Default::default() }
+	}
 }
 
 // A round isn't worth its fixed costs (collecting and sorting the candidates), unless it may propagate at least that many literals; the budget is carried over otherwise
 const ExtVivifyMinBudget: u64 = 2000;
-// The hashes of the tried clauses are dropped, once there are that many
-pub(crate) const ExtVivifyMaxTried: usize = 1 << 22;
+// The hashes of the tried clauses are dropped, once there are that many (their array then takes 16 Mb)
+pub(crate) const ExtVivifyMaxTried: usize = 1 << 20;
+// The initial number of the slots for the hashes (a power of 2)
+const ExtVivifyTriedInitCap: usize = 64;
 
-// An order-independent hash of a clause
+// An order-independent hash of a clause, which is never 0
 fn ExtVivifyHash(lits: &[TULit]) -> u64
 {
-	lits.iter().fold(0u64, |h, l|
+	let hash = lits.iter().fold(0u64, |h, l|
 	{
 		// The finalizer of splitmix64
 		let mut x = (*l as u64).wrapping_add(0x9E3779B97F4A7C15);
 		x = (x ^ (x >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
 		x = (x ^ (x >> 27)).wrapping_mul(0x94D049BB133111EB);
 		h.wrapping_add(x ^ (x >> 31))
-	})
+	});
+	hash | (hash == 0) as u64
 }
 
 impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
@@ -80,10 +180,23 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		}
 		self.m_ExtVivify.m_SearchPropsAtLastRound = searchProps;
 
-		// The candidates: the long learnt clauses; low glue first, then high activity (the recently used ones), then the order of the buffer
+		// The memory of the round is reserved, before anything is changed
+		let mut cands = std::mem::take(&mut self.m_ExtVivify.m_Cands);
+		self.ExtVivifyCollectCands(&mut cands);
+		self.ExtVivifyReserve();
+		if !cands.empty() && !self.IsUnrecoverable()
+		{
+			self.ExtVivifyRound(cands.get_span().as_slice(), budget);
+		}
+		self.m_ExtVivify.m_Cands = cands;
+	}
+
+	// The candidates of a round: the long learnt clauses; low glue first, then high activity (the recently used ones), then the order of the buffer
+	fn ExtVivifyCollectCands(&mut self, cands: &mut CVector<TExtVivifyCand<Ind>>)
+	{
+		cands.clear();
 		let maxGlue = self.m_Params.m_ParamVivifyMaxGlue.get();
 		let isActivityKept = self.m_Params.m_ParamClsDelStrategy.get() > 0;
-		let mut cands: Vec<(TUV, f32, Ind)> = Vec::new();
 		let mut clsInd = self.ClsLoopFirst(true);
 		while !self.ClsLoopCompleted()
 		{
@@ -92,34 +205,78 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				let glue = self.ClsGetGlue(clsInd);
 				if glue <= maxGlue
 				{
-					cands.push((glue, if isActivityKept { self.ClsGetActivity(clsInd) } else { 0. }, clsInd));
+					cands.push_back((glue, if isActivityKept { self.ClsGetActivity(clsInd) } else { 0. }, clsInd));
+					if cands.uninitialized_or_erroneous()
+					{
+						self.SetStatus(TToporStatus::STATUS_ALLOC_FAILED, "Couldn't reserve the candidates of vivification".to_string());
+						cands.clear();
+						return;
+					}
 				}
 			}
 			clsInd = self.ClsLoopNext();
 		}
-		if cands.is_empty()
+		if !cands.empty()
 		{
-			return;
+			cands.get_span().as_mut_slice().sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)).then(a.2.cmp(&b.2)));
 		}
-		cands.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(b.1.total_cmp(&a.1)).then(a.2.cmp(&b.2)));
+	}
 
-		if self.m_ExtVivify.m_Tried.len() > ExtVivifyMaxTried
+	// Make sure that the buffers of the extension, which are bounded by the number of the variables, have that capacity (so that nothing is allocated, while a clause is detached or the proof is written)
+	fn ExtVivifyReserve(&mut self)
+	{
+		let nextVar = self.GetNextVar() as usize;
+		// (the capacities change together)
+		if self.m_ExtVivify.m_UserLits.cap() < nextVar
 		{
-			self.m_ExtVivify.m_Tried.clear();
+			ReserveExactly!(self, self.m_ExtVivify.m_SavedPhases, nextVar, "m_ExtVivify.m_SavedPhases in ExtVivifyReserve");
+			ReserveExactly!(self, self.m_ExtVivify.m_Lits, nextVar, "m_ExtVivify.m_Lits in ExtVivifyReserve");
+			ReserveExactly!(self, self.m_ExtVivify.m_NewLits, nextVar, "m_ExtVivify.m_NewLits in ExtVivifyReserve");
+			ReserveExactly!(self, self.m_ExtVivify.m_Stack, nextVar, "m_ExtVivify.m_Stack in ExtVivifyReserve");
+			ReserveExactly!(self, self.m_ExtVivify.m_UserLits, nextVar, "m_ExtVivify.m_UserLits in ExtVivifyReserve");
 		}
+	}
 
+	// Is the query asked to stop? The requests, which the loop of Solve serves between two of its iterations, are served between two clauses of a round
+	fn ExtVivifyIsStopRequested(&mut self) -> bool
+	{
+		// The interrupt and the StopNow callback, precisely as at the top of the loop of Solve: the status is set, and Solve returns right after the hook of InprocessIfRequired
+		if self.m_InterruptNow.load(Ordering::Relaxed) || (self.M_CbStopNow.is_some() && (self.M_CbStopNow.as_mut().unwrap())() == TStopTopor::VAL_STOP)
+		{
+			if self.m_InterruptNow.load(Ordering::Relaxed)
+			{
+				self.SetStatus(TToporStatus::STATUS_USER_INTERRUPT, "Interrupt by the Interrupt callback".to_string());
+				self.m_InterruptNow.store(false, Ordering::Relaxed);
+			}
+			else
+			{
+				self.SetStatus(TToporStatus::STATUS_USER_INTERRUPT, "Interrupt by the StopNow callback".to_string());
+			}
+			return true;
+		}
+		// The global and the local timeout, tested precisely as the loop of Solve tests them after conflict analysis: the round ends, and the loop reports the timeout at that test of its current iteration
+		(self.m_Stat.m_OverallTime.IsTimeoutSet() && self.m_Stat.m_OverallTime.IsTimeout()) || (self.m_Stat.m_TimeSinceLastSolveStart.IsTimeoutSet() && self.m_Stat.m_TimeSinceLastSolveStart.IsTimeout())
+	}
+
+	// A round over the candidates, whose memory has been reserved
+	fn ExtVivifyRound(&mut self, cands: &[TExtVivifyCand<Ind>], budget: u64)
+	{
 		// To level 0: the assumptions leave the trail for the duration of the round
 		let assumpDecLevel = self.m_DecLevelOfLastAssignedAssumption;
 		self.Backtrack(0, false, false);
 		self.m_DecLevelOfLastAssignedAssumption = 0;
 		// Backtracking saves the phases; those of the search are kept
-		let savedPhases: Vec<bool> = (0..self.GetNextVar() as usize).map(|v| self.m_AssignmentInfo[v].m_IsNegated()).collect();
+		let nextVar = self.GetNextVar() as usize;
+		for v in 1..nextVar
+		{
+			self.m_ExtVivify.m_SavedPhases[v] = self.m_AssignmentInfo[v].m_IsNegated();
+		}
 
 		self.m_Stat.m_ExtVivifyRounds += 1;
 		let propsAtStart = self.m_Stat.m_Implications;
-		for cand in &cands
+		for cand in cands
 		{
-			if self.m_Stat.m_Implications - propsAtStart >= budget || self.m_Status.get() != TToporStatus::STATUS_UNDECIDED || self.m_EarliestFalsifiedAssump != BadULit
+			if self.m_Stat.m_Implications - propsAtStart >= budget || self.m_Status.get() != TToporStatus::STATUS_UNDECIDED || self.m_EarliestFalsifiedAssump != BadULit || self.ExtVivifyIsStopRequested()
 			{
 				break;
 			}
@@ -128,18 +285,19 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		self.m_Stat.m_ExtVivifyPropagations += self.m_Stat.m_Implications - propsAtStart;
 
 		debug_assert!(self.m_DecLevel == 0 || self.IsUnrecoverable());
-		for (v, isNegated) in savedPhases.iter().enumerate().skip(1)
+		for v in 1..nextVar
 		{
 			if !self.m_AssignmentInfo[v].m_IsAssigned()
 			{
-				self.m_AssignmentInfo[v].set_m_IsNegated(*isNegated);
+				let isNegated = self.m_ExtVivify.m_SavedPhases[v];
+				self.m_AssignmentInfo[v].set_m_IsNegated(isNegated);
 			}
 		}
 
 		self.m_DecLevelOfLastAssignedAssumption = assumpDecLevel;
 		if self.m_Status.get() != TToporStatus::STATUS_UNDECIDED
 		{
-			// A global contradiction, an error or a stop request of the new-learnt-clause callback: Solve returns right after the hook
+			// A global contradiction, an error, an interrupt or a stop request of a callback: Solve returns right after the hook
 			return;
 		}
 
@@ -188,38 +346,44 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		debug_assert!(self.m_DecLevel == 0 && self.m_ToPropagate.empty());
 		debug_assert!(!self.ClsChunkDeleted(clsInd) && self.ClsGetIsLearnt(clsInd));
 
-		let mut lits = std::mem::take(&mut self.m_ExtVivify.m_Lits);
+		// (the buffers have the capacity of the number of the variables, so they aren't reallocated: see ExtVivifyReserve)
+		let mut litsBuf = std::mem::take(&mut self.m_ExtVivify.m_Lits);
 		let mut newLits = std::mem::take(&mut self.m_ExtVivify.m_NewLits);
-		lits.clear();
+		litsBuf.clear();
 		newLits.clear();
 		let cls = self.Cls(clsInd);
-		lits.extend((0..cls.size()).map(|i| cls.get(i)));
+		debug_assert!(cls.size() <= litsBuf.cap() && cls.size() <= newLits.cap());
+		for i in 0..cls.size()
+		{
+			litsBuf.push_back(cls.get(i));
+		}
+		let lits: &[TULit] = litsBuf.get_span().as_slice();
 
 		// A clause, which is satisfied at level 0, is left to SimplifyIfRequired; the watches of any other clause are unassigned at level 0, once BCP has completed
-		if !lits.iter().any(|l| self.IsSatisfied(*l)) && !self.IsAssigned(lits[0]) && !self.IsAssigned(lits[1]) && !self.m_ExtVivify.m_Tried.contains(&ExtVivifyHash(&lits))
+		if !lits.iter().any(|l| self.IsSatisfied(*l)) && !self.IsAssigned(lits[0]) && !self.IsAssigned(lits[1]) && !self.m_ExtVivify.m_Tried.contains(ExtVivifyHash(lits))
 		{
 			self.m_Stat.m_ExtVivifyTried += 1;
 			// Assign records the earliest falsified assumption: a decision or an implication of the test may contradict an assumption (none is on the trail now)
 			let assumpInfo = (self.m_EarliestFalsifiedAssump, self.m_LatestEarliestFalsifiedAssump, self.m_LatestEarliestFalsifiedAssumpSolveInv);
 
-			self.ExtVivifyProbe(clsInd, &lits, &mut newLits);
-			let isShortened = !newLits.is_empty() && newLits.len() < lits.len() && !self.IsUnrecoverable();
+			self.ExtVivifyProbe(clsInd, lits, &mut newLits);
+			let isShortened = !newLits.empty() && newLits.size() < lits.len() && !self.IsUnrecoverable();
 
 			if isShortened
 			{
 				// The new clause is added, while its literals are still assigned (their decision levels make its glue), and before the old one is deleted
 				// (AddClsToBufferAndWatch serves the DRAT file and the new-learnt-clause callback; a unit clause isn't stored)
-				if newLits.len() == 1
+				if newLits.size() == 1
 				{
 					if self.IsCbLearntOrDrat()
 					{
-						self.NewLearntClsApplyCbLearntDrat(Span::from_slice(&mut newLits));
+						self.NewLearntClsApplyCbLearntDrat(newLits.get_span());
 					}
 				}
 				else
 				{
-					let newClsInd = self.AddClsToBufferAndWatch(Span::from_slice(&mut newLits), true, true);
-					if newLits.len() > 2 && !self.IsUnrecoverable()
+					let newClsInd = self.AddClsToBufferAndWatch(newLits.get_span(), true, true);
+					if newLits.size() > 2 && !self.IsUnrecoverable()
 					{
 						// The glue of the new clause is that of the artificial decision levels of the test; the glue of the old clause bounds the glue of its subset too
 						let oldGlue = self.ClsGetGlue(clsInd);
@@ -237,7 +401,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 				}
 				if !self.IsUnrecoverable()
 				{
-					self.ExtVivifyDratDelete(&lits);
+					self.ExtVivifyDratLine(lits, true);
 				}
 			}
 
@@ -253,8 +417,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			{
 				self.DeleteCls(clsInd, None);
 				self.m_Stat.m_ExtVivifyShortened += 1;
-				self.m_Stat.m_ExtVivifyLitsRemoved += (lits.len() - newLits.len()) as u64;
-				if newLits.len() == 1
+				self.m_Stat.m_ExtVivifyLitsRemoved += (lits.len() - newLits.size()) as u64;
+				if newLits.size() == 1
 				{
 					// A new global unit clause
 					self.m_Stat.m_ExtVivifyUnits += 1;
@@ -268,20 +432,21 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 					}
 				}
 			}
-			else
+			else if !self.m_ExtVivify.m_Tried.insert(ExtVivifyHash(lits)) && !self.IsUnrecoverable()
 			{
-				self.m_ExtVivify.m_Tried.insert(ExtVivifyHash(&lits));
+				// (the clause has been re-attached)
+				self.SetStatus(TToporStatus::STATUS_ALLOC_FAILED, "Couldn't reserve the hashes of the clauses tried by vivification".to_string());
 			}
 		}
 
-		self.m_ExtVivify.m_Lits = lits;
+		self.m_ExtVivify.m_Lits = litsBuf;
 		self.m_ExtVivify.m_NewLits = newLits;
 	}
 
 	// Test the clause clsInd, whose literals are lits, at decision level 0: detach it, decide the negations of its literals and propagate.
 	// If a clause over a subset of the literals is derived, it is returned in newLits (empty otherwise). The solver is left at the decision levels of the test,
 	// where every literal of the new clause is assigned, and the clause is left detached.
-	fn ExtVivifyProbe(&mut self, clsInd: Ind, lits: &[TULit], newLits: &mut Vec<TULit>)
+	fn ExtVivifyProbe(&mut self, clsInd: Ind, lits: &[TULit], newLits: &mut CVector<TULit>)
 	{
 		// BCP must neither propagate through the clause nor find it contradicting, while its literals are being falsified, so its watches are removed
 		// (and it isn't counted for the duration, so that the consistency assertions of BCP see as many long clauses as there are watched ones)
@@ -293,9 +458,22 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		}
 		self.m_Stat.m_ActiveLongClss -= 1;
 
-		// The variables, whose implication cones the new clause is derived from
+		// The variables, whose implication cones the new clause is derived from: a variable is marked as visited, when it is pushed, so it is pushed once at most,
+		// and the stack never outgrows its capacity of the number of the variables; the variables assigned at level 0 aren't visited
 		let mut stack = std::mem::take(&mut self.m_ExtVivify.m_Stack);
 		stack.clear();
+		macro_rules! Visit
+		{
+			($v:expr) =>
+			{
+				let v: TUVar = $v;
+				if !self.IsVisitedVar(v) && self.GetAssignedDecLevelVar(v) != 0
+				{
+					self.MarkVisitedVar(v);
+					stack.push_back(v);
+				}
+			};
+		}
 		let mut impliedLit = BadULit;
 		let mut isContradiction = false;
 		for &l in lits
@@ -320,10 +498,11 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			if contradictionInfo.IsContradiction() || self.IsUnrecoverable()
 			{
 				isContradiction = true;
-				if !self.IsUnrecoverable()
+				// (there is no contradicting clause after an error)
+				let ciSpan = if self.IsUnrecoverable() { Span::empty() } else { self.CiGetSpan(&mut contradictionInfo, TUV::MAX) };
+				for l in ciSpan
 				{
-					let ciSpan = self.CiGetSpan(&mut contradictionInfo, TUV::MAX);
-					stack.extend(ciSpan.iter().map(GetVar));
+					Visit!(GetVar(l));
 				}
 				break;
 			}
@@ -334,58 +513,81 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			// The literal is implied by a clause other than ours: all the other literals of its parent are falsified
 			debug_assert!(self.GetAssignedDecLevel(impliedLit) > 0 && !self.IsAssignedDec(impliedLit));
 			let parent = self.GetAssignedNonDecParentSpan(impliedLit);
-			stack.extend(parent.iter().filter(|l| *l != impliedLit).map(GetVar));
-			newLits.push(impliedLit);
+			for l in parent
+			{
+				if l != impliedLit
+				{
+					Visit!(GetVar(l));
+				}
+			}
+			newLits.push_back(impliedLit);
 		}
 		else if !isContradiction
 		{
 			// Every literal is falsified, so our clause is the contradiction (BCP is complete before every decision, so it never backtracks during the test)
 			debug_assert!(lits.iter().all(|l| self.IsFalsified(*l)));
-			stack.extend(lits.iter().filter(|l| self.IsFalsified(**l)).map(|l| GetVar(*l)));
+			for &l in lits
+			{
+				Visit!(GetVar(l));
+			}
 		}
 
 		// The decisions in the implication cones: every decision above level 0 is the negation of a literal of our clause
-		while let Some(v) = stack.pop()
+		while !stack.empty()
 		{
-			if self.IsVisitedVar(v) || self.GetAssignedDecLevelVar(v) == 0
-			{
-				continue;
-			}
-			self.MarkVisitedVar(v);
+			let v = stack.pop_back();
 			if !self.IsAssignedDecVar(v)
 			{
 				// (in the compressed mode the span is a temporary copy of the parent, which is valid until the next clause is fetched)
 				let parent = self.GetAssignedNonDecParentSpanVar(v);
-				stack.extend(parent.iter().map(GetVar).filter(|u| *u != v));
+				for l in parent
+				{
+					Visit!(GetVar(l));
+				}
 			}
 		}
-		newLits.extend(lits.iter().filter(|l| self.IsVisited(**l) && self.IsAssignedDec(**l)));
-		debug_assert!(newLits.iter().skip((impliedLit != BadULit) as usize).all(|l| self.IsFalsified(*l)));
+		for &l in lits
+		{
+			if self.IsVisited(l) && self.IsAssignedDec(l)
+			{
+				newLits.push_back(l);
+			}
+		}
+		debug_assert!(newLits.get_span().iter().skip((impliedLit != BadULit) as usize).all(|l| self.IsFalsified(l)));
 		self.CleanVisited();
 		self.m_ExtVivify.m_Stack = stack;
 	}
 
-	// The deletion of a clause in the DRAT file (the solver doesn't report its other deletions; this one follows the addition of the clause, which replaces the deleted one)
-	fn ExtVivifyDratDelete(&mut self, lits: &[TULit])
+	// A line of the DRAT file, which NewLearntClsApplyCbLearntDrat doesn't write (it writes the addition of a clause the solver has learnt, and reports the clause to the callback):
+	// the deletion of the clause lits (the solver proper doesn't report its deletions), or the addition of lits, which is not for the callback
+	// The buffer of the external literals has been reserved (ExtVivifyReserve)
+	fn ExtVivifyDratLine(&mut self, lits: &[TULit], isDeletion: bool)
 	{
 		if self.m_OpenedDratFile.is_none()
 		{
 			return;
 		}
 
-		let mut userLits: Vec<TLit> = lits.iter().map(|l| self.GetExternalLit(*l)).collect();
+		let mut userLits = std::mem::take(&mut self.m_ExtVivify.m_UserLits);
+		debug_assert!(lits.len() <= userLits.cap());
+		userLits.clear();
+		for &l in lits
+		{
+			userLits.push_back(self.GetExternalLit(l));
+		}
+		let userLitsSpan = userLits.get_span();
 		if self.m_DratSortEveryClause
 		{
-			userLits.sort_unstable_by_key(|l| l.unsigned_abs());
+			userLitsSpan.as_mut_slice().sort_unstable_by_key(|l| l.unsigned_abs());
 		}
 
-		// The encodings are those of NewLearntClsApplyCbLearntDrat, with d instead of a
+		// The encodings are those of NewLearntClsApplyCbLearntDrat, with d instead of a for a deletion
 		let mut buf = std::mem::take(&mut self.m_DratBuf);
 		buf.clear();
 		if self.m_IsDratBinary
 		{
-			buf.push(b'd');
-			for l in userLits
+			buf.push(if isDeletion { b'd' } else { b'a' });
+			for l in userLitsSpan
 			{
 				let mut ul64: u64 = ((l.unsigned_abs() as u64) << 1) + (l < 0) as u64;
 				while ul64 & !0x7f != 0
@@ -399,14 +601,18 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		}
 		else
 		{
-			buf.extend_from_slice(b"d ");
-			for l in userLits
+			if isDeletion
+			{
+				buf.extend_from_slice(b"d ");
+			}
+			for l in userLitsSpan
 			{
 				// Writing into a vector can't fail
 				let _ = write!(buf, "{} ", l);
 			}
 			buf.extend_from_slice(b"0\n");
 		}
+		self.m_ExtVivify.m_UserLits = userLits;
 
 		let isDratBinary = self.m_IsDratBinary;
 		let o = self.m_OpenedDratFile.as_mut().unwrap();
@@ -416,6 +622,44 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		{
 			self.OnBadDratFile();
 		}
+	}
+
+	// The hook of SimplifyIfRequired, which is about to remove the literals falsified at level 0 from the clause clsInd in place (the clause still holds all its literals, and stays long):
+	// if the extension is on, the proof gets the clause without those literals (which is RUP, since unit propagation falsifies them) and the deletion of the clause as it has been,
+	// so that the proof holds a long learnt clause precisely as the solver stores it, and its deletion by a later round names a clause of the proof (see the top of the file)
+	pub(crate) fn ExtVivifyOnGloballyFalsifiedLitsRemoval(&mut self, clsInd: Ind)
+	{
+		if !self.m_Params.m_ParamVivifyOn.get() || self.m_OpenedDratFile.is_none() || !self.ClsGetIsLearnt(clsInd)
+		{
+			return;
+		}
+		self.ExtVivifyReserve();
+		if self.IsUnrecoverable()
+		{
+			return;
+		}
+
+		let mut lits = std::mem::take(&mut self.m_ExtVivify.m_Lits);
+		let mut newLits = std::mem::take(&mut self.m_ExtVivify.m_NewLits);
+		lits.clear();
+		newLits.clear();
+		let cls = self.Cls(clsInd);
+		for i in 0..cls.size()
+		{
+			let l = cls.get(i);
+			lits.push_back(l);
+			if !self.IsGloballyFalsified(l)
+			{
+				newLits.push_back(l);
+			}
+		}
+		self.ExtVivifyDratLine(newLits.get_span().as_slice(), false);
+		if !self.IsUnrecoverable()
+		{
+			self.ExtVivifyDratLine(lits.get_span().as_slice(), true);
+		}
+		self.m_ExtVivify.m_Lits = lits;
+		self.m_ExtVivify.m_NewLits = newLits;
 	}
 
 	// The extra line of the short statistics, if the extension is on

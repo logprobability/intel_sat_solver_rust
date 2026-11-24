@@ -143,7 +143,7 @@ fn hints_in_incremental_solving()
 	assert!(s.HintPhase(-9));
 	assert!(s.HintPhase(-1));
 	assert_eq!(Solve(&mut s, &[]), TToporReturnVal::RET_SAT);
-	assert_eq!(s.m_Topi.m_ExtHints.m_PendingPhases, [-9]);
+	assert_eq!(s.m_Topi.m_ExtHints.m_PendingPhases.m_Hints, [(9, true)]);
 	assert_eq!(s.GetSavedPhase(9), TToporLitVal::VAL_DONT_CARE);
 	s.AddClause(&[9, 7]);
 	assert_eq!(Solve(&mut s, &[]), TToporReturnVal::RET_SAT);
@@ -151,14 +151,17 @@ fn hints_in_incremental_solving()
 	assert_eq!(Model(&s, 1..=9)[8], -9);
 	assert_eq!(s.GetLitValue(1), Unsat);
 
-	// An assumption wins over a hint, and the hint for an assumed variable is dropped rather than applied later
+	// An assumption wins over a hint, and the hint for an assumed variable waits for a query, where the variable is free (see deferred_phase_hints)
 	assert!(s.HintPhase(-2));
 	assert!(s.HintPhase(-3));
 	assert_eq!(Solve(&mut s, &[2, 9]), TToporReturnVal::RET_SAT);
 	assert_eq!(s.GetLitValue(2), Sat);
 	assert_eq!(s.GetLitValue(9), Sat);
 	assert_eq!(s.GetLitValue(3), Unsat);
-	assert!(s.m_Topi.m_ExtHints.m_PendingPhases.is_empty());
+	assert_eq!(s.m_Topi.m_ExtHints.m_PendingPhases.m_Hints, [(2, true)]);
+	// (a new hint replaces the waiting one)
+	assert!(s.HintPhase(2));
+	assert_eq!(s.m_Topi.m_ExtHints.m_PendingPhases.m_Hints, [(2, false)]);
 
 	// Unsatisfiable under the assumptions, with the hints pointing the other way: the answer and the core are intact
 	s.AddClause(&[-4, -5]);
@@ -169,6 +172,111 @@ fn hints_in_incremental_solving()
 	assert_eq!(Solve(&mut s, &[]), TToporReturnVal::RET_SAT);
 	assert!(s.GetLitValue(4) == Unsat || s.GetLitValue(5) == Unsat);
 	assert!(!s.IsError());
+}
+
+// A phase hint for a variable, which the assumptions of the next query hold (an assumption or a variable implied by the assumptions), is applied by the first later query, where the variable is free;
+// a hint for a variable assigned at level 0 is dropped
+#[test]
+fn deferred_phase_hints()
+{
+	fn Test<Ind: TUInd, const Compress: bool>()
+	{
+		let Pending = |s: &CTopor<Ind, Compress>| s.m_Topi.m_ExtHints.m_PendingPhases.m_Hints.clone();
+		let mut s = NewSolver::<Ind, Compress>(true);
+		// 10 implies 11
+		s.AddClause(&[-10, 11]);
+		assert!(s.HintPhase(-2) && s.HintPhase(-3) && s.HintPhase(-11));
+		// 2 is an assumption, and 11 is implied by the assumption 10: their hints wait, and the hint for the free variable 3 is applied
+		assert_eq!(Solve(&mut s, &[2, 10]), TToporReturnVal::RET_SAT);
+		assert_eq!((s.GetLitValue(2), s.GetLitValue(3), s.GetLitValue(10), s.GetLitValue(11)), (Sat, Unsat, Sat, Sat));
+		assert_eq!(Pending(&s), [(2, true), (11, true)]);
+		// They go on waiting, while the assumptions hold their variables
+		s.AddClause(&[7, 12]);
+		assert_eq!(Solve(&mut s, &[10, 2]), TToporReturnVal::RET_SAT);
+		assert_eq!((s.GetLitValue(2), s.GetLitValue(11)), (Sat, Sat));
+		assert_eq!(Pending(&s), [(2, true), (11, true)]);
+		// 2 is free in the next query: its hint is applied, although phase saving has recorded the value the assumption gave it; the hint of 11 still waits
+		assert_eq!(Solve(&mut s, &[10]), TToporReturnVal::RET_SAT);
+		assert_eq!((s.GetLitValue(2), s.GetLitValue(11)), (Unsat, Sat));
+		assert_eq!(Pending(&s), [(11, true)]);
+		// Without the assumptions 11 is free too (10 is hinted as well: it would imply 11 otherwise; the query gets a new variable to decide: the previous model stands otherwise, and nothing is applied)
+		assert!(s.HintPhase(-10));
+		assert_eq!(Solve(&mut s, &[]), TToporReturnVal::RET_SAT);
+		assert_eq!(Pending(&s), [(11, true), (10, true)]);
+		s.AddClause(&[7, 14]);
+		assert_eq!(Solve(&mut s, &[]), TToporReturnVal::RET_SAT);
+		assert_eq!((s.GetLitValue(2), s.GetLitValue(10), s.GetLitValue(11)), (Unsat, Unsat, Unsat));
+		assert!(Pending(&s).is_empty());
+
+		// A waiting hint is replaced by a newer one for its variable
+		assert!(s.HintPhase(-4));
+		assert_eq!(Solve(&mut s, &[4]), TToporReturnVal::RET_SAT);
+		assert_eq!(Pending(&s), [(4, true)]);
+		assert!(s.HintPhase(4));
+		assert_eq!(Pending(&s), [(4, false)]);
+		s.AddClause(&[7, 15]);
+		assert_eq!(Solve(&mut s, &[]), TToporReturnVal::RET_SAT);
+		assert_eq!(s.GetLitValue(4), Sat);
+		assert!(Pending(&s).is_empty());
+
+		// A variable assigned at level 0 keeps its value: its hint is dropped (the query has a new variable to decide, so that it reaches the search)
+		s.AddClause(&[5]);
+		s.AddClause(&[7, 13]);
+		assert!(s.HintPhase(-5) && s.HintPhase(-6));
+		assert_eq!(Solve(&mut s, &[]), TToporReturnVal::RET_SAT);
+		assert_eq!((s.GetLitValue(5), s.GetLitValue(6)), (Sat, Unsat));
+		assert!(Pending(&s).is_empty());
+		assert!(!s.IsError());
+	}
+	Test::<u32, false>();
+	Test::<u64, false>();
+	Test::<u64, true>();
+}
+
+// One hint of a kind is recorded per variable, so hinting again before every query doesn't grow the record, also for the variables the solver never gets to know; the latest hint wins
+#[test]
+fn pending_hints_are_bounded()
+{
+	let mut s = NewSolver::<u32, false>(true);
+	s.SetParam("/decision/score_hints/mult", 1.);
+	for query in 0..50
+	{
+		for i in 0..20
+		{
+			// The variables 50 to 53 don't exist
+			assert!(s.HintPhase(if (query + i) % 2 == 0 { 50 } else { -50 }));
+			assert!(s.HintPhase(-(51 + i % 3)));
+			assert!(s.HintScore(50, (query * 20 + i + 1) as f64));
+			assert!(s.HintPhase(if i % 2 == 0 { 1 } else { -1 }));
+		}
+		assert_eq!(s.m_Topi.m_ExtHints.m_PendingPhases.m_Hints.len(), 5);
+		s.AddClause(&[7, 100 + query]);
+		assert_eq!(Solve(&mut s, &[]), TToporReturnVal::RET_SAT);
+		// The latest hint of 1 was applied
+		assert_eq!(s.GetLitValue(1), Unsat);
+		assert_eq!(s.m_Topi.m_ExtHints.m_PendingPhases.m_Hints, [(50, query % 2 == 0), (51, true), (52, true), (53, true)]);
+		assert_eq!(s.m_Topi.m_ExtHints.m_PendingScores.m_Hints, [(50, (query * 20 + 20) as f64)]);
+	}
+	// Once the variable exists, its latest hints are applied
+	s.AddClause(&[50, 7]);
+	assert_eq!(Solve(&mut s, &[]), TToporReturnVal::RET_SAT);
+	assert_eq!(s.GetLitValue(50), Sat);
+	assert_eq!(s.m_Topi.m_ExtHints.m_PendingPhases.m_Hints, [(51, true), (52, true), (53, true)]);
+	assert!(s.m_Topi.m_ExtHints.m_PendingScores.is_empty());
+
+	// The boost of a score hint is that of the latest hint
+	let mut plain = NewSolver::<u32, false>(false);
+	let mut s = NewSolver::<u32, false>(false);
+	s.SetParam("/decision/score_hints/mult", 3.);
+	assert!(s.HintScore(9, 2.) && s.HintScore(5, 1.) && s.HintScore(9, 5.) && s.HintScore(5, 0.5));
+	assert_eq!(s.m_Topi.m_ExtHints.m_PendingScores.m_Hints, [(9, 5.), (5, 0.5)]);
+	for t in [&mut plain, &mut s]
+	{
+		t.AddClause(&[9, 7]);
+		assert_eq!(Solve(t, &[]), TToporReturnVal::RET_SAT);
+	}
+	assert_eq!(s.GetVarScore(9) - plain.GetVarScore(9), 15.);
+	assert_eq!(s.GetVarScore(5) - plain.GetVarScore(5), 1.5);
 }
 
 #[test]
@@ -187,7 +295,7 @@ fn score_hints()
 	assert_eq!(s.GetVarScore(4), plain.GetVarScore(4));
 	// The variable with the highest score is decided first
 	assert_eq!(s.GetLitDecLevel(5), 1);
-	assert_eq!(s.m_Topi.m_ExtHints.m_PendingScores, [(9, 2.)]);
+	assert_eq!(s.m_Topi.m_ExtHints.m_PendingScores.m_Hints, [(9, 2.)]);
 	s.AddClause(&[9, 7]);
 	assert_eq!(Solve(&mut s, &[]), TToporReturnVal::RET_SAT);
 	assert!(s.m_Topi.m_ExtHints.m_PendingScores.is_empty());
@@ -262,8 +370,8 @@ fn hints_file_round_trip()
 	let mut s = NewSolver::<u32, false>(true);
 	s.SetParam("/decision/score_hints/mult", 1.);
 	assert_eq!(s.ReadHints("c a comment\ns SATISFIABLE\nv 1 -2 0\n\n  3 -4 0\nb 2 0.5\nv 0\n"), Ok((4, 1)));
-	assert_eq!(s.m_Topi.m_ExtHints.m_PendingPhases, [1, -2, 3, -4]);
-	assert_eq!(s.m_Topi.m_ExtHints.m_PendingScores, [(2, 0.5)]);
+	assert_eq!(s.m_Topi.m_ExtHints.m_PendingPhases.m_Hints, [(1, false), (2, true), (3, false), (4, true)]);
+	assert_eq!(s.m_Topi.m_ExtHints.m_PendingScores.m_Hints, [(2, 0.5)]);
 	assert_eq!(s.ReadHints("v 1\nv 2 x 0\n"), Err("hints: cannot parse line 2: v 2 x 0".to_string()));
 	assert_eq!(s.ReadHints("b 1\n"), Err("hints: cannot parse line 1: b 1".to_string()));
 	assert_eq!(s.ReadHints("b x 1\n"), Err("hints: cannot parse line 1: b x 1".to_string()));

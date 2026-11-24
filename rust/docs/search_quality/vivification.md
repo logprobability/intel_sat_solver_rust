@@ -90,6 +90,9 @@ on the 3-colouring ones 38 to 40%, by 3.0 to 3.3; on random 3-SAT 29%, by 2.5; o
 * Only learnt clauses are vivified (the clauses of the user are never touched), a clause is tried once (a clause, which was shortened, is a new clause and is tried again), and the trail is not reused
   between two clauses (CaDiCaL and Kissat sort the candidates, so that consecutive ones share decisions); the budget is measured in propagated literals, not in memory accesses (see 4 above).
 * A round runs at decision level 0: the assumptions are taken off the trail and propagated again after the round, which is a fixed cost per round for queries under many assumptions.
-* The DRAT proof gets a `d` line per replaced clause, right after the line of the clause which replaces it; these are the only deletions the solver writes.
+* The DRAT proof gets a `d` line per replaced clause, right after the line of the clause which replaces it. With the extension on, it also gets the shortened clause and a `d` line for the original one,
+  when simplification removes the literals falsified at level 0 from a learnt clause in place, so that every `d` line names a clause the proof holds (a checker ignores a deletion of a clause it doesn't know);
+  these are the only deletions the solver writes.
+* A round is stopped before its next clause by the interrupt flag, the StopNow callback and the timeouts, and its memory is held by the solver's containers (a failed allocation is a memory-out status, not an abort).
   The proofs of 13 unsatisfiable instances (factoring, colouring, pigeonhole, random) in the three solver modes, textual and binary, with a round every 2000 conflicts at the effort 0.3
   (1.5 to 17 thousand replaced clauses per proof) were verified by `drat-trim`: 78 of 78.
