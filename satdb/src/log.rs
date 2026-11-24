@@ -1238,4 +1238,34 @@ mod tests
 			time("tx_range, per datom", logged, &mut || db.tx_range(1, db.basis_t() + 1).iter().map(|t| t.data.len()).sum());
 		}
 	}
+
+	// The time of reading the top 1% of an attribute's values: from the index (`index_range`) and by filtering the attribute, and by a query
+	// whose comparison bounds the index against the same query with a Float bound, which is left to the predicate
+	// (release: cargo test --release range_timings -- --ignored --nocapture)
+	#[test]
+	#[ignore]
+	fn range_timings()
+	{
+		use std::ops::Bound;
+		let scratch = Scratch::new("range_timings");
+		let path = scratch.path("ranges.log");
+		big_log(&path, 20_000);
+		let db = Conn::open(&path).unwrap().db().compacted();
+		let (n, lo) = (db.attr_id("n").unwrap(), Value::Int(990));
+		for (what, view) in [("current", db.clone()), ("as of 3/4", db.as_of(db.basis_t() * 3 / 4).unwrap()), ("history", db.history())]
+		{
+			let time = |name: &str, f: &mut dyn FnMut() -> usize| {
+				let (t, mut rows) = (std::time::Instant::now(), 0);
+				for _ in 0..20
+				{
+					rows = f();
+				}
+				println!("{what}: {name}: {:?} ({rows} rows)", t.elapsed() / 20);
+			};
+			time("index_range", &mut || view.index_range(n, Bound::Included(&lo), Bound::Unbounded).len());
+			time("the attribute, filtered", &mut || view.datoms(None, n, None).into_iter().filter(|d| d.v >= lo).count());
+			time("query, bound in the index", &mut || view.q("[:find ?e ?v :where [?e :n ?v] [(>= ?v 990)]]", &[]).unwrap().len());
+			time("query, bound left to the predicate", &mut || view.q("[:find ?e ?v :where [?e :n ?v] [(>= ?v 990.0)]]", &[]).unwrap().len());
+		}
+	}
 }

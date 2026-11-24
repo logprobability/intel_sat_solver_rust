@@ -48,6 +48,7 @@ use crate::log::Log;
 use crate::pmap::PMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1014,7 +1015,7 @@ impl Db
 		let d = |e: Eid, v: &Value, tx: Eid, added: bool| Datom { e, a, v: v.clone(), tx, added };
 		let hist = |index: &HIndex, prefix: &[Key]| index.scan(prefix).map(|c| c.datom()).collect();
 		// An as-of view reads the history, which gives the current datoms as of its basis
-		let mut out: Vec<Datom> = match (self.history || self.upto.is_some(), e, v)
+		let out: Vec<Datom> = match (self.history || self.upto.is_some(), e, v)
 		{
 			(false, Some(e), Some(v)) => self.eavt.get(&(e, a, v.clone())).map(|tx| d(e, v, *tx, true)).into_iter().collect(),
 			(false, Some(e), None) => self.eavt.seek(|k| (k.0, k.1) < (e, a)).take_while(|(k, _)| (k.0, k.1) == (e, a)).map(|(k, tx)| d(e, &k.2, *tx, true)).collect(),
@@ -1025,6 +1026,42 @@ impl Db
 			(true, None, Some(v)) => hist(&self.havet, &[Key::A(a), Key::V(v)]),
 			(true, None, None) => hist(&self.haevt, &[Key::A(a)]),
 		};
+		self.in_view(out)
+	}
+
+	/// The datoms of attribute `a` in this view whose value is within the bounds, in the order of the AVET index (by value, then entity):
+	/// Datomic's `index-range`. The range is located in the index, so the cost is that of the datoms returned (in an as-of or history view,
+	/// of their history). The values of an attribute have its type, so bounds of another type give all of its datoms or none
+	pub fn index_range(&self, a: AttrId, lo: Bound<&Value>, hi: Bound<&Value>) -> Vec<Datom>
+	{
+		let out = if self.history || self.upto.is_some()
+		{
+			self.havet.scan_range(&[Key::A(a)], lo, hi).map(|c| c.datom()).collect()
+		}
+		else
+		{
+			let below = |v: &Value| match lo
+			{
+				Bound::Unbounded => false,
+				Bound::Included(lo) => v < lo,
+				Bound::Excluded(lo) => v <= lo,
+			};
+			let within = |v: &Value| match hi
+			{
+				Bound::Unbounded => true,
+				Bound::Included(hi) => v <= hi,
+				Bound::Excluded(hi) => v < hi,
+			};
+			let rows = self.avet.seek(|k| k.0 < a || (k.0 == a && below(&k.1))).take_while(|(k, _)| k.0 == a && within(&k.1));
+			rows.map(|(k, tx)| Datom { e: k.2, a, v: k.1.clone(), tx: *tx, added: true }).collect()
+		};
+		self.in_view(out)
+	}
+
+	// The datoms of this view among those read from its indexes (the current ones, or the history's in a history or as-of view),
+	// which are in an index's order
+	fn in_view(&self, mut out: Vec<Datom>) -> Vec<Datom>
+	{
 		match (self.upto, self.history)
 		{
 			(Some(upto), true) => out.retain(|d| d.tx <= upto),
@@ -3140,6 +3177,69 @@ pub(crate) mod tests
 			assert_eq!(view.transact(&Tx::new()).err(), Some(Error::FilteredDb));
 		}
 		assert_eq!(latest.as_of(latest.basis_t()).unwrap().upto, None);
+	}
+
+	// index_range against the attribute's datoms filtered and sorted in AVET order, on every kind of view, for every attribute
+	// (the transactions' instants included) and bounds of every kind, on values of the attribute and of other types
+	#[test]
+	fn index_range_matches_a_filtered_scan()
+	{
+		let (conn, _) = random_conn(37, 60);
+		let db = conn.db();
+		let views = [
+			("current", db.clone()),
+			("compacted", db.compacted()),
+			("history", db.history()),
+			("as of 30", db.as_of(30).unwrap()),
+			("history as of 45", db.as_of(45).unwrap().history()),
+			("since 20", db.since(20).unwrap()),
+			("as of 50 since 10", db.as_of(50).unwrap().since(10).unwrap()),
+			("history since 25", db.history().since(25).unwrap()),
+		];
+		let mut rng = Rng::new(9);
+		let mut nonempty = 0;
+		for (what, view) in &views
+		{
+			for name in RANDOM_ATTRS.iter().chain([&TX_INSTANT])
+			{
+				let a = db.attr_id(name).unwrap();
+				let all = view.datoms(None, a, None);
+				let mut vals: Vec<Value> = db.history().datoms(None, a, None).into_iter().map(|d| d.v).collect();
+				vals.extend([Value::Int(-1), Value::Int(2), Value::from("b"), Value::Bool(true), Value::Ref(3), Value::Instant(305)]);
+				for _ in 0..40
+				{
+					let mut bound = || {
+						let v = &vals[(rng.next() % vals.len() as u64) as usize];
+						match rng.next() % 4
+						{
+							0 => Bound::Unbounded,
+							1 => Bound::Excluded(v),
+							_ => Bound::Included(v),
+						}
+					};
+					let (lo, hi) = (bound(), bound());
+					let within = |d: &&Datom| {
+						let above = match lo
+						{
+							Bound::Unbounded => true,
+							Bound::Included(v) => d.v >= *v,
+							Bound::Excluded(v) => d.v > *v,
+						};
+						above && match hi
+						{
+							Bound::Unbounded => true,
+							Bound::Included(v) => d.v <= *v,
+							Bound::Excluded(v) => d.v < *v,
+						}
+					};
+					let mut want: Vec<Datom> = all.iter().filter(within).cloned().collect();
+					want.sort_by(|x, y| (&x.v, x.e, x.tx, x.added).cmp(&(&y.v, y.e, y.tx, y.added)));
+					nonempty += usize::from(!want.is_empty() && want.len() < all.len());
+					assert_eq!(view.index_range(a, lo, hi), want, "{what}: {name} from {lo:?} to {hi:?}");
+				}
+			}
+		}
+		assert!(nonempty > 300, "{nonempty} proper ranges with datoms");
 	}
 
 	// A compacted value is the same database, with one segment per history index, and so are its views; the value it came from keeps

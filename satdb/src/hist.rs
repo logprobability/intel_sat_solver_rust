@@ -24,6 +24,7 @@ use crate::db::{AttrId, Datom, Eid, Value};
 use crate::succinct::{width_of, Bits, EliasFano, EliasFanoIter};
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::sync::Arc;
 
 /// A full tail becomes a segment (a tiny one in the tests, so that the small histories of the database's tests are in many segments)
@@ -312,6 +313,52 @@ impl Segment
 		(lo < hi).then_some((lo, hi))
 	}
 
+	// The range of the entries with the key prefix whose next column, the value, is within the bounds, if there are any
+	fn value_range(&self, prefix: &[Key], lo: Bound<&Value>, hi: Bound<&Value>) -> Option<(usize, usize)>
+	{
+		let (start, end) = self.range(prefix)?;
+		// The ranks keep the values' order, so the bounds are a range of ranks
+		let from = match lo
+		{
+			Bound::Unbounded => 0,
+			Bound::Included(v) => self.dict.partition_point(|x| x < v),
+			Bound::Excluded(v) => self.dict.partition_point(|x| x <= v),
+		} as u64;
+		let to = match hi
+		{
+			Bound::Unbounded => self.dict.len(),
+			Bound::Included(v) => self.dict.partition_point(|x| x <= v),
+			Bound::Excluded(v) => self.dict.partition_point(|x| x < v),
+		} as u64;
+		// Among the entries of the prefix, the value's column is in order
+		let c = prefix.len();
+		let first_at_least = |rank: u64| {
+			let (mut lo, mut hi) = (start, end);
+			while lo < hi
+			{
+				let mid = lo + (hi - lo) / 2;
+				if self.col(mid, c) < rank { lo = mid + 1 } else { hi = mid }
+			}
+			lo
+		};
+		let (lo, hi) = (first_at_least(from), first_at_least(to));
+		(lo < hi).then_some((lo, hi))
+	}
+
+	// The integer of column c of entry i
+	fn col(&self, i: usize, c: usize) -> u64
+	{
+		if c < self.lead_cols
+		{
+			let lead = self.lead.iter_from(i).next().expect("a lead for each entry");
+			lead.wrapping_shr(self.places[c]) & !shl(!0, self.widths[c])
+		}
+		else
+		{
+			self.rows.get(i * self.row_bits + self.places[c] as usize, self.widths[c])
+		}
+	}
+
 	// The integers of the columns of entry i, given its lead, and its `added` flag
 	#[inline]
 	fn ints(&self, i: usize, lead: u64) -> ([u64; 4], bool)
@@ -501,10 +548,45 @@ impl HIndex
 	pub(crate) fn scan<'a>(&'a self, prefix: &[Key]) -> Scan<'a>
 	{
 		debug_assert!(is_prefix_of(prefix, &self.order), "{prefix:?} isn't a prefix of {:?}", self.order);
-		let mut heads = Vec::new();
-		for seg in self.segs.iter()
+		self.merged(self.segs.iter().map(|seg| seg.range(prefix)), self.tail_of(prefix))
+	}
+
+	/// The entries whose leading columns are `prefix` and whose next column, which must be the value, is within the bounds, in order:
+	/// the value's range is located in each segment (by the ranks of the bounds in its dictionary) and in the tail, not scanned for
+	pub(crate) fn scan_range<'a>(&'a self, prefix: &[Key], lo: Bound<&Value>, hi: Bound<&Value>) -> Scan<'a>
+	{
+		debug_assert!(is_prefix_of(prefix, &self.order) && self.order.get(prefix.len()) == Some(&Col::V), "{prefix:?} isn't a prefix of {:?} before its value", self.order);
+		let tail = self.tail_of(prefix);
+		let from = tail.partition_point(|d| match lo
 		{
-			if let Some(range) = seg.range(prefix)
+			Bound::Unbounded => false,
+			Bound::Included(v) => d.v < *v,
+			Bound::Excluded(v) => d.v <= *v,
+		});
+		let to = tail.partition_point(|d| match hi
+		{
+			Bound::Unbounded => true,
+			Bound::Included(v) => d.v <= *v,
+			Bound::Excluded(v) => d.v < *v,
+		});
+		self.merged(self.segs.iter().map(|seg| seg.value_range(prefix, lo, hi)), &tail[from.min(to)..to])
+	}
+
+	// The tail's entries whose leading columns are `prefix`
+	fn tail_of(&self, prefix: &[Key]) -> &[Datom]
+	{
+		let lo = self.tail.partition_point(|d| cmp_prefix(&Change::of(d), prefix).is_lt());
+		let hi = lo + self.tail[lo..].partition_point(|d| cmp_prefix(&Change::of(d), prefix).is_eq());
+		&self.tail[lo..hi]
+	}
+
+	// The merge of a range of each segment (if any) and of entries of the tail
+	fn merged<'a>(&'a self, ranges: impl Iterator<Item = Option<(usize, usize)>>, tail: &'a [Datom]) -> Scan<'a>
+	{
+		let mut heads = Vec::new();
+		for (seg, range) in self.segs.iter().zip(ranges)
+		{
+			if let Some(range) = range
 			{
 				let mut cursor = Cursor::of(seg, self.order, range);
 				if let Some(first) = cursor.next()
@@ -513,9 +595,7 @@ impl HIndex
 				}
 			}
 		}
-		let lo = self.tail.partition_point(|d| cmp_prefix(&Change::of(d), prefix).is_lt());
-		let hi = lo + self.tail[lo..].partition_point(|d| cmp_prefix(&Change::of(d), prefix).is_eq());
-		let mut cursor = Cursor::Tail(self.tail[lo..hi].iter());
+		let mut cursor = Cursor::Tail(tail.iter());
 		if let Some(first) = cursor.next()
 		{
 			heads.push((first, cursor));
@@ -633,6 +713,68 @@ mod tests
 		}
 		assert_reads(&HIndex::new(EAVT), &[], &[random_entry(&mut Rng::new(1), false)], "empty");
 		assert_reads(&HIndex::from_sorted(LOG, Vec::new()), &[], &[], "built empty");
+	}
+
+	// In every order: the entries of the key prefix before the value whose value is within bounds read like the sorted list filtered,
+	// for bounds of every kind (inverted ones too) on values the index has and values it doesn't, through several segments and compacted
+	#[test]
+	fn value_ranges_match_a_sorted_list()
+	{
+		for (o, order) in [EAVT, AEVT, AVET, VAET, LOG].iter().enumerate()
+		{
+			let mut rng = Rng::new(60 + o as u64);
+			let mut index = HIndex::new(*order);
+			let mut model: Vec<Datom> = Vec::new();
+			while model.len() < 3003
+			{
+				let d = random_entry(&mut rng, *order == VAET);
+				if let Err(at) = model.binary_search_by(|x| cmp_datoms(order, x, &d))
+				{
+					model.insert(at, d.clone());
+					index.insert(d);
+				}
+			}
+			let mut compact = index.clone();
+			compact.compact();
+			assert!(index.segments() > 1 && compact.segments() == 1);
+			let v_col = order.iter().position(|col| *col == Col::V).unwrap();
+			let mut nonempty = 0;
+			for _ in 0..600
+			{
+				let pick = |rng: &mut Rng| if rng.next() % 4 == 0 { random_entry(rng, false) } else { model[(rng.next() % model.len() as u64) as usize].clone() };
+				let (probe, x, y) = (pick(&mut rng), pick(&mut rng).v, pick(&mut rng).v);
+				let prefix = prefixes(order, &probe).swap_remove(v_col);
+				let mut bound = |v| match rng.next() % 4
+				{
+					0 => Bound::Unbounded,
+					1 => Bound::Excluded(v),
+					_ => Bound::Included(v),
+				};
+				let (lo, hi) = (bound(&x), bound(&y));
+				let within = |d: &Datom| {
+					let above = match lo
+					{
+						Bound::Unbounded => true,
+						Bound::Included(v) => d.v >= *v,
+						Bound::Excluded(v) => d.v > *v,
+					};
+					above && match hi
+					{
+						Bound::Unbounded => true,
+						Bound::Included(v) => d.v <= *v,
+						Bound::Excluded(v) => d.v < *v,
+					}
+				};
+				let want: Vec<Datom> = model.iter().filter(|d| cmp_prefix(&Change::of(d), &prefix).is_eq() && within(d)).cloned().collect();
+				nonempty += usize::from(!want.is_empty());
+				for (index, what) in [(&index, "segments"), (&compact, "compacted")]
+				{
+					assert_eq!(index.scan_range(&prefix, lo, hi).map(|c| c.datom()).collect::<Vec<_>>(), want, "{order:?} {what}: {prefix:?} from {lo:?} to {hi:?}");
+				}
+			}
+			assert!(nonempty > 100, "{order:?}: {nonempty} ranges with entries");
+		}
+		assert_eq!(HIndex::new(AVET).scan_range(&[Key::A(1)], Bound::Unbounded, Bound::Unbounded).count(), 0);
 	}
 
 	// In every order: compaction leaves one segment that reads like the index it came from (whose clone still reads the same),
