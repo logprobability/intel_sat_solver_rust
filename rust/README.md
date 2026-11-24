@@ -180,9 +180,12 @@ Every clause it adds is implied by the formula, so the answers, the models, the 
     scripts/phase_oracle_ceiling.py          # the oracle-ceiling experiment; writes docs/search_quality/ceiling_tables.md (the reading is in ceiling.md)
     scripts/target_phase_bench.py            # target phases and rephasing versus the baseline; writes docs/search_quality/target_phase_tables.md (the reading is in target_phase.md)
     scripts/vivify_bench.py                  # vivification versus the baseline; writes docs/search_quality/vivification_tables.md (the reading is in vivification.md)
+    scripts/tune_params.py [--loo] --tune <instance.cnf>... [--validate <instance.cnf>...] [--out FILE.md]   # the configurator: random search, then coordinate descent, PAR-2 on conflicts or time
+    scripts/search_quality_final.py          # the baseline, every extension, all of them and the tuned configurations side by side; writes docs/search_quality/final_tables.md
 
 `search_quality_bench.py` runs the release executable under named configurations (sets of parameters, the first one being the baseline) and tabulates the status, the conflicts,
 the decisions, the restarts and the CPU time per instance and configuration, with the geometric means of the ratios to the baseline; it fails, if two configurations give contradicting answers.
+`docs/search_quality/README.md` is the summary: what was built, how to use it, the final results and their caveats, and the recommended configuration (the defaults for the planner workload).
 
 ## Upstream issues found while testing the fork
 
