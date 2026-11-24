@@ -8,7 +8,8 @@
 //! `run` then finishes the optimization (within `RUN_BUDGET` conflicts) and executes the plan as nested loops,
 //! each clause using the index that its bound positions select (EAVT, AVET or AEVT; their history counterparts in a history view,
 //! where a pattern can also match the datom's transaction and added flag, see `Query::pattern_tx`).
-//! A pattern that binds its value reads only the range of AVET that its body's comparisons of that value allow (`Step::Range`).
+//! A pattern that binds its value reads only the range of AVET that its body's comparisons of that value allow (`Step::Range`),
+//! and the planner estimates the pattern by the fraction of its attribute that comparisons with constants keep (`Query::charge`).
 //! The `parse` module reads the same queries from a Datalog text (`Db::q`).
 //!
 //! # Clauses
@@ -282,10 +283,11 @@ pub(crate) fn unbound_need(body: &[Clause], pre: &BTreeSet<VarId>) -> Option<Var
 	body.iter().flat_map(|c| c.needs_binds().0).find(|x| !pre.contains(x) && !binds.contains(x))
 }
 
-/// The planner's weights of a pattern, from the attribute's statistics: the fanout is the number of datoms matching per input row
-pub(crate) fn pattern_weights(s: AttrStats) -> [u32; 4]
+/// The planner's weights of a pattern, from the attribute's statistics: the fanout is the number of datoms matching per input row,
+/// of which the comparisons charged at the pattern keep the fraction `kept`
+pub(crate) fn pattern_weights(s: AttrStats, kept: f64) -> [u32; 4]
 {
-	let d = s.datoms as f64;
+	let d = s.datoms as f64 * kept;
 	let (e, v) = (s.entities.max(1) as f64, s.values.max(1) as f64);
 	monotone([d, d / e, d / v, d / (e * v)].map(weight_of_fanout))
 }
@@ -640,17 +642,72 @@ impl Query
 		let calls = self.materialize(&c, &mut rels);
 		self.rels = rels;
 		self.rules_used |= calls?;
-		let shape = self.shape(&c, &vec![false; self.vars.len()], &Ctx { rels: &self.rels, delta: None });
 		self.clauses.push(c);
+		let (i, pre, ctx) = (self.clauses.len() - 1, vec![false; self.vars.len()], Ctx { rels: &self.rels, delta: None });
+		let shape = self.shape(&self.clauses, i, &pre, &ctx);
+		// The earlier clauses whose estimates the clause changes: the pattern that a comparison is charged at, and the comparisons
+		// that are charged at a pattern (see `charge`)
+		let charged: Vec<usize> = match &self.clauses[i]
+		{
+			Clause::Pred { .. } => self.charge(&self.clauses[i], &self.clauses, &pre).map(|charge| charge.0).into_iter().collect(),
+			Clause::Pattern { .. } => (0..i).filter(|&p| self.charge(&self.clauses[p], &self.clauses, &pre).is_some_and(|charge| charge.0 == i)).collect(),
+			_ => Vec::new(),
+		};
+		let reweighed: Vec<(usize, [u32; 4])> = charged.into_iter().map(|c| (c, self.shape(&self.clauses, c, &pre, &ctx).weights)).collect();
 		self.planner.add_clause(shape, self.vars.len());
+		for (c, weights) in reweighed
+		{
+			self.planner.reweigh(c, weights);
+		}
 		self.planner.refine(ONLINE_BUDGET);
-		Ok(self.clauses.len() - 1)
+		Ok(i)
 	}
 
-	// The planner's view of a clause, with the variables of `pre` bound beforehand (they count as constants);
-	// a rule call is estimated from the relation that `ctx` gives it
-	pub(crate) fn shape(&self, c: &Clause, pre: &[bool], ctx: &Ctx) -> ClauseShape
+	// Where a comparison's selectivity is charged: a comparison of a variable (not bound beforehand) with a constant is charged at the
+	// first pattern of `body` whose value is that variable, if the attribute has the constant's type. Gives that pattern's index and
+	// attribute, and the comparison as `value op constant`. The pattern's estimates are scaled by the fraction of its datoms that the
+	// comparison keeps (`kept`), which is exact when the pattern reads the range (`Step::Range`), and the comparison then keeps every row
+	fn charge<'c>(&self, c: &'c Clause, body: &[Clause], pre: &[bool]) -> Option<(usize, AttrId, Cmp, &'c Value)>
 	{
+		let (x, op, k) = match c
+		{
+			Clause::Pred { op, l: Term::Var(x), r: Term::Val(k) } => (*x, *op, k),
+			Clause::Pred { op, l: Term::Val(k), r: Term::Var(x) } => (*x, op.flipped(), k),
+			_ => return None,
+		};
+		if pre[x]
+		{
+			return None;
+		}
+		let (at, a) = body.iter().enumerate().find_map(|(i, b)| match b
+		{
+			Clause::Pattern { a, v, .. } if var_of(v) == Some(x) => Some((i, *a)),
+			_ => None,
+		})?;
+		(self.db.attr(a).value_type == k.value_type()).then_some((at, a, op, k))
+	}
+
+	// The fraction of the datoms of attribute `a` whose value `v` satisfies `v op k`, counted in the index
+	fn kept(&self, a: AttrId, op: Cmp, k: &Value) -> f64
+	{
+		let part = |lo, hi| self.db.range_fraction(a, lo, hi);
+		let (inc, exc, open) = (Bound::Included(k), Bound::Excluded(k), Bound::Unbounded);
+		match op
+		{
+			Cmp::Eq => part(inc, inc),
+			Cmp::Ne => 1.0 - part(inc, inc),
+			Cmp::Lt => part(open, exc),
+			Cmp::Le => part(open, inc),
+			Cmp::Gt => part(exc, open),
+			Cmp::Ge => part(inc, open),
+		}
+	}
+
+	// The planner's view of clause `i` of `body`, with the variables of `pre` bound beforehand (they count as constants);
+	// a rule call is estimated from the relation that `ctx` gives it
+	pub(crate) fn shape(&self, body: &[Clause], i: usize, pre: &[bool], ctx: &Ctx) -> ClauseShape
+	{
+		let c = &body[i];
 		let free = |vs: Vec<VarId>| -> Vec<VarId> { vs.into_iter().filter(|&x| !pre[x]).collect() };
 		let (needs, binds) = c.needs_binds();
 		let (needs, binds) = (free(needs), free(binds));
@@ -660,15 +717,22 @@ impl Query
 			{
 				// The tx and added positions bind their variables, but the cost model only distinguishes the entity and value positions
 				let slot = |t: &Term| var_of(t).filter(|&x| !pre[x]);
-				ClauseShape { slots: [slot(e), slot(v)], needs, binds, weights: pattern_weights(self.db.stats(*a)) }
+				// The comparisons charged at the pattern (their fractions multiply, as if independent)
+				let charges = body.iter().filter_map(|p| self.charge(p, body, pre)).filter(|charge| charge.0 == i);
+				let kept: f64 = charges.map(|(_, a, op, k)| self.kept(a, op, k)).product();
+				ClauseShape { slots: [slot(e), slot(v)], needs, binds, weights: pattern_weights(self.db.stats(*a), kept) }
 			}
 			Clause::Rule { args, .. } =>
 			{
 				// Like a pattern whose entity and value positions are the first two arguments
 				let slot = |i: usize| args.get(i).and_then(var_of).filter(|&x| !pre[x]);
-				ClauseShape { slots: [slot(0), slot(1)], needs, binds, weights: pattern_weights(ctx.relation(c).stats()) }
+				ClauseShape { slots: [slot(0), slot(1)], needs, binds, weights: pattern_weights(ctx.relation(c).stats(), 1.0) }
 			}
-			Clause::Pred { op, .. } => ClauseShape { slots: [None, None], needs, binds, weights: [weight_of_fanout(op.selectivity()); 4] },
+			Clause::Pred { op, .. } =>
+			{
+				let passing = if self.charge(c, body, pre).is_some() { 1.0 } else { op.selectivity() };
+				ClauseShape { slots: [None, None], needs, binds, weights: [weight_of_fanout(passing); 4] }
+			}
 			Clause::Not { .. } => ClauseShape { slots: [None, None], needs, binds, weights: [weight_of_fanout(NOT_SELECTIVITY); 4] },
 			Clause::Or { branches, .. } =>
 			{
@@ -681,7 +745,7 @@ impl Query
 				let mut rows = 0.0;
 				for b in branches
 				{
-					let shapes: Vec<ClauseShape> = b.iter().map(|c| self.shape(c, &inner, ctx)).collect();
+					let shapes: Vec<ClauseShape> = (0..b.len()).map(|i| self.shape(b, i, &inner, ctx)).collect();
 					let mut bound = vec![false; pre.len()];
 					let mut log2 = 0.0;
 					for k in greedy_order(&shapes, pre.len(), &[]).expect("unconstrained clauses always have an order")
@@ -874,9 +938,9 @@ impl Query
 	pub(crate) fn compile_body<'a>(&'a self, body: &'a [Clause], mut bound: Vec<bool>, ctx: &Ctx, budget: u64) -> Result<Vec<Step<'a>>, Error>
 	{
 		let mut planner = Planner::new();
-		for c in body
+		for i in 0..body.len()
 		{
-			planner.add_clause(self.shape(c, &bound, ctx), bound.len());
+			planner.add_clause(self.shape(body, i, &bound, ctx), bound.len());
 		}
 		let order = planner.refine(budget).order.clone();
 		self.compile(body, &order, &mut bound, ctx)
@@ -2447,5 +2511,72 @@ pub(crate) mod tests
 		let most = db.datoms(None, n, None).into_iter().map(|d| d.v).max().unwrap();
 		let want: Vec<Vec<Value>> = db.datoms(None, n, Some(&most)).into_iter().map(|d| vec![Value::Ref(d.e)]).collect();
 		assert_eq!(db.q("[:find ?e :where [?e :n ?v] (not-join [?v] [?o :n ?w] [(> ?w ?v)])]", &[]).unwrap(), want);
+	}
+
+	// The planner costs a range by the fraction of the attribute that it keeps, counted in the index: the plan starts from a pattern
+	// whose range is small, whatever the order in which the pattern and its comparisons were added, and not from one whose range
+	// is most of the attribute, nor for a bound that isn't read from the index
+	#[test]
+	fn the_plan_starts_from_a_small_range()
+	{
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		tx.define("big", ValueType::Int, Cardinality::One).define("small", ValueType::Str, Cardinality::One);
+		for i in 0..2000
+		{
+			let e = tx.temp();
+			tx.add(e, "big", i);
+			if i % 2 == 0
+			{
+				tx.add(e, "small", "s");
+			}
+		}
+		conn.transact(&tx).unwrap();
+		let db = conn.db();
+		// The clauses of `[?e :small ?w] [?e :big ?v] [(?v op bound)]`, added in the order `added`; returns the plan in terms of
+		// 's' (small), 'b' (big) and 'p' (the comparison), and the entities found
+		let run = |view: &Db, added: &str, lo: Value, hi: Option<i64>| -> (String, usize) {
+			let mut q = view.query();
+			let (e, w, v) = (q.var("?e"), q.var("?w"), q.var("?v"));
+			let mut names = Vec::new();
+			for c in added.chars()
+			{
+				match c
+				{
+					's' => q.pattern(e.clone(), "small", w.clone()).unwrap(),
+					'b' => q.pattern(e.clone(), "big", v.clone()).unwrap(),
+					_ => q.pred(v.clone(), Cmp::Ge, lo.clone()).unwrap(),
+				};
+				names.push(c);
+			}
+			if let Some(hi) = hi
+			{
+				q.pred(hi, Cmp::Gt, v.clone()).unwrap();
+				names.push('q');
+			}
+			let found = q.run(&[e]).unwrap().len();
+			assert!(q.plan().optimal);
+			(q.plan().order.iter().map(|&c| names[c]).collect(), found)
+		};
+		for added in ["sbp", "spb", "psb", "pbs", "bsp", "bps"]
+		{
+			// 20 of the 2000 values: from the range. 1900 of them: from the 1000 datoms of small
+			let (plan, found) = run(&db, added, Value::Int(1980), None);
+			assert!(plan.starts_with('b') && found == 10, "{added}: {plan}, {found} found");
+			let (plan, found) = run(&db, added, Value::Int(100), None);
+			assert!(plan.starts_with('s') && found == 950, "{added}: {plan}, {found} found");
+			// Two bounds: 20 values between them
+			let (plan, found) = run(&db, added, Value::Int(100), Some(120));
+			assert!(plan.starts_with('b') && found == 10, "{added}: {plan}, {found} found");
+			// A Float bound is compared numerically, by the predicate: the fixed estimate, a third of the attribute
+			let (plan, found) = run(&db, added, Value::Float(1980.0), None);
+			assert!(plan.starts_with('s') && found == 10, "{added}: {plan}, {found} found");
+			// The history has the same datoms here, and an as-of view the latest value's estimates
+			for view in [db.history(), db.as_of(1).unwrap()]
+			{
+				let (plan, found) = run(&view, added, Value::Int(1980), None);
+				assert!(plan.starts_with('b') && found == 10, "{added}: {plan}, {found} found");
+			}
+		}
 	}
 }

@@ -15,6 +15,8 @@ struct Node<K, V>
 	key: K,
 	val: V,
 	prio: u64,
+	/// The number of nodes of the subtree, for `rank`
+	size: usize,
 	left: Link<K, V>,
 	right: Link<K, V>,
 }
@@ -51,7 +53,13 @@ fn prio_of<K: Hash>(key: &K) -> u64
 
 fn node<K, V>(key: K, val: V, prio: u64, left: Link<K, V>, right: Link<K, V>) -> Link<K, V>
 {
-	Some(Arc::new(Node { key, val, prio, left, right }))
+	let size = 1 + size_of(&left) + size_of(&right);
+	Some(Arc::new(Node { key, val, prio, size, left, right }))
+}
+
+fn size_of<K, V>(t: &Link<K, V>) -> usize
+{
+	t.as_ref().map_or(0, |n| n.size)
 }
 
 impl<K: Ord + Hash + Clone, V: Clone> PMap<K, V>
@@ -271,6 +279,26 @@ impl<K: Ord + Hash + Clone, V: Clone> PMap<K, V>
 		}
 		Iter { stack }
 	}
+
+	/// The number of keys for which `below` is true (monotone, as for `seek`: the keys before the one `seek` starts at),
+	/// in logarithmic time, from the subtrees' sizes
+	pub fn rank(&self, below: impl Fn(&K) -> bool) -> usize
+	{
+		let (mut cur, mut rank) = (&self.root, 0);
+		while let Some(n) = cur
+		{
+			if below(&n.key)
+			{
+				rank += 1 + size_of(&n.left);
+				cur = &n.right;
+			}
+			else
+			{
+				cur = &n.left;
+			}
+		}
+		rank
+	}
 }
 
 pub struct Iter<'a, K, V>
@@ -331,6 +359,10 @@ mod tests
 			assert!(m.iter().map(|(k, v)| (*k, *v)).eq(b.iter().map(|(k, v)| (*k, *v))));
 			assert!(m.seek(|k| *k < 250).map(|(k, _)| *k).eq(b.range(250..).map(|(k, _)| *k)));
 			assert_eq!(m.get(&7), b.get(&7));
+			for bound in [0, 1, 123, 250, 499, 500, 600]
+			{
+				assert_eq!(m.rank(|k| *k < bound), b.range(..bound).count(), "the rank of {bound}");
+			}
 		}
 	}
 
@@ -372,6 +404,10 @@ mod tests
 			}
 			assert!(heap(&m.root));
 			assert!(m.iter().map(|(k, v)| (*k, *v)).eq(b.iter().map(|(k, v)| (*k, *v))));
+			for bound in [0, 17, 5_000, 9_999, 10_000]
+			{
+				assert_eq!(m.rank(|k| *k < bound), b.range(..bound).count(), "the rank of {bound} among {n} and more");
+			}
 		}
 	}
 

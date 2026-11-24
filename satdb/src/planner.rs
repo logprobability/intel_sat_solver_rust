@@ -25,6 +25,8 @@
 //! SAT orders the larger queries, incrementally, and explains refused constraints; the tests use the DP as a cross-check of SAT.
 //!
 //! # The encoding (everything is added monotonically, so that nothing has to be retracted when a clause is added)
+//! The one change that isn't an addition is `reweigh`, a clause whose estimate a later clause refined: the DP reads the new weights,
+//! and the SAT planner, if it had encoded the clause, starts over with a new solver.
 //! The clauses are encoded when the SAT planner is first needed (a query larger than `DP_MAX`, or a refused constraint), in the order they were added.
 //! * Order: a tournament over the clauses, one variable per pair, with both 3-cycles of every triple forbidden (an acyclic tournament is a total order).
 //! * Boundness: for each variable `v` at a position of clause `c`, a literal `b(v,c)` with `b(v,c) -> OR_{d binds v} before(d,c) OR tail(v,c)`.
@@ -405,6 +407,27 @@ impl Planner
 		self.nvars = nvars;
 		let (prev, c) = (std::mem::take(&mut self.plan.order), self.shapes.len() - 1);
 		self.set_carried((0..=prev.len()).map(|p| [&prev[..p], &[c], &prev[p..]].concat()));
+	}
+
+	/// Change the weights of clause `c`, whose estimate a clause added later refined (a comparison bounding a pattern's range).
+	/// The encoding only grows, so if the clause is encoded already, the solver starts over, and the next refinement encodes the query again.
+	/// Until then, the plan is the cheaper of the greedy one and the previous one
+	pub(crate) fn reweigh(&mut self, c: usize, weights: [u32; 4])
+	{
+		assert!(weights == monotone(weights), "the weights must not increase when a slot becomes bound");
+		if self.shapes[c].weights == weights
+		{
+			return;
+		}
+		self.shapes[c].weights = weights;
+		if c < self.encoded
+		{
+			let old = std::mem::replace(self, Planner::new());
+			(self.shapes, self.nvars, self.before, self.plan, self.error, self.dp_max) = (old.shapes, old.nvars, old.before, old.plan, old.error, old.dp_max);
+			(self.solves, self.conflicts, self.fallback_cores) = (old.solves, old.conflicts, old.fallback_cores);
+		}
+		let prev = std::mem::take(&mut self.plan.order);
+		self.set_carried(std::iter::once(prev));
 	}
 
 	/// Require clause `a` to run before clause `b`; returns the constraint's index. A constraint under which no order is valid
@@ -1043,6 +1066,67 @@ mod tests
 			assert_eq!(dp.plan().source, PlanSource::Dp);
 			assert_eq!(dp.solves, 0);
 		}
+	}
+
+	// Re-weighing clauses while the query is assembled, between refinements and constraints, ends at the optimum of the final weights:
+	// by the DP, and by SAT, whose solver starts over when the clause is already encoded
+	#[test]
+	fn reweighing_matches_brute_force()
+	{
+		let mut rng = Rng::new(21);
+		let mut restarts = 0;
+		for round in 0..40
+		{
+			let n = 2 + round % 5;
+			let nvars = 1 + (rng.next() % 4) as usize;
+			let mut shapes = random_query(&mut rng, n, nvars);
+			let (mut dp, mut sat) = (Planner::new(), sat_planner());
+			let mut before = Vec::new();
+			for i in 0..n
+			{
+				dp.add_clause(shapes[i].clone(), nvars);
+				sat.add_clause(shapes[i].clone(), nvars);
+				if rng.next() % 3 != 0
+				{
+					sat.refine(if rng.next() % 2 == 0 { u64::MAX } else { 1 });
+					dp.refine(u64::MAX);
+				}
+				let c = (rng.next() % (i as u64 + 1)) as usize;
+				let weights = if shapes[c].binds.is_empty()
+				{
+					[weight_of_fanout(1.0 / (1 + rng.next() % 8) as f64); 4]
+				}
+				else
+				{
+					monotone([0; 4].map(|_| weight_of_fanout((rng.next() % 5000) as f64 / 16.0)))
+				};
+				restarts += usize::from(c < sat.encoded && shapes[c].weights != weights);
+				shapes[c].weights = weights;
+				dp.reweigh(c, weights);
+				sat.reweigh(c, weights);
+				assert!(!sat.plan().optimal || sat.plan().cost == cost_of_order(&shapes[..=i], &sat.plan().order, nvars), "round {round}: a stale plan");
+				let (a, b) = ((rng.next() % (i as u64 + 1)) as usize, (rng.next() % (i as u64 + 1)) as usize);
+				if a != b && rng.next() % 3 == 0
+				{
+					let accepted = dp.require_before(a, b).is_ok();
+					assert_eq!(sat.require_before(a, b).is_ok(), accepted, "round {round}: {a} before {b}");
+					if accepted
+					{
+						before.push((a, b));
+					}
+				}
+			}
+			let best = brute_force(&shapes, nvars, &before).unwrap();
+			for p in [&mut dp, &mut sat]
+			{
+				let plan = p.refine(u64::MAX).clone();
+				assert!(plan.optimal && p.error().is_none(), "round {round}: {:?} {plan:?}", p.error());
+				assert!(respects(&shapes, nvars, &before, &plan.order), "round {round}: invalid order {:?}", plan.order);
+				assert_eq!(plan.cost, best, "round {round}: shapes {shapes:?} constraints {before:?}");
+				assert_eq!(plan.cost, cost_of_order(&shapes, &plan.order, nvars));
+			}
+		}
+		assert!(restarts > 20, "{restarts} restarts of the solver");
 	}
 
 	#[test]

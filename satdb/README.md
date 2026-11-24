@@ -147,7 +147,16 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     the bodies of `not`, `or` and rules too, and in every view. On 20,000 transactions (`cargo test --release range_timings -- --ignored
     --nocapture`, one run), the top 1% of an attribute's values (704 datoms of about 130,000): `index_range` 10 µs against 6.4 ms for
     filtering the attribute, and the query `[?e :n ?v] [(>= ?v 990)]` 2.2 ms against 15.5 ms with the bound left to the predicate
-    (as of a past basis: 187 µs against 11.9 ms, and 1.7 ms against 15.3 ms). The planner doesn't cost the range yet (see below).
+    (as of a past basis: 187 µs against 11.9 ms, and 1.7 ms against 15.3 ms).
+  * The planner costs the range: a comparison of a variable with a constant is *charged at* the first pattern whose value is that
+    variable (of the constant's type). The pattern's estimates are scaled by the fraction of its datoms that the comparison keeps,
+    counted in the index in logarithmic time (`Db::range_fraction`: ranks in the current treap, whose nodes hold their subtree's size,
+    and range lengths in the history segments), and the comparison itself then counts as keeping every row. That is exact where the
+    pattern reads the range; where its entity is bound first, the fraction is applied one clause early. The fractions of several
+    comparisons multiply (so a range between two bounds is overestimated), and a since or as-of view uses the latest value's fraction,
+    like its other statistics. The comparison may be added before or after the pattern: the planner re-weighs the affected clause
+    (`Planner::reweigh`). On the database above, `[?e :tag "a"] [?e :n ?v] [(>= ?v 990)]` (200 entities, where a quarter of the tags are "a") now
+    starts from the range: 1.3 ms, against 27.5 ms held to the previous plan with `require_before` (1.1 ms against 11.2 ms as of a past basis).
   * Find specs (`Query::find`) take plain terms and the aggregates `count`, `count-distinct`, `sum`, `min`, `max` and `avg`, grouped by the plain terms,
     over the distinct tuples of the find and `with` variables, as in Datomic. `sum` of Ints is an exact Int (an error on overflow), and a Float
     once any value is a Float; `avg` is a Float; both take only numbers. Text queries add `(pull ?e [pattern])` in any position and
@@ -182,7 +191,9 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     Feasibility itself is decided exactly by the greedy order (being able to run is monotone in the set of clauses that ran); the core comes
     from the SAT solver (`IsAssumptionRequired` over the constraints' assumptions, shrunk by deletion) and is re-confirmed by that test,
     falling back to deletion with the test if the solver runs out of budget.
-  * Larger queries use one incremental SAT solver per query, encoded when first needed and then extended clause by clause (nothing is retracted),
+  * Larger queries use one incremental SAT solver per query, encoded when first needed and then extended clause by clause (nothing is retracted;
+    the one change that the encoding can't absorb, a clause re-weighed after it was encoded because a comparison added later bounds its range,
+    starts the solver over, and the next refinement encodes the query again),
     with a refinement bounded by a conflict budget after each clause (each solve is charged at least one conflict, so the budget also bounds
     the number of solves, and a spent budget solves nothing; a finite budget is clamped so that the solver's threshold, its conflict count
     plus the budget, doesn't wrap; and a solve can overshoot by the few conflicts of its last round of conflict analysis).
@@ -227,7 +238,9 @@ The crate depends on the solver by path (`../rust`), with the solver's profiles 
                             # evaluator, aggregates against a hand grouping, text queries against the builder, text transactions against the builder
                             # (the same database, entity ids and history included) and their errors' positions, compaction against the
                             # value it came from (and the same transactions after it), value ranges of the indexes against filtered
-                            # scans (every index order, view, kind of bound and comparison, Floats with their zeros and NaN), blanks in not and or, transitive closure
+                            # scans (every index order, view, kind of bound and comparison, Floats with their zeros and NaN), the planner's
+                            # range fractions against counts, re-weighed clauses against brute force (the DP and SAT), plans that start
+                            # from a small range in every order of adding the clauses, blanks in not and or, transitive closure
                             # (four formulations, random graphs with cycles) against Floyd-Warshall, mutual recursion against a
                             # parity search, stratified negation, random rule programs against a naive simultaneous fixpoint,
                             # and the plan count of semi-naive evaluation on a long chain; the durable log: a random history reopened
@@ -273,8 +286,9 @@ This is a start. What is missing, roughly in order of value:
   cut SAT's time from ~40 s; reducing the adder columns in rounds instead of chains made it much slower.)
 * Ordering constraints: only `require_before` on the query's top-level clauses (not inside `not`, `or` or rule bodies), no text syntax,
   and no way to drop an accepted constraint.
-* Cost model: independence assumptions and fixed predicate selectivities; no histograms. A pattern restricted to a range of its index
-  is still estimated as the whole attribute followed by its predicates, so the planner doesn't start from it for its range.
+* Cost model: independence assumptions; no histograms. A comparison with a constant is measured in the index, but one with a variable,
+  or with a constant of another type than the attribute's, still has a fixed selectivity, as does `not`. A pattern whose entity is bound
+  is estimated as if every such entity had the attribute, which overrates plans that start from the other pattern of a join.
 * Indexes: Datomic's five are here (EAVT, AEVT, AVET and VAET, current and historical, and the log), with range access to AVET.
   Not here: a general `datoms`/`seek-datoms` over any index from any position (the accessors read by key prefix, and `index_range` by value),
   composite tuple indexes (`:db/tupleAttrs`: they need a tuple value type, and with it composite unique keys), and Datomic's fulltext

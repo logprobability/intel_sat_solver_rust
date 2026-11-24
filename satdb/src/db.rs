@@ -43,7 +43,7 @@
 //! code as `transact`, so a reopened connection has the same values, down to the index contents and statistics.
 //! `Conn::checkpoint` writes a `Snapshot` next to the log, from which `Db::from_snapshot` rebuilds the value without replaying (see `log`).
 
-use crate::hist::{Change, HIndex, Key, AEVT, AVET, EAVT, LOG, VAET};
+use crate::hist::{after, before, Change, HIndex, Key, AEVT, AVET, EAVT, LOG, VAET};
 use crate::log::Log;
 use crate::pmap::PMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1040,22 +1040,28 @@ impl Db
 		}
 		else
 		{
-			let below = |v: &Value| match lo
-			{
-				Bound::Unbounded => false,
-				Bound::Included(lo) => v < lo,
-				Bound::Excluded(lo) => v <= lo,
-			};
-			let within = |v: &Value| match hi
-			{
-				Bound::Unbounded => true,
-				Bound::Included(hi) => v <= hi,
-				Bound::Excluded(hi) => v < hi,
-			};
-			let rows = self.avet.seek(|k| k.0 < a || (k.0 == a && below(&k.1))).take_while(|(k, _)| k.0 == a && within(&k.1));
+			let rows = self.avet.seek(|k| k.0 < a || (k.0 == a && before(&k.1, lo))).take_while(|(k, _)| k.0 == a && !after(&k.1, hi));
 			rows.map(|(k, tx)| Datom { e: k.2, a, v: k.1.clone(), tx: *tx, added: true }).collect()
 		};
 		self.in_view(out)
+	}
+
+	/// The fraction of the datoms that `stats` counts for attribute `a` whose value is within the bounds, for the planner: counted in
+	/// the index (in logarithmic time, without reading the datoms), so exact for the current value and for its history view, and like
+	/// `stats` an estimate from the latest value in a `since` or `as_of` view. 1 for an attribute without datoms
+	pub(crate) fn range_fraction(&self, a: AttrId, lo: Bound<&Value>, hi: Bound<&Value>) -> f64
+	{
+		let total = self.stats(a).datoms;
+		let count = if self.history
+		{
+			self.havet.count_range(&[Key::A(a)], lo, hi)
+		}
+		else
+		{
+			let (start, end) = (self.avet.rank(|k| k.0 < a || (k.0 == a && before(&k.1, lo))), self.avet.rank(|k| k.0 < a || (k.0 == a && !after(&k.1, hi))));
+			end.saturating_sub(start)
+		};
+		if total == 0 { 1.0 } else { (count as f64 / total as f64).min(1.0) }
 	}
 
 	// The datoms of this view among those read from its indexes (the current ones, or the history's in a history or as-of view),
@@ -3236,6 +3242,13 @@ pub(crate) mod tests
 					want.sort_by(|x, y| (&x.v, x.e, x.tx, x.added).cmp(&(&y.v, y.e, y.tx, y.added)));
 					nonempty += usize::from(!want.is_empty() && want.len() < all.len());
 					assert_eq!(view.index_range(a, lo, hi), want, "{what}: {name} from {lo:?} to {hi:?}");
+					// The planner's fraction is that count, where the view's statistics are its own
+					if ["current", "compacted", "history"].contains(what)
+					{
+						assert_eq!(all.len() as u64, view.stats(a).datoms, "{what}: {name}");
+						let counted = view.range_fraction(a, lo, hi) * all.len() as f64;
+						assert!(all.is_empty() || (counted - want.len() as f64).abs() < 1e-6, "{what}: {name} from {lo:?} to {hi:?}: {counted} of {}", want.len());
+					}
 				}
 			}
 		}

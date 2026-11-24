@@ -1266,6 +1266,19 @@ mod tests
 			time("the attribute, filtered", &mut || view.datoms(None, n, None).into_iter().filter(|d| d.v >= lo).count());
 			time("query, bound in the index", &mut || view.q("[:find ?e ?v :where [?e :n ?v] [(>= ?v 990)]]", &[]).unwrap().len());
 			time("query, bound left to the predicate", &mut || view.q("[:find ?e ?v :where [?e :n ?v] [(>= ?v 990.0)]]", &[]).unwrap().len());
+			// A join that the planner starts from the range once it costs it (a quarter of the tags are "a")
+			time("join, range costed", &mut || view.q("[:find ?e :where [?e :tag \"a\"] [?e :n ?v] [(>= ?v 990)]]", &[]).unwrap().len());
+			time("join, bound left to the predicate", &mut || view.q("[:find ?e :where [?e :tag \"a\"] [?e :n ?v] [(>= ?v 990.0)]]", &[]).unwrap().len());
+			// The same join held to the plan that starts from the tags, which was the plan before ranges were costed
+			time("join, from the tags", &mut || {
+				let mut q = view.query();
+				let (e, v) = (q.var("?e"), q.var("?v"));
+				let tags = q.pattern(e.clone(), "tag", "a").unwrap();
+				let ns = q.pattern(e.clone(), "n", v.clone()).unwrap();
+				q.pred(v, crate::query::Cmp::Ge, 990).unwrap();
+				q.require_before(tags, ns).unwrap();
+				q.run(&[e]).unwrap().len()
+			});
 		}
 	}
 }

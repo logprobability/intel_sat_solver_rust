@@ -135,6 +135,28 @@ fn is_prefix_of(prefix: &[Key], order: &Order) -> bool
 	prefix.len() <= order.len() && prefix.iter().zip(order).all(|(key, col)| matches!((key, col), (Key::E(_), Col::E) | (Key::A(_), Col::A) | (Key::V(_), Col::V) | (Key::Tx(_), Col::Tx)))
 }
 
+/// Whether a value is before a lower bound
+pub(crate) fn before(v: &Value, lo: Bound<&Value>) -> bool
+{
+	match lo
+	{
+		Bound::Unbounded => false,
+		Bound::Included(lo) => v < lo,
+		Bound::Excluded(lo) => v <= lo,
+	}
+}
+
+/// Whether a value is after an upper bound
+pub(crate) fn after(v: &Value, hi: Bound<&Value>) -> bool
+{
+	match hi
+	{
+		Bound::Unbounded => false,
+		Bound::Included(hi) => v > hi,
+		Bound::Excluded(hi) => v >= hi,
+	}
+}
+
 // x << n, for n up to 64
 fn shl(x: u64, n: u32) -> u64
 {
@@ -318,18 +340,7 @@ impl Segment
 	{
 		let (start, end) = self.range(prefix)?;
 		// The ranks keep the values' order, so the bounds are a range of ranks
-		let from = match lo
-		{
-			Bound::Unbounded => 0,
-			Bound::Included(v) => self.dict.partition_point(|x| x < v),
-			Bound::Excluded(v) => self.dict.partition_point(|x| x <= v),
-		} as u64;
-		let to = match hi
-		{
-			Bound::Unbounded => self.dict.len(),
-			Bound::Included(v) => self.dict.partition_point(|x| x <= v),
-			Bound::Excluded(v) => self.dict.partition_point(|x| x < v),
-		} as u64;
+		let (from, to) = (self.dict.partition_point(|x| before(x, lo)) as u64, self.dict.partition_point(|x| !after(x, hi)) as u64);
 		// Among the entries of the prefix, the value's column is in order
 		let c = prefix.len();
 		let first_at_least = |rank: u64| {
@@ -556,20 +567,22 @@ impl HIndex
 	pub(crate) fn scan_range<'a>(&'a self, prefix: &[Key], lo: Bound<&Value>, hi: Bound<&Value>) -> Scan<'a>
 	{
 		debug_assert!(is_prefix_of(prefix, &self.order) && self.order.get(prefix.len()) == Some(&Col::V), "{prefix:?} isn't a prefix of {:?} before its value", self.order);
+		self.merged(self.segs.iter().map(|seg| seg.value_range(prefix, lo, hi)), self.tail_range(prefix, lo, hi))
+	}
+
+	/// The number of entries that `scan_range` gives, without reading them
+	pub(crate) fn count_range(&self, prefix: &[Key], lo: Bound<&Value>, hi: Bound<&Value>) -> usize
+	{
+		let in_segs: usize = self.segs.iter().filter_map(|seg| seg.value_range(prefix, lo, hi)).map(|(start, end)| end - start).sum();
+		in_segs + self.tail_range(prefix, lo, hi).len()
+	}
+
+	// The tail's entries whose leading columns are `prefix` and whose value is within the bounds
+	fn tail_range(&self, prefix: &[Key], lo: Bound<&Value>, hi: Bound<&Value>) -> &[Datom]
+	{
 		let tail = self.tail_of(prefix);
-		let from = tail.partition_point(|d| match lo
-		{
-			Bound::Unbounded => false,
-			Bound::Included(v) => d.v < *v,
-			Bound::Excluded(v) => d.v <= *v,
-		});
-		let to = tail.partition_point(|d| match hi
-		{
-			Bound::Unbounded => true,
-			Bound::Included(v) => d.v <= *v,
-			Bound::Excluded(v) => d.v < *v,
-		});
-		self.merged(self.segs.iter().map(|seg| seg.value_range(prefix, lo, hi)), &tail[from.min(to)..to])
+		let (from, to) = (tail.partition_point(|d| before(&d.v, lo)), tail.partition_point(|d| !after(&d.v, hi)));
+		&tail[from.min(to)..to]
 	}
 
 	// The tail's entries whose leading columns are `prefix`
