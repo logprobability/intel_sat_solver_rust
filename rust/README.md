@@ -70,7 +70,7 @@ The changes are confined to how the same statements are compiled; none changes a
 ## Coverage
 
 `scripts/coverage.sh` runs all the tests under LLVM source-based coverage and fails if any line is neither executed nor explicitly marked in the sources.
-Of the 9597 lines, the tests execute 9590. The rarest solver paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
+Of the 10175 lines, the tests execute 10168. The rarest solver paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
 while another assumption is falsified) are driven by tests on crafted solver states, which the fuzzer never produces. The other 7 lines carry the mark
 `COVERAGE-NOT-REACHED` with its reason: they run only if the system allocator fails, which the test-only allocation-fault injection doesn't simulate,
 or if a decompressor is on the PATH but can't be run. (The script also supports a `COVERAGE-UNREACHABLE` mark; no line carries it.)
@@ -116,6 +116,84 @@ The control flow is the same statement by statement. The differences are confine
   functions and classes of `ToporBitArrayBuffer.hpp` and the `tableByBit`/`tableByEntry` tables of `ToporTableBitInfo.hpp`, with all their static asserts).
 * **The zlib input of `Main.cc` isn't ported:** the Makefile builds the C++ tool with `-DSKIP_ZLIB`, and the port implements that configuration (compressed inputs are read
   through the shell's decompressors, as the C++ tool does then).
+
+## Rust-only extensions
+
+Features without a C++ counterpart live in their own modules (`src/topi_ext_*.rs`) with small, marked hooks in the mirrored files. Each one is gated by a parameter,
+which is off by default, and with the parameters off the solver's behavior, output and proofs are those of the C++ solver (`scripts/diff_vs_cpp.sh`).
+A new parameter must also be listed in `IsParamExcluded` of `src/tests/fuzzing.rs`: the fuzz scenarios draw parameters by index, so a longer list changes all of them, including the ones
+`scripts/coverage.sh` relies on to reach the rare paths. The extension gets its own tests instead (`src/tests/ext_hints.rs`, `src/tests/ext_target_phase.rs`, `src/tests/ext_vivify.rs`), and `TOPOR_FUZZ_EXTRA_PARAMS="<Param> <Val> ..." cargo test fuzz`
+runs all the fuzz scenarios with the given parameters set first, that is, with the extension on.
+
+**Phase and score hints** (`src/topi_ext_hints.rs`): advice for the search, which is never binding, so a wrong hint can only cost time.
+
+* `CTopor::HintPhase(l)` seeds the saved polarity of the variable of `l` *without fixing it* (unlike `FixPolarity`): the solver decides the variable to `l` the next time,
+  but stays free to flip it, and phase saving overwrites the hint as usual. A polarity fixed by `FixPolarity` wins for as long as it is in force. Requires `/phase/hints/on 1`.
+* `CTopor::HintScore(v, score)` boosts the decision score of `v` by `/decision/score_hints/mult` times `score` at the next query, through the machinery of `BoostScore`.
+  Ignored, if the parameter is 0 (the default).
+* The hints are applied by the next `Solve` right before its search loop (if a hinted variable is still assigned
+  above the assumptions by the previous query, the solver backtracks to the assumptions first, as a restart does).
+  One hint of a kind is recorded per variable, and a newer hint replaces the one, which hasn't been applied yet, so hinting again before every query never grows the record beyond the number of the distinct variables hinted.
+  A hint, which the next `Solve` can't apply, waits: a hint for a variable, which doesn't exist yet, waits for the variable; a phase hint for a variable held by the assumptions of the query
+  (an assumption, or a variable they imply) waits for the first later query, in which the variable is free, and then overrides the phase saved in the meantime. A phase hint for a variable assigned at level 0 is dropped.
+  In a sequence of queries an applied hint lasts only until phase saving overwrites it, so it is given again before the query it is meant for
+  (`docs/search_quality/ceiling.md` measures what the hints can and cannot buy).
+  `CTopor::GetSavedPhase(v)` and `CTopor::GetVarScore(v)` read the state to carry over; `CTopor::WriteHints()` / `ReadHints(text)` do it in the hints-file format.
+* The executable: `/topor_tool/hints_file <file>` reads a hints file before the first query, `/topor_tool/write_hints_file <file>` writes one after every query
+  (the saved phases, which are the model after a satisfiable query, and the ranks of the decision scores), and the commands `lh <Lit>` and `ls <Var> <Score>` give hints inside an instance
+  (they are also what `TOPOR_DUMP_NAME` records). A hints file holds `v <Lit> ... 0` lines (phases, as in the model a SAT solver prints; the `v` is optional), `b <Var> <Score>` lines (scores) and comments.
+
+**Target/best-phase saving and rephasing** (`src/topi_ext_target_phase.rs`): the phase oracle the solver generates for itself, as CaDiCaL and Kissat do.
+Only the polarities of decisions change, so the answers, the models and the proofs stay correct.
+
+* `/phase/target/on 1`: the solver records the assignment at the largest conflict-free trail since the latest rephase (the *target* phases) and since the latest rephase
+  to the best phases (the *best* phases), and a decision takes the target phase of its variable in preference to the saved phase.
+  `2`: only while the current restart strategy is the numeric one (arithmetic or Luby), which is this solver's counterpart of a stable mode (under LBD-based restarts the best phases are still tracked for rephasing).
+  There is no alternation of the restart strategies within a query: the solver picks a strategy per query type, and switching in the middle of a query would need the LBD averages to be kept up under both.
+* `/phase/rephase/conf_init N` (0: off): after N conflicts, at the next restart, the saved phases of the unassigned variables are reset: to the original phases (those of the start of the query,
+  which include the phase hints), to their inversion, to the best phases, or they are flipped (`/phase/rephase/random 1`: random instead), in the order O I (B F B O B I)*; the target is reset.
+  After every rephase the interval is multiplied by `/phase/rephase/conf_mult` (1) and incremented by `/phase/rephase/conf_incr` (1000), so the schedule is arithmetic, geometric or both.
+* The existing phase management is in charge: a polarity fixed by `FixPolarity` or forced by `/phase/force_solution` wins over the target phase (but for the restarts, in which the phase stage
+  doesn't force the polarities: `/phase/unforce_restarts_fraction_*`), and a rephase leaves the saved phase of such a variable alone. The target, best and original phases live in spare bits of `m_PolarityInfo`
+  (`FixPolarity` on a variable drops them for that variable). Every query starts without a target, from the saved phases, that is, from the latest model or the hints.
+* Statistics: `m_ExtRephases`, `m_ExtTargetPhaseUpdates` and `m_ExtTargetPhaseDecisions` of `GetStatistics()`; if the extension is on, the statistics lines are followed by
+  `c ToporExt Rephases <N> TargetUpds <N> TargetDecs <N>`.
+* Measurements and the recommended setting (`/phase/target/on 1 /phase/rephase/conf_init 1000` for hard satisfiable queries; off for refutations): `docs/search_quality/target_phase.md`.
+
+**Vivification of learnt clauses** (`src/topi_ext_vivify.rs`): an inprocessing step, which shortens the long learnt clauses (the "vivification: see Kissat paper" of the C++ to-do list).
+Every clause it adds is implied by the formula, so the answers, the models, the cores and the proofs stay correct.
+
+* `/inprocessing/vivify/on 1` adds a vivification round to inprocessing, so it needs `/inprocessing/on 1`, and it runs on the schedule of inprocessing: at the start of every query
+  and, with `/inprocessing/conflicts_before_next N`, at the first restart after every N conflicts (the C++ default of N is "never again in this query").
+* A round backtracks to decision level 0 (the assumptions are taken off the trail and re-assigned after the round, as after a conflict below them) and tests the learnt clauses in the order of
+  increasing glue and decreasing activity: the clause is detached from its watches (so it can't be the reason of its own shortening), the negations of its literals are decided one by one and propagated,
+  and a contradiction, a literal of the clause implied by the previous ones, or literals falsified by propagation leave a clause over a subset of the literals, which replaces the clause
+  (with the lower of the two glues and the activity of the old clause). A unit clause is propagated at level 0; a clause, which wasn't shortened, isn't tried again.
+* `/inprocessing/vivify/effort F` (0.1): a round may propagate F times the literals, which the search has propagated since the previous round (the rounds of short queries are skipped, and their budget is carried over).
+  `/inprocessing/vivify/max_glue G`: only the clauses of the glue G at most are candidates.
+* The proof: the new clause is added before the old one is deleted (`d ...`), and the new-learnt-clause callback is given the new clause. Every deletion names a clause of the proof:
+  while the extension is on, the DRAT file is also told, when simplification removes the literals falsified at level 0 from a learnt clause in place (the shortened clause is added, the original one is deleted;
+  the C++ solver, and this one with the extension off, write nothing then). These are the only deletions the solver writes.
+  The conflicts and the decisions of the statistics are those of the search; the saved phases, the user's polarities and the decision heap are not touched.
+* A round ends before its next clause, when the query is asked to stop: an interrupt or a stop request of the StopNow callback makes `Solve` return right away, as between two decisions of the search,
+  and a global or a local timeout is reported by the search loop right after the round. The memory of a round is held by the solver's own containers: a failed allocation gives `RET_MEM_OUT`, as anywhere else in the solver,
+  and the record of the clauses, which were tried in vain, is bounded (2^20 hashes, 16 Mb).
+* Statistics: `m_ExtVivifyRounds`, `m_ExtVivifyTried`, `m_ExtVivifyShortened`, `m_ExtVivifyLitsRemoved`, `m_ExtVivifyUnits` and `m_ExtVivifyPropagations` of `GetStatistics()`; if the extension is on, the statistics lines
+  are followed by `c ToporExt VivifyRounds <N> Tried <N> Shortened <N> LitsRemoved <N> Units <N> Props <N> SearchProps <N>`.
+* Measurements and the recommended setting: `docs/search_quality/vivification.md`.
+
+**Search-quality measurements** (`scripts/search_quality_bench.py`, `scripts/phase_oracle_ceiling.py`, `scripts/target_phase_bench.py`, `scripts/vivify_bench.py`, `docs/search_quality/`):
+
+    scripts/search_quality_bench.py --config base= --config hinted="/phase/hints/on 1 /topor_tool/hints_file hints/{inst}.hints" [--out PREFIX] <instance.cnf>...
+    scripts/phase_oracle_ceiling.py          # the oracle-ceiling experiment; writes docs/search_quality/ceiling_tables.md (the reading is in ceiling.md)
+    scripts/target_phase_bench.py            # target phases and rephasing versus the baseline; writes docs/search_quality/target_phase_tables.md (the reading is in target_phase.md)
+    scripts/vivify_bench.py                  # vivification versus the baseline; writes docs/search_quality/vivification_tables.md (the reading is in vivification.md)
+    scripts/tune_params.py [--loo] --tune <instance.cnf>... [--validate <instance.cnf>...] [--out FILE.md]   # the configurator: random search, then coordinate descent, PAR-2 on conflicts or time
+    scripts/search_quality_final.py          # the baseline, every extension, all of them and the tuned configurations side by side; writes docs/search_quality/final_tables.md
+
+`search_quality_bench.py` runs the release executable under named configurations (sets of parameters, the first one being the baseline) and tabulates the status, the conflicts,
+the decisions, the restarts and the CPU time per instance and configuration, with the geometric means of the ratios to the baseline; it fails, if two configurations give contradicting answers.
+`docs/search_quality/README.md` is the summary: what was built, how to use it, the final results and their caveats, and the recommended configuration (the defaults for the planner workload).
 
 ## Upstream issues found while testing the fork
 

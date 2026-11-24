@@ -568,6 +568,21 @@ topi_params!
 	m_ParamIngInvokeEveryQueryAfterInitPostpone: bool = single("/inprocessing/invoke_every_query_after_init_postpone", "Inprocessing: invoke right after every query after /inprocessing/postpone_first_inv_conflicts conflicts", true);
 	m_ParamIngPostponeFirstInvConflicts: u32 = single("/inprocessing/postpone_first_inv_conflicts", "Inprocessing: conflicts to postpone the very first inprocessing invocation", 0);
 	m_ParamIngConflictsBeforeNextInvocation: u32 = single("/inprocessing/conflicts_before_next", "Inprocessing: conflicts before the next invocation", u32::MAX);
+
+	// Parameters of the Rust-only extensions (no C++ counterpart; each one is off by default, which leaves the solver's behavior identical to that of the C++ solver)
+	// Phase and score hints (topi_ext_hints.rs)
+	m_ParamPhaseHintsOn: bool = single("/phase/hints/on", "Rust-only: phase hints: let HintPhase (the lh command, /topor_tool/hints_file) seed the saved polarity of a variable without fixing it", false);
+	m_ParamScoreHintsMult: f64 = single("/decision/score_hints/mult", "Rust-only: score hints: HintScore (the ls command, /topor_tool/hints_file) boosts the decision score of its variable by this value times the hinted score at the next query (0: score hints are ignored)", 0., 0.);
+	// Target/best-phase saving and rephasing (topi_ext_target_phase.rs)
+	m_ParamTargetPhaseOn: u8 = single("/phase/target/on", "Rust-only: target phase: decide a variable, whose polarity isn't forced, to its phase in the largest conflict-free trail since the latest rephase in preference to its saved phase: 0: off; 1: on; 2: on only while the current restart strategy is the numeric one (the stable-mode counterpart)", 0, 0, 2);
+	m_ParamRephaseConfInit: u32 = single("/phase/rephase/conf_init", "Rust-only: rephasing: the number of conflicts before the first rephase, which resets the saved phases to the original, inverted, best or flipped ones (O I (B F B O B I)*) and resets the target phases (0: no rephasing)", 0);
+	m_ParamRephaseConfIncr: u32 = single("/phase/rephase/conf_incr", "Rust-only: rephasing: after every rephase the interval in conflicts till the next one is multiplied by /phase/rephase/conf_mult and incremented by this value", 1000);
+	m_ParamRephaseConfMult: f64 = single("/phase/rephase/conf_mult", "Rust-only: rephasing: the multiplier of the interval between two rephases (see /phase/rephase/conf_incr)", 1., 1.);
+	m_ParamRephaseRandom: bool = single("/phase/rephase/random", "Rust-only: rephasing: random phases instead of the flipped ones (the F of the schedule)", false);
+	// Vivification of learnt clauses (topi_ext_vivify.rs)
+	m_ParamVivifyOn: bool = single("/inprocessing/vivify/on", "Rust-only: vivification: let inprocessing (so, /inprocessing/on is required, and /inprocessing/conflicts_before_next schedules it) shorten the long learnt clauses: at decision level 0 the negations of the literals of a clause are propagated one by one, and the clause is replaced by the subset of its literals, which a contradiction or an implied literal is derived from", false);
+	m_ParamVivifyEffort: f64 = single("/inprocessing/vivify/effort", "Rust-only: vivification: the propagations, which a round may spend, as a fraction of the propagations of the search since the previous round", 0.1, 0.);
+	m_ParamVivifyMaxGlue: u32 = single("/inprocessing/vivify/max_glue", "Rust-only: vivification: only the learnt clauses, whose glue is not higher than this value, are candidates (the clauses of a lower glue go first anyway)", u32::MAX);
 }
 
 // The state of the C++ CTopiParams class proper (which, unlike here, doesn't hold the parameter values, since they are members of the solver class)

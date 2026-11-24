@@ -136,6 +136,19 @@ pub struct TToporStatistics
 	// The number of duplicate binary clauses, removed by inprocessing
 	pub m_IngsDuplicateBinsRemoved: u32,
 
+	// Rust-only extension (topi_ext_target_phase.rs): the number of rephases, of updates of the target phases and of decisions, which took the target phase
+	pub m_ExtRephases: u64,
+	pub m_ExtTargetPhaseUpdates: u64,
+	pub m_ExtTargetPhaseDecisions: u64,
+	// Rust-only extension (topi_ext_vivify.rs): the number of vivification rounds, of clauses tried, of clauses shortened, of literals removed from them, of unit clauses among the shortened ones,
+	// and of literals propagated by vivification (they are counted in m_Implications too)
+	pub m_ExtVivifyRounds: u64,
+	pub m_ExtVivifyTried: u64,
+	pub m_ExtVivifyShortened: u64,
+	pub m_ExtVivifyLitsRemoved: u64,
+	pub m_ExtVivifyUnits: u64,
+	pub m_ExtVivifyPropagations: u64,
+
 	pub(crate) m_OverallTime: CTimeMeasure,
 	pub(crate) m_TimeSinceLastSolveStart: CTimeMeasure,
 	pub(crate) m_ShortStartInv: u8,
@@ -185,6 +198,15 @@ impl TToporStatistics
 			m_AllUipSucceeded: 0,
 			m_Ings: 0,
 			m_IngsDuplicateBinsRemoved: 0,
+			m_ExtRephases: 0,
+			m_ExtTargetPhaseUpdates: 0,
+			m_ExtTargetPhaseDecisions: 0,
+			m_ExtVivifyRounds: 0,
+			m_ExtVivifyTried: 0,
+			m_ExtVivifyShortened: 0,
+			m_ExtVivifyLitsRemoved: 0,
+			m_ExtVivifyUnits: 0,
+			m_ExtVivifyPropagations: 0,
 			m_OverallTime: CTimeMeasure::new(false, 1000),
 			m_TimeSinceLastSolveStart: CTimeMeasure::new(false, 1000),
 			m_ShortStartInv: 0,

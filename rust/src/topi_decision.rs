@@ -62,7 +62,10 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		debug_assert!(!self.IsAssignedVar(v));
 		let res = if self.IsNotForced(v)
 		{
-			if self.m_Params.m_ParamPolarityStrat.get() == 1 { (rand() % 2) != 0 } else { self.m_AssignmentInfo[v as usize].m_IsNegated() }
+			if self.m_Params.m_ParamPolarityStrat.get() == 1 { (rand() % 2) != 0 }
+			// Rust-only extension (topi_ext_target_phase.rs): the target phase in preference to the saved phase
+			else if self.m_Params.m_ParamTargetPhaseOn.get() != 0 { self.ExtTargetPhaseGetIsNegated(v) }
+			else { self.m_AssignmentInfo[v as usize].m_IsNegated() }
 		}
 		else
 		{
