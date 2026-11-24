@@ -6,6 +6,9 @@
 # configurations of an instance are never split), and by family (trained on the other families).
 # Models: ngb (NGBRegressor, Normal; the number of stages chosen by early stopping on an inner split by instance), gbm+const (sklearn gradient boosting for the mean,
 # one constant sigma from inner out-of-fold residuals), gbm quantile (sklearn gradient boosting with the quantile loss, intervals only), const (the training mean and deviation).
+# On a linear baseline: ridge+const (standardized ridge regression for the mean, one constant sigma from its out-of-fold residuals) and ridge+ngb: NGBRegressor (Normal) fitted to the
+# residuals of the ridge regression, which for the mean is boosting from the ridge prediction as a per-sample offset (ngboost has no such offset) and lets the variance be learnt.
+# The residuals it trains on are cross-fitted by instance (each instance's residuals come from a ridge regression which has not seen it); early stopping as for ngb, 0 stages allowed.
 # Then two uses of the distribution, computed from the recorded runs: choosing the configuration per instance (by the predicted mean, or risk-aware by the predicted 90% quantile),
 # and setting a conflict budget from a predicted quantile.
 #
@@ -18,6 +21,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import numpy as np
 from scipy.stats import norm
 from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import GroupKFold, GroupShuffleSplit
 from sklearn.tree import DecisionTreeRegressor
 from ngboost import NGBRegressor
@@ -33,7 +39,10 @@ def new_gbm(**kw):
 def new_ngb(n):
 	return NGBRegressor(Dist=Normal, n_estimators=n, learning_rate=0.03, minibatch_frac=1.0, Base=DecisionTreeRegressor(criterion="friedman_mse", max_depth=3), verbose=False, random_state=0)
 
-# Returns {model: (mu, sigma)} for the test rows, and the quantile predictions of the quantile GBM
+def new_ridge():
+	return make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+
+# Returns {model: (mu, sigma)} for the test rows, the quantile predictions of the quantile GBM, and the stages chosen for ngb and for ridge+ngb
 def fit_predict(Xtr, ytr, gtr, Xte):
 	res = {}
 	# ngb: the number of the boosting stages by early stopping on a fifth of the training instances, then a fit on all of them
@@ -50,8 +59,27 @@ def fit_predict(Xtr, ytr, gtr, Xte):
 		oof[b] = new_gbm().fit(Xtr[a], ytr[a]).predict(Xtr[b])
 	res["gbm+const"] = (new_gbm().fit(Xtr, ytr).predict(Xte), np.full(len(Xte), float(np.sqrt(np.mean((oof - ytr) ** 2)))))
 	res["const"] = (np.full(len(Xte), ytr.mean()), np.full(len(Xte), ytr.std()))
+	# The linear baseline: out-of-fold predictions for the training rows (folds split by instance), the model of all the training rows for the test rows
+	oof = np.zeros(len(ytr))
+	for a, b in GroupKFold(n_splits=5).split(Xtr, ytr, gtr):
+		oof[b] = new_ridge().fit(Xtr[a], ytr[a]).predict(Xtr[b])
+	resid = ytr - oof
+	lin = new_ridge().fit(Xtr, ytr).predict(Xte)
+	res["ridge+const"] = (lin, np.full(len(Xte), float(np.sqrt(np.mean(resid ** 2)))))
+	# ridge+ngb: NGBoost on the cross-fitted residuals; the same validation instances; 0 stages (the ridge prediction with the mean and the deviation of the residuals)
+	# if no stage beats that on the validation instances
+	m = new_ngb(600)
+	m.fit(Xtr[tr], resid[tr], X_val=Xtr[va], Y_val=resid[va], early_stopping_rounds=40)
+	val = list(m.evals_result["val"].values())[0]
+	init = float(-norm.logpdf(resid[va], resid[tr].mean(), resid[tr].std()).mean())
+	bestLin = int(np.argmin(val)) + 1 if min(val) < init else 0
+	if bestLin:
+		d = new_ngb(bestLin).fit(Xtr, resid).pred_dist(Xte)
+		res["ridge+ngb"] = (lin + np.asarray(d.params["loc"]), np.asarray(d.params["scale"]))
+	else:
+		res["ridge+ngb"] = (lin + resid.mean(), np.full(len(Xte), resid.std()))
 	quant = np.column_stack([new_gbm(loss="quantile", alpha=q).fit(Xtr, ytr).predict(Xte) for q in QS])
-	return res, quant, best
+	return res, quant, (best, bestLin)
 
 def evaluate(mu, sigma, y):
 	z = (y - mu) / sigma
@@ -76,7 +104,7 @@ def main():
 			X.append(r["inst_features"] + [float(k == j) for j in range(len(CONFIGS))])
 			y.append(math.log10(confs(r, c) + 1)); g.append(i); cfg.append(k); fam.append(r["family"]); sat.append(r["status"] == "SAT")
 	X, y, g, cfg, fam, sat = np.array(X), np.array(y), np.array(g), np.array(cfg), np.array(fam), np.array(sat)
-	names = ["ngb", "gbm+const", "const"]
+	names = ["ngb", "gbm+const", "const", "ridge+const", "ridge+ngb"]
 	out = {}
 
 	def run(splits):
@@ -105,8 +133,9 @@ def main():
 		mu, sg, quant, stages = run(splits)
 		results[protocol] = (mu, sg, quant)
 		done = ~np.isnan(mu["ngb"])
-		md += [f"### {title}", "", f"NGBoost stages chosen by early stopping per fold: {stages}.", "", "| rows | model | RMSE | MAE | NLL | cov50 | cov90 | width90 | mean sigma | PIT histogram | max PIT deviation |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|"]
-		subsets = [("all", done)] + [(f, done & (fam == f)) for f in ("rand", "factor", "col")]
+		out[f"{protocol}/stages"] = {"ngb": [s[0] for s in stages], "ridge+ngb": [s[1] for s in stages]}
+		md += [f"### {title}", "", f"NGBoost stages chosen by early stopping per fold: {[s[0] for s in stages]} (never fewer than 20). For `ridge+ngb`, the stages on the residuals of the ridge regression: {[s[1] for s in stages]} (0 is allowed: the ridge prediction with a constant sigma).", "", "| rows | model | RMSE | MAE | NLL | cov50 | cov90 | width90 | mean sigma | PIT histogram | max PIT deviation |", "|---|---|---:|---:|---:|---:|---:|---:|---:|---|---:|"]
+		subsets = [("all", done)] + ([("all but pigeonhole", done & (fam != "php"))] if (done & (fam == "php")).any() else []) + [(f, done & (fam == f)) for f in ("rand", "factor", "col")]
 		for sname, mask in subsets:
 			for m in names:
 				e = evaluate(mu[m][mask], sg[m][mask], y[mask])
@@ -144,10 +173,13 @@ def main():
 	M = np.column_stack([mu["ngb"][cfg == k] for k in range(3)])
 	S = np.column_stack([sg["ngb"][cfg == k] for k in range(3)])
 	G = np.column_stack([mu["gbm+const"][cfg == k] for k in range(3)])
+	R = np.column_stack([mu["ridge+ngb"][cfg == k] for k in range(3)])
+	RS = np.column_stack([sg["ridge+ngb"][cfg == k] for k in range(3)])
 	assert all((g[cfg == k] == np.arange(len(use))).all() for k in range(3))
 	rules = [("always base", np.zeros(len(use), dtype=int)), ("always target", np.ones(len(use), dtype=int)), ("always vivify", np.full(len(use), 2)),
 		("ngb: lowest predicted mean", M.argmin(1)), ("ngb: lowest predicted 90% quantile (risk-aware)", (M + norm.ppf(0.9) * S).argmin(1)),
-		("ngb: leave base only if P(other < base) > 0.75 (independent Normals)", None), ("gbm: lowest predicted mean", G.argmin(1)), ("oracle: the best of the three per instance", C.argmin(1))]
+		("ngb: leave base only if P(other < base) > 0.75 (independent Normals)", None), ("gbm: lowest predicted mean", G.argmin(1)), ("oracle: the best of the three per instance", C.argmin(1)),
+		("ridge+ngb: lowest predicted mean", R.argmin(1)), ("ridge+ngb: lowest predicted 90% quantile (risk-aware)", (R + norm.ppf(0.9) * RS).argmin(1))]
 	# The cautious rule: switch to the alternative with the highest probability of beating the baseline, if that probability exceeds 0.75
 	pBeat = norm.cdf((M[:, [0]] - M) / np.sqrt(S[:, [0]] ** 2 + S ** 2))
 	pBeat[:, 0] = 0

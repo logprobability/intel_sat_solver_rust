@@ -16,6 +16,9 @@
 #   the true-model oracle at the coverage and the accuracy of the predictor).
 # ngbX:* uses the cross-family predictions; planner only: ngbLF:* the predictions with the lf polarity as a feature, ngbPV:* those without the instance-level features;
 # lf:all hints the planner's lf polarities themselves.
+# If DIR/preds_lr.npz exists (ngb_lr.py: boosting on a logistic-regression baseline), its models ngb_es, ngb_lr and ngb_stack get M:all, M:t0.7 and M:all+conf_x1;
+# on the planner instances also with the suffixes LF and PV (the two other protocols), next to logregLF and logregPV, and M:all, M:t0.7 on the sequences;
+# and M:all+conf_x1+flipK for logreg, ngb_lr and ngb_stack: the confident-first hints under the perturbation of the control flipK (a check against the noise of the search).
 # The recorded planner sequences and their versions without lf are hinted again before every query (lh commands), since phase saving overwrites a hint.
 # Every run verifies its model; an answer which differs from that of the baseline is reported, and SAT versus UNSAT is a soundness bug (exit code 1).
 #
@@ -30,8 +33,11 @@ from search_quality_bench import bench
 from ngb_common import VERIFY, geo, hints_text, write
 
 PHASE_MODELS = ["ngb", "gbm", "gbm_iso", "logreg", "jw", "prior"]
+EXTRA_MODELS = ["ngb_es", "ngb_lr", "ngb_stack"]	# those of ngb_lr.py, if it has been run
+EXTRA_SEQ = ["logreg", "logregLF", "logregPV"] + [m + s for m in EXTRA_MODELS for s in ("", "LF", "PV")]	# hinted on the planner sequences as well, once ngb_lr.py has been run
 THRESHOLDS = [0.55, 0.6, 0.7, 0.8, 0.9]
 MULTS = [1, 10]
+FLIPS = [500, 1000, 2000]
 ON = ["/phase/hints/on", "1"]
 MULT = lambda k: ["/decision/score_hints/mult", str(k)]
 
@@ -66,6 +72,17 @@ def strategies(name, var, y, P, seeds, lfLits):
 				p = P[x]
 				res[f"{x}:{s}"] = (ON, lits(p) if s == "all" else lits(p, conf(p) >= float(s[1:])), [])
 			res[f"{x}:all+conf_x1"] = (ON + MULT(1), lits(P[x]), list(zip(var, 2 * np.abs(P[x] - 0.5) + 1e-3)))
+	# The models of ngb_lr.py, and the logistic regression of the two other planner protocols: the three strategies of that comparison
+	for m in EXTRA_SEQ[1:]:
+		if m in P:
+			res[f"{m}:all"] = (ON, lits(P[m]), [])
+			res[f"{m}:t0.7"] = (ON, lits(P[m], conf(P[m]) >= 0.7), [])
+			res[f"{m}:all+conf_x1"] = (ON + MULT(1), lits(P[m]), list(zip(var, 2 * np.abs(P[m] - 0.5) + 1e-3)))
+	# Is a difference between two confident-first configurations more than the noise of the search? The same hints under the uninformative perturbation of the flip controls
+	if "ngb_lr" in P:
+		for m in ("logreg", "ngb_lr", "ngb_stack"):
+			for k in FLIPS:
+				res[f"{m}:all+conf_x1+flip{k}"] = (ON + MULT(1) + ["/decision/polarity/flip_factor", str(k)], lits(P[m]), list(zip(var, 2 * np.abs(P[m] - 0.5) + 1e-3)))
 	if lfLits:
 		res["lf:all"] = (ON, lfLits, [])
 	c = 2 * np.abs(P["ngb"] - 0.5) + 1e-3
@@ -103,6 +120,7 @@ def main():
 	y, inst, var = d["y"], d["inst"], d["var"]
 	records = json.load(open(os.path.join(a.work, "instances.json")))
 	preds = np.load(os.path.join(a.work, "preds.npz"))
+	extra = np.load(os.path.join(a.work, "preds_lr.npz")) if os.path.exists(os.path.join(a.work, "preds_lr.npz")) else None
 	byName = {r["name"]: i for i, r in enumerate(records)}
 	hintsDir = os.path.join(a.work, "hints")
 	instDir = os.path.join(a.work, "inst")
@@ -128,6 +146,13 @@ def main():
 		if r["family"] == "planner":
 			P["ngbLF"] = preds["within+lf:ngb"][rows]
 			P["ngbPV"] = preds["within-pv:ngb"][rows]
+		if extra is not None:
+			P.update({m: extra[f"within:{m}"][rows] for m in EXTRA_MODELS})
+			if r["family"] == "planner":
+				for suffix, protocol in (("LF", "within+lf"), ("PV", "within-pv")):
+					P["logreg" + suffix] = preds[f"{protocol}:logreg"][rows]
+					P.update({m + suffix: extra[f"{protocol}:{m}"][rows] for m in EXTRA_MODELS})
+			assert not any(np.isnan(P[m]).any() for m in P), r["name"]
 			lfCol = list(d["features"]).index("lf_pol")
 			lfLits = [int(v) * int(s) for v, s in zip(var[rows], d["X"][rows, lfCol]) if s != 0]
 		# The labels are those of the model of this very instance, if it is the one the samples come from; a planner version has its own model, so no oracle there
@@ -138,7 +163,8 @@ def main():
 			if how == "file":
 				configs[name] = params + ["/topor_tool/hints_file", os.path.join(hintsDir, "{inst}." + name + ".hints")]
 				write(os.path.join(hintsDir, f"{r['name']}.{name}.hints"), hints_text(lits, scores))
-			elif scores == [] and (name.split(":")[0] in ("ngb", "ngbLF", "ngbPV", "lf", "prior") and name.split(":")[-1] in ("all", "t0.8") or name.startswith("rand_phase")):
+			elif scores == [] and (name.split(":")[0] in ("ngb", "ngbLF", "ngbPV", "lf", "prior") and name.split(":")[-1] in ("all", "t0.8") or name.startswith("rand_phase")
+					or extra is not None and name.split(":")[0] in EXTRA_SEQ and name.split(":")[-1] in ("all", "t0.7")):
 				# A sequence of queries: the phase hints are given again before every query
 				path = os.path.join(instDir, f"{r['name']}.rehint.{name.replace(':', '_')}.cnf")
 				lh = "".join(f"lh {l}\n" for l in lits)
@@ -146,7 +172,7 @@ def main():
 				rehintPaths.append((path, r["name"], name))
 	fileInst = [r["path"] for r, _, how in todo if how == "file"]
 	seqInst = [r["path"] for r, _, how in todo if how == "lh"]
-	controls = [(f"flip{k}", ["/decision/polarity/flip_factor", str(k)]) for k in (500, 1000, 2000)]
+	controls = [(f"flip{k}", ["/decision/polarity/flip_factor", str(k)]) for k in FLIPS]
 	rows = []
 	if a.resume and os.path.exists(os.path.join(a.work, "solve_runs.csv")):
 		for r in csv.DictReader(open(os.path.join(a.work, "solve_runs.csv"))):
@@ -162,14 +188,21 @@ def main():
 					write(path, "")
 	names = sorted(configs)
 	allNames = names
-	names = [n for n in names if any((os.path.basename(p), n) not in have for p in fileInst)]
+	# The configurations of the two other planner protocols which ngb_lr.py adds exist for the planner instances only, and are run on those only
+	plannerOnly = {n for n in names if n.split(":")[0] in EXTRA_SEQ and n.split(":")[0].endswith(("LF", "PV"))}
+	plannerInst = [r["path"] for r, _, how in todo if how == "file" and r["family"] == "planner"]
+	instOf = lambda n: plannerInst if n in plannerOnly else fileInst
+	names = [n for n in names if any((os.path.basename(p), n) not in have for p in instOf(n))]
 	rehintAll = rehintPaths
 	rehintPaths = [x for x in rehintPaths if (x[1] + ".cnf", x[2]) not in have]
 	print(f"{len(fileInst)} instances x {len(names) + 4} configurations, {len(seqInst)} sequences, {len(rehintPaths)} re-hinted sequence runs", flush=True)
 	if not have:
 		rows += bench(a.exe, fileInst + seqInst, [("base", VERIFY)] + [(n, VERIFY + p) for n, p in controls], a.timeout, a.jobs, verbose=False)
+	names = [n for n in names if n not in plannerOnly] + [n for n in names if n in plannerOnly]
 	for k in range(0, len(names), 10):
-		rows += bench(a.exe, fileInst, [(n, VERIFY + configs[n]) for n in names[k:k + 10]], a.timeout, a.jobs, verbose=False)
+		for insts in (fileInst, plannerInst):
+			batch = [(n, VERIFY + configs[n]) for n in names[k:k + 10] if instOf(n) is insts]
+			rows += bench(a.exe, insts, batch, a.timeout, a.jobs, verbose=False) if batch else []
 		print(f"{min(k + 10, len(names))}/{len(names)} configurations done", flush=True)
 	for r in bench(a.exe, [p for p, _, _ in rehintPaths], [("x", VERIFY + ON)], a.timeout, a.jobs, verbose=False) if rehintPaths else []:
 		_, src, name = next(x for x in rehintPaths if os.path.basename(x[0]) == r["instance"])
@@ -243,12 +276,15 @@ def main():
 		f"**SAT-versus-UNSAT contradictions with the baseline: {len(contradictions)}.** Runs whose final status or number of answered queries differs from the baseline's (timeouts or errors): {len([x for x in differ if 'another' not in x[2]])}"
 		+ "".join(f"; {i} under `{c}`: {s}" for i, c, s in differ if "another" not in s) + f". Runs of a planner sequence in which a budget-limited query ends differently (CONFLICT_OUT versus an answer): {len([x for x in differ if 'another' in x[2]])}.", ""]
 	summary = {}
+	extraRng = np.random.RandomState(1)
 	for title, group, hasModel in groups:
 		if not group:
 			continue
 		md += [f"### {title} ({len(group)} instances; baseline: {sum(by[(i, 'base')]['confs'] for i in group)} conflicts in total)", "", "| configuration | n | ratio | 95% interval | wins/losses | total conflicts | CPU ratio | hinted | right |", "|---|---:|---:|---|---:|---:|---:|---:|---:|"]
 		for c in allConfigs:
-			l = line(group, c)
+			# The rows which ngb_lr.py adds draw their bootstrap samples from a generator of their own, so that the intervals of the other rows do not depend on its having been run
+			added = c.split(":")[0] in EXTRA_SEQ[1:] or "+flip" in c or c.split(":")[0] == "logreg" and rec(group[0])["role"] in ("nolf", "recorded")
+			l = line(group, c, extraRng) if added else line(group, c)
 			if l is None or c == "base":
 				continue
 			summary[f"{title}|{c}"] = l

@@ -2,7 +2,8 @@
 
 The question: can natural-gradient boosted trees (NGBoost, Duan et al. 2020) put a well-calibrated uncertainty around a prediction, and can the solver use it?
 Two predictions were tried: the value of each variable in a model (advice through the phase and score hints of [`ceiling.md`](ceiling.md)), and the number of conflicts of an instance.
-All the tables are in [`ngboost_tables.md`](ngboost_tables.md) (sections 1 to 5, referred to below); the scripts are `scripts/ngb_*.py`.
+All the tables are in [`ngboost_tables.md`](ngboost_tables.md) (sections 1 to 6, referred to below); the scripts are `scripts/ngb_*.py`.
+A follow-up question, whether NGBoost can be built on top of the logistic regression that turned out best, is answered in [its own section](#ngboost-on-a-logistic-regression-baseline-section-6).
 
 ## Answer
 
@@ -18,6 +19,9 @@ All the tables are in [`ngboost_tables.md`](ngboost_tables.md) (sections 1 to 5,
   **on the planner instances nothing is distinguishable from the controls**, and on the recorded sequences nothing moves at all (1.03).
 * **The instance-level predictive distribution** (NGBoost's real strength) is calibrated in-distribution and marginally sharper than a constant-variance GBM (NLL 0.798 against 0.813),
   but neither use tried gains anything: choosing a configuration by predicted mean or by predicted quantile is no better than always running the baseline (1.01), and a budget from a predicted quantile wastes as much as the constant-variance one.
+* **NGBoost on top of the logistic regression** (added later; section 6): possible, and it changes nothing. Boosting the residual of the logistic regression with early stopping picks 0 to 28 rounds on random 3-SAT and reproduces the logistic regression
+  (log loss 0.5661 against 0.5651, the same accuracy); used in the solver it is not distinguishable from the logistic regression (paired, confident-first: 1.13 times its conflicts, interval 0.90 to 1.43), and neither is NGBoost with the logit as a feature (0.86, interval 0.67 to 1.11).
+  What the follow-up did show is that the plain NGBoost above was run too long: with early stopping (30 to 46 rounds instead of 300) its log loss on random 3-SAT drops from 0.600 to 0.580 and its ECE on the planner instances from 0.32 to 0.04. It is still behind the logistic regression, and its solving results do not change.
 
 So: NGBoost works as advertised and is not what matters. What mattered here is an ordering of the decisions by how sure a cheap predictor is, on one family of formulas; any probabilistic classifier supplies that.
 
@@ -31,6 +35,7 @@ So: NGBoost works as advertised and is not what matters. What mattered here is a
 | C | `ngb_solve.py` | 104 configurations (the seeds of the randomized ones counted separately) over 259 instances and 8 planner sequences, 27064 solver runs (section 3) |
 | D | `ngb_regress.py` | NGBRegressor for log10(conflicts), interval calibration, two uses (section 4) |
 | E | `ngb_tables.py` | cost of the advice (section 5); assembles `ngboost_tables.md` |
+| follow-up | `ngb_lr.py` (and additions to `ngb_solve.py`, `ngb_regress.py`) | NGBoost on a logistic-regression baseline, a ridge baseline for the regression (section 6 and rows of sections 3 and 4); 5046 more solver runs |
 
 **Instances.** For the per-variable experiment: uniform random 3-SAT at ratio 4.2 with 175, 200 and 225 variables (135 formulas: 92 satisfiable, 89 of them with at least 200 baseline conflicts; 43 unsatisfiable);
 factoring of semiprimes of two 15- to 19-bit primes (40, all satisfiable, 1957 to 153686 conflicts) and of primes (16, unsatisfiable); 3-colouring of random graphs with 350 vertices and 2.30 edges per vertex (60: 35 satisfiable, 25 unsatisfiable).
@@ -96,6 +101,7 @@ Reading:
 4. **On the planner instances NGBoost is the worst model.** Left-one-out over four instances, it is at least 90% sure about 57% of the variables and right on 49% of them (ECE 0.32, log loss 2.19, against 0.70 for the base rate).
    The cause is the instance-level features: with three training instances the trees learn each instance's base rate from them and apply it with full confidence to the fourth. Without those features (per-variable only) NGBoost's ECE drops to 0.065 and its accuracy rises to 0.566,
    which is 1.2 points above always answering the majority polarity. Adding the planner's own `lf` polarity as a feature changes nothing (0.534). No model here predicts the planner's models.
+   (Section 6, added later: the overconfidence is that of 300 rounds; with early stopping NGBoost's ECE on these instances is 0.04. Its accuracy stays below the majority polarity.)
 5. **What it looks at.** The "need" balance carries 57 to 62% of NGBoost's importance on random 3-SAT and factoring. It is one round of a belief-propagation-like estimate, so the learnt models are close to a tuned, smoothed version of a known heuristic; that is consistent with logistic regression matching the trees.
 
 **Label ambiguity (section 2).** The label is one model's value. Checked on 40 random 3-SAT instances (7225 solver runs, every variable tested with the opposite unit clause) and on the 40 factoring instances:
@@ -239,6 +245,187 @@ Medians. Features are numpy passes over the literal occurrences; NGBoost's infer
 On the hard generated instances the advice costs 2 to 8% of the solve time, which the gain on random 3-SAT covers. **On the planner queries NGBoost's advice costs more than solving** (66 ms against 48 ms in the median; 0.5 to 2.0 times the solve time over the four, above 1 for three of them),
 and logistic regression would be the only affordable predictor (12 ms, almost all of it the features). A native feature pass would be much cheaper than the numpy one; training (4 s per 10000 variables for NGBoost, offline) is not counted.
 
+## NGBoost on a logistic-regression baseline (section 6)
+
+The question, asked after the results above: logistic regression was the best predictor on the one family where the advice works; can NGBoost be built on top of it, and is the result better?
+Everything here was run after the tables of sections 1 to 5 had been seen, on the same held-out instances.
+
+### What was built
+
+* **`ngb_lr`: boosting from a per-sample offset.** The parameter is the logit theta of a variable, p = sigmoid(theta). It starts at the logit of the logistic regression for that variable instead of at the base rate, and the trees fit only what the logistic regression leaves.
+  ngboost 0.6.1 cannot do this: its initial parameter is one vector fitted to the marginal distribution (`fit_init_params_to_marginal`), and `pred_param` starts every row from it; there is no offset argument. So the Bernoulli case is implemented in `ngb_lr.py` (`OffsetBernoulliNGB`, about 50 lines):
+  per round, on a minibatch, the natural gradient of the log score, **(p - y) / (p (1 - p))** (the ordinary gradient p - y divided by the Fisher information p (1 - p); p is clipped to [0.001, 0.999] in it), a `DecisionTreeRegressor` fitted to it, and theta <- theta - 0.05 * scale * tree(x),
+  with the scale from NGBoost's own line search (doubled while the minibatch loss does not rise, then halved until it is below the starting loss). Trees of depth 3, `friedman_mse`, minibatch fraction 0.5, at most 30000 training rows and at most 300 rounds: the settings of the `ngb` of section 1.
+  Started from the base rate instead of the offset, this implementation agrees with the stock NGBClassifier (one fold of random 3-SAT, 300 rounds: held-out log loss 0.6153 against 0.6147, logits correlated at 0.993; the two differ only in their random minibatches).
+* **Cross-fitting.** The logistic regression is fitted on the training fold only. The logits which the booster trains on are out-of-fold: the instances of the training fold are split into 5 groups (3 for the planner), and each instance gets its logits from a logistic regression that has not seen it.
+  Otherwise the booster would be trained on offsets that fit the training labels better than the offsets it meets at prediction time. The logits of the held-out instances come from the logistic regression of the whole training fold, which is exactly the `logreg` of section 1 (the predictions agree to 1e-21).
+* **Early stopping by instance.** A fifth of the instances of the training fold is the validation set (the variables of an instance are never on both sides). The number of rounds with the lowest validation log loss is chosen, the fit stops 50 rounds after the best one, **0 rounds is a legal choice** (the logistic regression alone),
+  and the model is then fitted again on the whole training fold with that number of rounds.
+* **Comparison points.** `ngb_stack`: the stock `NGBClassifier` with the (cross-fitted) logit of the logistic regression as a 42nd feature. `ngb_es`: the stock `NGBClassifier` of section 1 with the same early stopping, so that a difference between `ngb_lr` and plain NGBoost is not just the stopping rule. `logreg` and `ngb` (300 rounds): the rows of section 1, unchanged.
+* Nothing was tuned: the tree, learning-rate and row settings are those of section 1, the stopping rule was fixed before the first run. Two fits of everything gave bit-identical predictions.
+
+### Rounds chosen
+
+| family (protocol) | `ngb_es` | `ngb_lr` | `ngb_stack` |
+|---|---|---|---|
+| random 3-SAT (5 folds) | 30, 46, 28, 44, 30 | **18, 0, 1, 0, 28** | 37, 35, 30, 46, 35 |
+| factoring (5 folds) | 153, 38, 111, 117, 84 | 7, 110, 3, 132, 142 | 133, 50, 98, 87, 84 |
+| 3-colouring (5 folds) | 39, 39, 33, 30, 30 | 9, 45, 5, 10, 10 | 39, 44, 32, 30, 36 |
+| planner, leave-one-out | 6, 6, 20, 31 | 22, 22, 0, 9 | 0, 8, 8, 9 |
+| planner, per-variable features only | 30, 12, 41, 31 | **0, 1, 0, 0** | 23, 2, 3, 9 |
+| cross-family (random 3-SAT / factoring / colouring / planner) | 97 / 49 / 64 / 84 | 21 / 11 / 109 / 82 | 63 / 32 / 54 / 34 |
+
+* **On random 3-SAT the residual of the logistic regression has almost no learnable signal.** Two of five folds stop at 0 rounds and one at 1; in the other two the validation log loss improves by 0.0011 and 0.0002 (from 0.568 and 0.578). On 3-colouring the improvements are 0.0001 to 0.0003.
+  On factoring three folds run past 100 rounds and gain 0.004 to 0.008 in validation log loss: there the trees find something the linear model lacks.
+* The numbers vary widely between folds (0 to 28, 3 to 142) because the validation curve is nearly flat: the choice is mostly noise around a small gain.
+* **Plain NGBoost wants 30 to 46 rounds on random 3-SAT, not the 300 of section 1.** Section 1's `ngb` was overfitted. This is the most useful by-product of the exercise.
+
+### Calibration (within-family, held out by instance)
+
+| family | model | accuracy | Brier | log loss | ECE | accuracy at confidence >= 0.9 (share) | log loss minus that of `logreg` (95% interval over instances) |
+|---|---|---:|---:|---:|---:|---:|---|
+| random 3-SAT | logreg | 0.703 | 0.1923 | **0.5651** | 0.0097 | 0.948 (0.07) | - |
+| | ngb (300 rounds) | 0.693 | 0.1988 | 0.5997 | 0.0160 | 0.904 (0.12) | +0.0346 (+0.028 to +0.041) |
+| | ngb_es | 0.692 | 0.1981 | 0.5795 | 0.0086 | 0.940 (0.05) | +0.0144 (+0.012 to +0.017) |
+| | **ngb_lr** | 0.703 | 0.1926 | 0.5661 | 0.0090 | 0.936 (0.08) | +0.0009 (+0.0000 to +0.0018) |
+| | ngb_stack | 0.703 | 0.1929 | 0.5664 | 0.0084 | 0.934 (0.09) | +0.0012 (+0.0001 to +0.0023) |
+| factoring | logreg | 0.628 | 0.2202 | 0.6257 | 0.0162 | 0.985 (0.03) | - |
+| | ngb (300 rounds) | 0.635 | 0.2166 | 0.6203 | 0.0108 | 0.982 (0.03) | -0.0053 (-0.010 to +0.000) |
+| | ngb_es | 0.635 | 0.2167 | **0.6180** | 0.0062 | 0.997 (0.03) | -0.0076 (-0.013 to -0.003) |
+| | **ngb_lr** | 0.630 | 0.2182 | 0.6215 | 0.0125 | 0.997 (0.03) | -0.0042 (-0.007 to -0.001) |
+| | ngb_stack | 0.635 | 0.2168 | **0.6180** | 0.0075 | 0.999 (0.03) | -0.0077 (-0.012 to -0.003) |
+| 3-colouring | logreg / ngb / ngb_es / ngb_lr / ngb_stack | 0.669 / 0.668 / 0.669 / 0.669 / 0.669 | 0.2205 / 0.2209 / 0.2206 / 0.2205 / 0.2206 | 0.6313 / 0.6330 / 0.6320 / 0.6313 / 0.6316 | 0.0004 / 0.0034 / 0.0010 / 0.0007 / 0.0013 | all (0.01) | ngb_lr: -0.0001 (-0.0002 to +0.0000) |
+| planner, leave-one-out | logreg | 0.527 | 0.2794 | 0.7714 | 0.1858 | 0.802 (0.02) | - |
+| | ngb (300 rounds) | 0.532 | 0.3957 | 2.1922 | 0.3170 | 0.489 (0.57) | +1.42 (-0.01 to +3.54) |
+| | ngb_es | 0.548 | 0.2495 | **0.6923** | **0.0415** | 1.000 (0.00) | -0.079 (-0.238 to -0.014) |
+| | **ngb_lr** | 0.551 | 0.4260 | 2.1585 | **0.4277** | 0.564 (0.94) | +1.39 (-0.04 to +1.58) |
+| | ngb_stack | 0.475 | 0.3052 | 0.8228 | 0.1947 | - (0.00) | +0.05 (-0.33 to +0.28) |
+| planner, per-variable features only | logreg | 0.530 | 0.2781 | 0.7850 | 0.1777 | 0.722 (0.07) | - |
+| | ngb (300 rounds) / ngb_es | 0.566 / 0.555 | 0.2493 / 0.2437 | 0.7078 / 0.6798 | 0.0645 / 0.0515 | 0.695 (0.05) / 1.000 (0.01) | -0.077 / -0.105 |
+| | **ngb_lr** (0, 1, 0, 0 rounds) | 0.529 | 0.2789 | 0.7874 | 0.1780 | 0.722 (0.07) | +0.0025 |
+| | ngb_stack | 0.573 | 0.2449 | 0.6821 | 0.0629 | 1.000 (0.00) | -0.103 (-0.183 to -0.005) |
+
+Reading:
+
+1. **On random 3-SAT `ngb_lr` is the logistic regression.** Its probabilities differ from `logreg`'s by 0.004 on average, the predicted polarity differs on 0.3% of the variables and the confidence ranks correlate at 0.997. Log loss and Brier score are a hair worse (+0.0009, interval touching 0), the ECE is 0.0090 against 0.0097 (difference -0.0007, interval -0.0024 to +0.0009).
+   **It is not better calibrated than the logistic regression**, and none of the three ECE differences from `logreg` on random 3-SAT has an interval that excludes 0. It is better calibrated than the 300-round `ngb` (ECE 0.0090 against 0.0160, log loss 0.566 against 0.600), but so is everything else, the early-stopped `ngb_es` (0.0086) included.
+2. **On factoring the baseline helps the logistic regression and hurts NGBoost.** `ngb_lr` improves on `logreg` (log loss -0.0042, the interval excludes 0), so here the trees add something. But plain early-stopped NGBoost and the stacked variant are better still (0.6180 against 0.6215), and their ECE is half of `ngb_lr`'s (0.006 to 0.008 against 0.0125; no ECE interval excludes 0).
+   Tying the model to the linear logit is a restriction, and on the family where the linear model is the weaker one it costs. None of this moves the accuracy by more than 0.7 points, and the variables that the swap of the factors flips stay at 0.50 for every model, at a mean confidence of 0.61 to 0.62 (backbone table of section 6).
+3. **3-colouring: nothing to learn**, as before; all five are the base rate.
+4. **Planner, leave-one-out: `ngb_lr` is the worst model in the study** (94% of the variables above 0.9 confidence, 56% of them right; ECE 0.43). The mechanism is the cross-fitting itself: with three training instances the out-of-fold logistic regressions are fitted on two instances and are wildly wrong on the third
+   (validation log loss of the cross-fitted logits: 4.95 and 7.18 in two folds, against 0.69 for a coin), the booster learns large corrections to those saturated logits, and applies them to the held-out instance, whose own logits are not saturated.
+   Without the instance-level features the logistic regression does not saturate, early stopping picks 0, 1, 0 and 0 rounds, and `ngb_lr` is `logreg` again.
+   On the same instances **early stopping repairs plain NGBoost**: `ngb_es` (6 to 31 rounds) has ECE 0.04 and log loss 0.692, where the 300-round `ngb` had 0.32 and 2.19. Reading 4 of section A, "on the planner instances NGBoost is the worst model", is a statement about 300 rounds on three instances; stopped early it is the best-calibrated learnt model there.
+   It still knows nothing: accuracy 0.548 against 0.554 for the majority polarity, log loss 0.692 against 0.698 for the base rate.
+5. **Cross-family the baseline is a liability.** The cross-family logistic regression saturates on random 3-SAT, colouring and the planner instances (section A, reading 3), an offset cannot undo that, and `ngb_lr` keeps its ECE of 0.50, 0.66 and 0.45 and its log loss of 6 to 9.
+   `ngb_stack`, which can ignore the feature, is in between; `ngb_es` is the best there (ECE 0.19, 0.09, 0.08, 0.14 on random 3-SAT, factoring, colouring, planner; the 300-round `ngb`: 0.20, 0.07, 0.27, 0.15).
+6. **Backbone** (random 3-SAT): `ngb_lr` and `logreg` are identical to the third digit (0.771 on backbone variables, 0.654 on the others; `ngb` and `ngb_es`: 0.762 and 0.643).
+
+### Solving
+
+The new predictors were added to `ngb_solve.py` and run with `--resume` next to the cached runs: `M:all`, `M:t0.7` (abstain below confidence 0.7) and `M:all+conf_x1` (confident variables decided first), on the same 259 instances and the planner versions; 5046 more runs, 32110 in all, every model verified.
+**No run contradicts the baseline (0 SAT-versus-UNSAT, no timeouts or errors).** Three runs of one planner sequence (`planner_huge_budget.nolf`: the cached `rand_phase` seed and the new `ngb_stackLF:all`, `ngb_stackPV:all`) end one budget-limited query with CONFLICT_OUT where the baseline answers UNSAT, which is not a contradiction.
+
+Ratio to the baseline (geometric mean, 95% bootstrap interval, better/worse; the intervals are those of section 3):
+
+| configuration | random 3-SAT (89) | total conflicts (baseline 892k) | > 10x | factoring (40) | 3-colouring (35) | unsatisfiable (84) |
+|---|---|---:|---:|---|---|---|
+| `logreg:all` | 0.716 (0.52-0.99) 51/38 | 883k | 3 | 0.774 (0.56-1.08) | 1.399 | 0.984 |
+| `ngb:all` | 0.727 (0.53-1.01) 51/38 | 845k | 3 | 0.750 (0.56-0.97) | 1.278 | 0.982 |
+| `ngb_es:all` | 0.760 (0.56-1.01) 51/38 | 780k | 4 | 0.838 (0.63-1.10) | 1.312 | 0.979 |
+| `ngb_lr:all` | 0.704 (0.51-0.97) 51/38 | 856k | 2 | 1.023 (0.76-1.36) | 1.370 | 0.977 |
+| `ngb_stack:all` | 0.732 (0.51-1.03) 48/41 | 869k | 3 | 0.825 (0.59-1.14) | 1.363 | 0.985 |
+| `logreg:t0.7` / `ngb:t0.7` | 0.834 / 0.787 | 927k / 976k | 4 / 4 | 1.000 / 0.853 | 1.000 / 0.981 | 0.989 / 0.986 |
+| `ngb_es:t0.7` / `ngb_lr:t0.7` / `ngb_stack:t0.7` | 0.788 / 0.854 / 0.892 | 890k / 952k / 1089k | 3 / 3 / 5 | 0.678 / 0.925 / 0.716 | 0.951 / 0.973 / 0.968 | 0.990 / 0.986 / 0.990 |
+| `logreg:all+conf_x1` | **0.105 (0.06-0.17) 68/21** | 658k | 2 | 0.939 (0.69-1.28) | 1.038 | 0.990 |
+| `ngb:all+conf_x1` | 0.173 (0.11-0.28) 67/22 | 692k | 4 | 0.825 (0.60-1.16) | 0.904 | 0.982 |
+| `ngb_es:all+conf_x1` | 0.179 (0.11-0.30) 65/24 | 693k | 3 | 0.851 (0.62-1.14) | 0.792 (0.56-1.11) | 0.971 |
+| `ngb_lr:all+conf_x1` | 0.120 (0.07-0.20) 66/23 | 661k | 1 | **0.567 (0.38-0.79)** 26/14 | 0.974 | 0.974 |
+| `ngb_stack:all+conf_x1` | **0.090 (0.06-0.14) 75/14** | **340k** | 2 | 0.969 (0.74-1.29) | 1.155 | 0.975 |
+| controls (`flip1000` / `rand_phase` / `perm_x1`) | 1.27 / 1.30 / 1.35 | 1101k / 1006k / 926k | 3 / 4 / 4 | 0.91 / 1.01 / 1.11 | 1.15 / 1.07 / 1.17 | 0.98 / 0.98 / 0.99 |
+
+**Paired with the logistic regression** (per instance, the logarithm of conflicts of A over conflicts of `logreg` under the same strategy; section 6 has all 259 paired rows):
+
+| A against `logreg`, confident-first (`all+conf_x1`) | random 3-SAT (89): A / logreg (95% interval), better / worse / equal, Wilcoxon p | factoring (40) | 3-colouring (35) | unsatisfiable (84) |
+|---|---|---|---|---|
+| `ngb_lr` | **1.134 (0.90-1.43)**, 23 / 25 / 41, p = 0.29 | 0.603 (0.41-0.86), 27 / 13, p = 0.009 | 0.938 (0.68-1.26), p = 0.83 | 0.984 (0.96-1.01) |
+| `ngb_stack` | 0.858 (0.67-1.11), 44 / 43 / 2, p = 0.44 | 1.032 (0.75-1.39), p = 0.86 | 1.113 (0.80-1.50), p = 0.11 | 0.985 (0.96-1.01) |
+| `ngb_es` | 1.695 (1.12-2.61), 36 / 52 / 1, p = 0.08 | 0.906 (0.64-1.28) | 0.763 (0.55-1.04) | 0.981 (0.96-1.01) |
+| `ngb` (300 rounds) | 1.638 (1.03-2.71), 35 / 53 / 1, p = 0.05 | 0.879 (0.63-1.22) | 0.871 (0.68-1.12) | 0.992 (0.97-1.02) |
+
+With phases only (`:all`) `ngb_lr` against `logreg` is 0.983 (0.91-1.06; 78 of 89 instances identical) on random 3-SAT and **1.321 (1.05-1.68, p = 0.03) on factoring, in the wrong direction**; with abstention (`:t0.7`) 1.025 and 0.925.
+
+Two cells of these tables look like findings: `ngb_lr:all+conf_x1` on factoring (0.567 of the baseline, 0.603 of `logreg`, p = 0.009), on a family where section C found nothing, and `ngb_stack:all+conf_x1` on random 3-SAT, which halves the total conflicts (340k against 658k for `logreg`).
+Both were checked, after they were seen, by running the same hints under the uninformative perturbation of the controls (`/decision/polarity/flip_factor` 500, 1000, 2000; 2331 runs), which changes the search and adds no information:
+
+| group | perturbation | `logreg` ratio to baseline | `ngb_lr` | `ngb_stack` | `ngb_lr` / `logreg` | `ngb_stack` / `logreg` |
+|---|---|---:|---:|---:|---|---|
+| random 3-SAT | none | 0.105 | 0.120 | 0.090 | 1.134 (0.90-1.43) | 0.858 (0.66-1.10) |
+| | 500 / 1000 / 2000 | 0.099 / 0.098 / 0.101 | 0.115 / 0.111 / 0.117 | 0.101 / 0.102 / 0.100 | 1.161 / 1.141 / 1.163 | 1.015 / 1.049 / 0.996 |
+| | median of the three | 0.102 | 0.116 | 0.104 | 1.138 (0.94-1.38) | 1.022 (0.81-1.30) |
+| factoring | none | 0.939 | 0.567 | 0.969 | 0.603 (0.41-0.88) | 1.032 |
+| | 500 / 1000 / 2000 | 1.043 / 0.771 / 0.692 | 0.805 / 0.695 / 0.809 | 0.924 / 0.767 / 0.817 | **0.772 / 0.901 / 1.169** | 0.887 / 0.996 / 1.180 |
+| | median of the three | 0.848 | 0.837 | 0.900 | 0.987 (0.71-1.32) | 1.061 (0.81-1.34) |
+| 3-colouring | none; median of the three | 1.038; 1.135 | 0.974; 0.899 | 1.155; 0.880 | 0.938; 0.792 (0.58-1.05) | 1.113; 0.775 (0.54-1.06) |
+
+Reading:
+
+1. **`ngb_lr` does not solve better than the logistic regression.** On random 3-SAT, confident-first, it needs 1.13 times the conflicts of `logreg` in the geometric mean (interval 0.90 to 1.43), is better on 23 instances, worse on 25 and identical on 41 (the folds with 0 or 1 round give the same hints), with the same total (661k against 658k).
+   Under each of the three perturbations the ratio is 1.14 to 1.16 again. The direction is consistently against `ngb_lr`; the intervals include 1. The few rounds of boosting reorder some variables of similar confidence, which is the one thing this strategy is sensitive to, and that does not help.
+2. **`ngb_stack` is not distinguishable from the logistic regression either.** The paired ratio is 0.86 with an interval from 0.67 to 1.11, 44 better and 43 worse. Its halved total comes from the few largest instances (its five costliest runs sum to 182k conflicts, `logreg`'s to 337k), and under the perturbations the paired ratio is 1.02, 1.05 and 1.00. One lucky unperturbed run on the heavy instances, not an effect.
+3. **The baseline does carry over the logistic regression's advantage over NGBoost.** Plain NGBoost, 300 rounds or early-stopped, needs 1.6 to 1.7 times the conflicts of `logreg` with the confident-first order (intervals 1.03 to 2.71 and 1.12 to 2.61), and both variants built on the logistic regression remove that gap. So "NGBoost on a logistic-regression baseline" is as good as the logistic regression and better than NGBoost alone, at several times the inference cost of the former.
+   Early stopping, which improved NGBoost's log loss by 0.02, changes nothing for solving (`ngb_es` against `ngb`: 1.035, interval 0.76 to 1.39): once more calibration is not what the solver uses.
+4. **The factoring cell is noise.** 0.603 of `logreg` unperturbed becomes 0.77, 0.90 and 1.17 under the three perturbations (median run: 0.987, interval 0.71 to 1.32), and the same predictor with phases only is *worse* than `logreg` at p = 0.03. `logreg:all+conf_x1` itself moves between 0.69 and 1.04 of the baseline under the perturbations.
+   A satisfiable factoring instance changes its conflicts by a factor of 2.7 RMS (0.43 in log10) under such a perturbation (noise floor of section 4), so with 40 instances single cells at p = 0.01 are to be expected among the paired rows of section 6. By contrast the random 3-SAT effect is stable: 0.098 to 0.105 for `logreg` in all four runs.
+5. **Unsatisfiable instances are not affected** by any new configuration (0.971 to 0.990, paired 0.98 to 1.00, no instance beyond 1.5 times). The three easy satisfiable instances behave as in section C (any full phase hint costs them a factor of 4 to 17).
+6. **Planner: nothing is distinguishable**, as before. Leave-one-out with all features, `ngb_lr` against `logreg` is 1.19, 0.78 and 1.66 on `.plain` for the three strategies with intervals from 0.2 to 5.5 over four instances; on the recorded sequences 1.04 and 0.97.
+   With the per-variable features only, `ngb_lr` gives the same hints as `logreg` (0 rounds) and the same conflicts. The single cells that look good (`ngb_esPV:t0.7` on `.plain`: 18 conflicts in total) are on the queries that random score hints also bring to 0 conflicts.
+
+### The same for the regression (rows added to section 4)
+
+The analogue for log10(conflicts): a standardized ridge regression (alpha 1) for the mean, and NGBoost with a Normal on top of it. Since ngboost has no offset, `NGBRegressor` is fitted to the residuals of the ridge regression, which for the mean is the same as boosting from the ridge prediction, and the variance is learnt from the residuals.
+The residuals are cross-fitted by instance (5 grouped folds inside the training fold); early stopping as for the `ngb` of section D, on the same validation instances, with 0 stages allowed. `ridge+const` is the ridge mean with one sigma from its out-of-fold residuals. The existing `ngb` row was already early-stopped.
+
+| held out by | model | stages | RMSE | NLL | coverage of the 50% / 90% interval | width of the 90% interval (log10) |
+|---|---|---|---:|---:|---|---:|
+| instance, without the 2 pigeonhole formulas (1233 rows) | ngb | 95, 72, 59, 62, 76 | **0.534** | **0.793** | 0.50 / 0.88 | 1.56 |
+| | gbm + constant sigma | - | 0.545 | 0.813 | 0.57 / 0.91 | 1.81 |
+| | ridge + constant sigma | - | 0.597 | 1.136 | 0.64 / 0.94 | 3.33 |
+| | **ridge + ngb** | 76, 67, 30, 35, 37 | 0.542 | 0.799 | 0.51 / 0.91 | 1.75 |
+| instance, all (1239 rows) | ngb | | 0.536 | 0.798 | 0.50 / 0.88 | 1.56 |
+| | **ridge + ngb** | | **2.016** | 0.828 | 0.51 / 0.91 | 27.5 |
+| family | ngb | 28, 84, 99 | 0.761 | 2.213 | 0.41 / 0.71 | 1.72 |
+| | ridge + constant sigma | - | **5.040** | 25.8 | 0.01 / 0.07 | 2.19 |
+| | **ridge + ngb** | 8, 55, 51 | 4.146 | 9.81 | 0.01 / 0.07 | 3.10 |
+
+* **In-distribution it is the same model as plain NGBoost**: RMSE 0.542 against 0.534, NLL 0.799 against 0.793, coverage 0.51 / 0.91 against 0.50 / 0.88 with intervals 12% wider. The linear baseline alone is clearly worse (RMSE 0.60), the trees make up the difference (30 to 76 stages; never 0), and nothing is gained over letting the trees do all of it.
+* **The linear baseline makes the model fragile.** On the six rows of the two pigeonhole formulas, which are far from everything else in feature space, the ridge regression extrapolates, their cross-fitted residuals are enormous, and the booster memorises them: the error on those rows is about 28 in log10 units, which alone takes the RMSE over all rows to 2.0 and the mean interval width to 27.
+  The constant sigma of `ridge+const` is inflated by the same residuals (1.0 against an actual error of 0.6, hence its NLL of 1.14). Plain NGBoost is unaffected (0.536 with them, 0.534 without).
+* **Held out by family the ridge baseline fails completely**: RMSE 5.0 (the constant predictor: 0.78), 7% coverage of the 90% interval; boosting on top cannot repair an offset that is wrong by orders of magnitude. The same lesson as the saturated cross-family logistic regression.
+* **Budget from the 90% quantile, at an equal 90% solved** (section D, use 2): conflicts wasted on the instances given up on are 22% of all conflicts for `ridge+ngb` and 19% for `ridge+const`, against 19% for `ngb`, 17% for the constant-variance GBM and 26% for one global budget. Nothing gained.
+  Choosing the configuration by `ridge+ngb`'s predicted mean gives 0.987 on the instances with at least 200 conflicts, but it picks the baseline for no instance (330 target, 83 vivify), so it is "always target" (0.949) made worse, not a per-instance choice.
+
+### Answer to the follow-up
+
+* **Is it possible?** Yes, but not with ngboost 0.6.1 as it is; the Bernoulli case takes 50 lines, and the stacked variant (the logit as a feature) needs no new code. For the regression, fitting NGBoost to cross-fitted residuals does it.
+* **Is it better calibrated than the logistic regression?** No. On random 3-SAT it is the logistic regression (0 to 28 rounds; ECE 0.0090 against 0.0097, log loss 0.5661 against 0.5651, differences inside their intervals). On factoring its log loss is 0.004 better, and plain early-stopped NGBoost is better than both.
+  On the planner instances with all features it is the worst-calibrated model of the study, because cross-fitting over three instances produces offsets unlike those at prediction time.
+* **Is it better calibrated than plain NGBoost?** Than the 300-round `ngb` of section 1, yes on random 3-SAT (and so is everything). Than NGBoost with the same early stopping: equal ECE and a better log loss on random 3-SAT (0.566 against 0.580), worse on factoring (0.6215 against 0.6180), far worse out of family.
+* **Does it solve better than the logistic regression?** No. Paired on the 89 random 3-SAT instances, confident-first: 1.13 times `logreg`'s conflicts (0.90 to 1.43), 23 better and 25 worse, stable under perturbation (1.14 to 1.16). The stacked variant: 0.86 (0.67 to 1.11), 1.02 under perturbation. Nothing on factoring, colouring, unsatisfiable or planner instances survives the perturbation check.
+* **Cost of inference.** A round is one depth-3 tree per variable in Python: about 1.2 to 1.9 microseconds per variable for `ngb_lr` at its median of 10 rounds, 3 to 4 times the logistic regression measured in the same run (0.4 to 0.5), growing linearly with the rounds (factoring: up to 142);
+  `ngb_stack` 3.4 to 4.0 (39 rounds), the 300-round `ngb` 11.4. Against section E the logistic regression remains the only predictor that is negligible next to the feature pass.
+* **The conclusion of the study does not change**: the ordering by the confidence of a cheap predictor is what helps on random 3-SAT, the logistic regression supplies it at the lowest cost, and boosting on top of it adds rounds and no information. The one correction to the earlier text is that NGBoost had been run for ten times too many rounds; stopped early it is better calibrated (and no longer the worst model on the planner instances) and solves exactly as before.
+
+Caveats specific to this section:
+
+* **Post hoc.** The question, the three new models and their strategies were chosen after sections 1 to 5 were known, and are evaluated on the same held-out instances. The perturbation check was added after the solving tables of this section were seen. The hyperparameters were not tuned on the held-out instances, but the *selection of what to try* was informed by them (logistic regression was built upon because it had won there).
+* **One positive family.** Everything about solving rests on the same 89 random 3-SAT instances as before; "as good as the logistic regression" is a statement about them.
+* **Multiple comparisons.** Section 6 has 259 paired rows and 20 perturbation rows with unadjusted intervals and p-values; section 3 gained 42 configurations. At that count a handful of rows at p < 0.05 is expected (seen on the generated families: 0.009, 0.03, 0.03, 0.04, 0.04 and 0.05, in both directions). No new row is claimed as an effect.
+* **Power.** The paired interval of `ngb_lr` against `logreg` on random 3-SAT is 0.90 to 1.43; a true difference of 10% either way is not excluded, a gain of the size that separates `logreg` from `ngb` (1.6) is.
+* **The early-stopping choice is noisy** (15 validation instances for random 3-SAT, 6 to 7 for factoring and colouring, one for the planner); another validation split would give other round counts, and for the planner the stopping rule has a single instance to go on.
+* **The own implementation of the offset booster** was checked against the stock NGBClassifier on one fold only (same settings, constant offset), and differs from it in the clipping of p in the gradient (0.001) and in its random stream.
+* **Inference times** are Python times from two runs on a loaded machine and differ by a factor of 1.5 between them.
+
 ## What it would take to matter for the planner
 
 1. **More recordings.** Four instances cannot train, calibrate or evaluate anything; leave-one-out over four is how NGBoost came to be 90% sure and half right. Dozens of recorded query sequences are the precondition (the first next step of [`README.md`](README.md) as well).
@@ -263,6 +450,8 @@ Outside the planner, the finding worth following up is not NGBoost but the confi
 * **The regression has 413 instances from four generators** and no real workload; its in-distribution calibration says nothing about a new family, as the family-held-out rows show.
 * **CPU times** were measured on a shared machine under load from other jobs; conflicts are exact, times indicative. The feature and inference times are Python times.
 * **NGBoost hyperparameters were not tuned** (nor were the other models'); a tuned NGBoost might be somewhat sharper. Nothing here suggests it would change a conclusion, since calibration was not what the solver used.
+  The follow-up of section 6 bears this out for the number of rounds: early stopping (6 to 153 rounds instead of 300) improves NGBoost's log loss and ECE in every family and changes none of its solving results.
+* The follow-up (NGBoost on a logistic-regression baseline) has its own caveats at the end of its section; it was designed after these results were known.
 * Not done: NGBoost with a categorical or Beta distribution; per-query labels for the planner sequences (only the final `.plain` model); score hints on the `.nolf` and recorded sequences (`ls` before each query); hints through IPASIR.
 
 ## Dependencies and reproduction
@@ -279,6 +468,16 @@ From `rust/`, with a release build (`cargo build --release`); `W` is any scratch
     W/venv/bin/python scripts/ngb_solve.py    --exe target/release/intel_sat_solver --work W/work    # about 45 min: 27064 runs, section 3; exits 1 on a contradiction
     W/venv/bin/python scripts/ngb_regress.py  --work W/work                                           # 30 s: section 4
     W/venv/bin/python scripts/ngb_tables.py   --work W/work                                           # section 5, writes docs/search_quality/ngboost_tables.md
+
+The follow-up (section 6 and the added rows of sections 3 and 4), after the commands above:
+
+    W/venv/bin/python scripts/ngb_lr.py       --work W/work --stage fit                               # about 1.5 min on 8 processes: ngb_es, ngb_lr, ngb_stack; writes W/work/preds_lr.npz
+    W/venv/bin/python scripts/ngb_solve.py    --exe target/release/intel_sat_solver --work W/work --resume   # about 10 min: the 5046 runs of the new configurations; rewrites section 3
+    W/venv/bin/python scripts/ngb_lr.py       --work W/work --stage report                            # section 6
+    W/venv/bin/python scripts/ngb_regress.py  --work W/work                                           # section 4 with the ridge rows
+    W/venv/bin/python scripts/ngb_tables.py   --work W/work
+
+`ngb_solve.py` adds the configurations of the follow-up only if `W/work/preds_lr.npz` exists, so the first sequence of commands still reproduces the original 27064 runs; with `--resume` the rows of the original configurations in section 3 are unchanged to the last digit (checked: the regenerated tables differ from the committed ones only by added rows and the run counts).
 
 Times are for 8 parallel solver processes on a 10-core machine that was shared with other jobs. The instance generation, the folds and the models are seeded; the predictions of two runs of `ngb_phase.py` were bit-identical, and `ngb_solve.py` checks that its baseline reproduces the conflicts recorded by `ngb_data.py`.
 `ngb_solve.py --resume` reuses the runs of `W/work/solve_runs.csv` and runs only what is missing. The solver binary used was a copy of the `target/release/intel_sat_solver` present in this worktree when the experiment started (HEAD 22dcb26); it was not rebuilt for the experiment, so that it was built from exactly that commit was not verified.
