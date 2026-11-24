@@ -70,7 +70,7 @@ The changes are confined to how the same statements are compiled; none changes a
 ## Coverage
 
 `scripts/coverage.sh` runs all the tests under LLVM source-based coverage and fails if any line is neither executed nor explicitly marked in the sources.
-Of the 9779 lines, the tests execute 9772. The rarest solver paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
+Of the 10175 lines, the tests execute 10168. The rarest solver paths (e.g., a reimplication in BCP which satisfies the earliest falsified assumption,
 while another assumption is falsified) are driven by tests on crafted solver states, which the fuzzer never produces. The other 7 lines carry the mark
 `COVERAGE-NOT-REACHED` with its reason: they run only if the system allocator fails, which the test-only allocation-fault injection doesn't simulate,
 or if a decompressor is on the PATH but can't be run. (The script also supports a `COVERAGE-UNREACHABLE` mark; no line carries it.)
@@ -122,7 +122,8 @@ The control flow is the same statement by statement. The differences are confine
 Features without a C++ counterpart live in their own modules (`src/topi_ext_*.rs`) with small, marked hooks in the mirrored files. Each one is gated by a parameter,
 which is off by default, and with the parameters off the solver's behavior, output and proofs are those of the C++ solver (`scripts/diff_vs_cpp.sh`).
 A new parameter must also be listed in `IsParamExcluded` of `src/tests/fuzzing.rs`: the fuzz scenarios draw parameters by index, so a longer list changes all of them, including the ones
-`scripts/coverage.sh` relies on to reach the rare paths. The extension gets its own tests instead (`src/tests/ext_hints.rs`, `src/tests/ext_target_phase.rs`).
+`scripts/coverage.sh` relies on to reach the rare paths. The extension gets its own tests instead (`src/tests/ext_hints.rs`, `src/tests/ext_target_phase.rs`, `src/tests/ext_vivify.rs`), and `TOPOR_FUZZ_EXTRA_PARAMS="<Param> <Val> ..." cargo test fuzz`
+runs all the fuzz scenarios with the given parameters set first, that is, with the extension on.
 
 **Phase and score hints** (`src/topi_ext_hints.rs`): advice for the search, which is never binding, so a wrong hint can only cost time.
 
@@ -156,11 +157,29 @@ Only the polarities of decisions change, so the answers, the models and the proo
   `c ToporExt Rephases <N> TargetUpds <N> TargetDecs <N>`.
 * Measurements and the recommended setting (`/phase/target/on 1 /phase/rephase/conf_init 1000` for hard satisfiable queries; off for refutations): `docs/search_quality/target_phase.md`.
 
-**Search-quality measurements** (`scripts/search_quality_bench.py`, `scripts/phase_oracle_ceiling.py`, `scripts/target_phase_bench.py`, `docs/search_quality/`):
+**Vivification of learnt clauses** (`src/topi_ext_vivify.rs`): an inprocessing step, which shortens the long learnt clauses (the "vivification: see Kissat paper" of the C++ to-do list).
+Every clause it adds is implied by the formula, so the answers, the models, the cores and the proofs stay correct.
+
+* `/inprocessing/vivify/on 1` adds a vivification round to inprocessing, so it needs `/inprocessing/on 1`, and it runs on the schedule of inprocessing: at the start of every query
+  and, with `/inprocessing/conflicts_before_next N`, at the first restart after every N conflicts (the C++ default of N is "never again in this query").
+* A round backtracks to decision level 0 (the assumptions are taken off the trail and re-assigned after the round, as after a conflict below them) and tests the learnt clauses in the order of
+  increasing glue and decreasing activity: the clause is detached from its watches (so it can't be the reason of its own shortening), the negations of its literals are decided one by one and propagated,
+  and a contradiction, a literal of the clause implied by the previous ones, or literals falsified by propagation leave a clause over a subset of the literals, which replaces the clause
+  (with the lower of the two glues and the activity of the old clause). A unit clause is propagated at level 0; a clause, which wasn't shortened, isn't tried again.
+* `/inprocessing/vivify/effort F` (0.1): a round may propagate F times the literals, which the search has propagated since the previous round (the rounds of short queries are skipped, and their budget is carried over).
+  `/inprocessing/vivify/max_glue G`: only the clauses of the glue G at most are candidates.
+* The proof: the new clause is added before the old one is deleted (`d ...`; the only deletions the solver writes), and the new-learnt-clause callback is given the new clause.
+  The conflicts and the decisions of the statistics are those of the search; the saved phases, the user's polarities and the decision heap are not touched.
+* Statistics: `m_ExtVivifyRounds`, `m_ExtVivifyTried`, `m_ExtVivifyShortened`, `m_ExtVivifyLitsRemoved`, `m_ExtVivifyUnits` and `m_ExtVivifyPropagations` of `GetStatistics()`; if the extension is on, the statistics lines
+  are followed by `c ToporExt VivifyRounds <N> Tried <N> Shortened <N> LitsRemoved <N> Units <N> Props <N> SearchProps <N>`.
+* Measurements and the recommended setting: `docs/search_quality/vivification.md`.
+
+**Search-quality measurements** (`scripts/search_quality_bench.py`, `scripts/phase_oracle_ceiling.py`, `scripts/target_phase_bench.py`, `scripts/vivify_bench.py`, `docs/search_quality/`):
 
     scripts/search_quality_bench.py --config base= --config hinted="/phase/hints/on 1 /topor_tool/hints_file hints/{inst}.hints" [--out PREFIX] <instance.cnf>...
     scripts/phase_oracle_ceiling.py          # the oracle-ceiling experiment; writes docs/search_quality/ceiling_tables.md (the reading is in ceiling.md)
     scripts/target_phase_bench.py            # target phases and rephasing versus the baseline; writes docs/search_quality/target_phase_tables.md (the reading is in target_phase.md)
+    scripts/vivify_bench.py                  # vivification versus the baseline; writes docs/search_quality/vivification_tables.md (the reading is in vivification.md)
 
 `search_quality_bench.py` runs the release executable under named configurations (sets of parameters, the first one being the baseline) and tabulates the status, the conflicts,
 the decisions, the restarts and the CPU time per instance and configuration, with the geometric means of the ratios to the baseline; it fails, if two configurations give contradicting answers.

@@ -579,6 +579,10 @@ topi_params!
 	m_ParamRephaseConfIncr: u32 = single("/phase/rephase/conf_incr", "Rust-only: rephasing: after every rephase the interval in conflicts till the next one is multiplied by /phase/rephase/conf_mult and incremented by this value", 1000);
 	m_ParamRephaseConfMult: f64 = single("/phase/rephase/conf_mult", "Rust-only: rephasing: the multiplier of the interval between two rephases (see /phase/rephase/conf_incr)", 1., 1.);
 	m_ParamRephaseRandom: bool = single("/phase/rephase/random", "Rust-only: rephasing: random phases instead of the flipped ones (the F of the schedule)", false);
+	// Vivification of learnt clauses (topi_ext_vivify.rs)
+	m_ParamVivifyOn: bool = single("/inprocessing/vivify/on", "Rust-only: vivification: let inprocessing (so, /inprocessing/on is required, and /inprocessing/conflicts_before_next schedules it) shorten the long learnt clauses: at decision level 0 the negations of the literals of a clause are propagated one by one, and the clause is replaced by the subset of its literals, which a contradiction or an implied literal is derived from", false);
+	m_ParamVivifyEffort: f64 = single("/inprocessing/vivify/effort", "Rust-only: vivification: the propagations, which a round may spend, as a fraction of the propagations of the search since the previous round", 0.1, 0.);
+	m_ParamVivifyMaxGlue: u32 = single("/inprocessing/vivify/max_glue", "Rust-only: vivification: only the learnt clauses, whose glue is not higher than this value, are candidates (the clauses of a lower glue go first anyway)", u32::MAX);
 }
 
 // The state of the C++ CTopiParams class proper (which, unlike here, doesn't hold the parameter values, since they are members of the solver class)

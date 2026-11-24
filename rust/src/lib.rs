@@ -69,6 +69,8 @@ pub(crate) mod topi_decision;
 pub(crate) mod topi_ext_hints;
 // Rust-only extension: target/best-phase saving and rephasing
 pub(crate) mod topi_ext_target_phase;
+// Rust-only extension: vivification of learnt clauses
+pub(crate) mod topi_ext_vivify;
 pub(crate) mod topi_inprocess;
 pub(crate) mod topi_main;
 pub(crate) mod topi_params;

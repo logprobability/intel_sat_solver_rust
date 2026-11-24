@@ -71,7 +71,7 @@ def main():
 
 	rows = bench(a.exe, instances, [(name, VERIFY + params) for name, _, params, _ in CONFIGS], a.timeout, a.jobs, verbose=False)
 	with open(os.path.join(a.work, "runs.csv"), "w", newline="") as f:
-		w = csv.DictWriter(f, fieldnames=["instance", "config", "status", "confs", "decs", "rsts", "cpu", "code", "verdicts"])
+		w = csv.DictWriter(f, fieldnames=["instance", "config", "status", "confs", "decs", "rsts", "cpu", "code", "verdicts"], extrasaction="ignore")
 		w.writeheader()
 		w.writerows(rows)
 	bad = contradictions(rows)

@@ -179,7 +179,7 @@ def main():
 
 	# Every run, for a closer look
 	with open(os.path.join(a.work, "runs.csv"), "w", newline="") as f:
-		w = csv.DictWriter(f, fieldnames=["instance", "config", "status", "confs", "decs", "rsts", "cpu", "code", "verdicts"])
+		w = csv.DictWriter(f, fieldnames=["instance", "config", "status", "confs", "decs", "rsts", "cpu", "code", "verdicts"], extrasaction="ignore")
 		w.writeheader()
 		w.writerows(rows)
 

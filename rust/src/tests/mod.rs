@@ -15,3 +15,4 @@ mod cov_misc;
 // The Rust-only extensions
 mod ext_hints;
 mod ext_target_phase;
+mod ext_vivify;

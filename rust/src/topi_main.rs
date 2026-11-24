@@ -1336,6 +1336,11 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			}
 
 			self.InprocessIfRequired();
+			// Rust-only extension (topi_ext_vivify.rs): vivification may decide the query (a global contradiction, a falsified assumption or a model); nothing, unless /inprocessing/vivify/on is set
+			if self.m_Params.m_ParamVivifyOn.get() && self.m_Status.get() != TToporStatus::STATUS_UNDECIDED
+			{
+				ReturnTrv!(self.StatusToRetVal());
+			}
 			self.SimplifyIfRequired();
 			self.DeleteClausesIfRequired();
 			self.CompressBuffersIfRequired();

@@ -179,6 +179,8 @@ pub struct CTopi<Ind: TUInd, const Compress: bool>
 	pub(crate) m_ExtHints: crate::topi_ext_hints::CExtHints,
 	// Rust-only extension (topi_ext_target_phase.rs): the state of target/best-phase saving and rephasing
 	pub(crate) m_ExtTargetPhase: crate::topi_ext_target_phase::CExtTargetPhase,
+	// Rust-only extension (topi_ext_vivify.rs): the state of the vivification of learnt clauses
+	pub(crate) m_ExtVivify: crate::topi_ext_vivify::CExtVivify,
 
 	// Literal currently propagated by BCP
 	pub(crate) m_CurrentlyPropagatedLit: TULit,
@@ -449,6 +451,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			m_NonForcedPolaritySelectionForFlip: 0,
 			m_ExtHints: Default::default(),
 			m_ExtTargetPhase: Default::default(),
+			m_ExtVivify: Default::default(),
 			m_CurrentlyPropagatedLit: BadULit,
 			m_Cis: CVector::new(0, 0),
 			m_Dis: CVector::new(0, 0),
@@ -2285,7 +2288,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 	pub(crate) fn StatStrShort(&mut self, forcePrintingHead: bool) -> String
 	{
 		let bi = self.GetStatBufferInfo();
-		// Rust-only extension (topi_ext_target_phase.rs): an extra line, if the extension is on (empty otherwise)
-		self.m_Stat.StatStrShort(&bi, forcePrintingHead, true) + &self.ExtTargetPhaseStatStr()
+		// Rust-only extensions (topi_ext_target_phase.rs, topi_ext_vivify.rs): an extra line per extension, which is on (empty otherwise)
+		self.m_Stat.StatStrShort(&bi, forcePrintingHead, true) + &self.ExtTargetPhaseStatStr() + &self.ExtVivifyStatStr()
 	}
 }

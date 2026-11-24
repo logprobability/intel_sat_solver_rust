@@ -39,6 +39,8 @@ def run_one(exe, inst, params, timeout):
 		outFile.seek(0)
 		out = outFile.read().decode(errors="replace")
 	res = parse(out)
+	# The statistics lines of the Rust-only extensions (for the scripts of the extensions)
+	res["ext"] = [l for l in out.splitlines() if l.startswith("c ToporExt ")]
 	res["cpu"] = ru.ru_utime + ru.ru_stime
 	res["code"] = "timeout" if timedOut.is_set() else p.returncode
 	# The status of the instance: the verdict of its last query, or why there is none
@@ -118,7 +120,7 @@ def write_tables(rows, configs, baseline, prefix=None, out=sys.stdout):
 		with open(prefix + ".md", "w") as f:
 			f.write(text)
 		with open(prefix + ".csv", "w", newline="") as f:
-			w = csv.DictWriter(f, fieldnames=["instance", "config", "status", "confs", "decs", "rsts", "cpu", "code", "verdicts"])
+			w = csv.DictWriter(f, fieldnames=["instance", "config", "status", "confs", "decs", "rsts", "cpu", "code", "verdicts"], extrasaction="ignore")
 			w.writeheader()
 			w.writerows(rows)
 	return summary, bad

@@ -113,7 +113,9 @@ fn IsParamExcluded(name: &str) -> bool
 	// (The hints have no effect without HintPhase/HintScore, which the scenarios don't invoke; tests/ext_hints.rs fuzzes them.)
 	name == "/phase/hints/on" || name == "/decision/score_hints/mult" ||
 	// (tests/ext_target_phase.rs fuzzes these)
-	name.starts_with("/phase/target/") || name.starts_with("/phase/rephase/")
+	name.starts_with("/phase/target/") || name.starts_with("/phase/rephase/") ||
+	// (tests/ext_vivify.rs fuzzes these, and so does every scenario under TOPOR_FUZZ_EXTRA_PARAMS)
+	name.starts_with("/inprocessing/vivify/")
 }
 
 // Parses the description of the parameters, which is provided by the solver, into the list of the parameters with a few interesting legal values for each
@@ -641,6 +643,36 @@ pub fn NewFuzzSolver(solverMode: u8, varsNumHint: TLit) -> Box<dyn TFuzzSolver>
 	}
 }
 
+// Parameters, which every scenario of this thread sets right after the solver is created (before the parameters of the scenario itself): they turn on a Rust-only extension,
+// which the scenarios don't know of (see IsParamExcluded), so that all of them exercise it. The default is the environment variable TOPOR_FUZZ_EXTRA_PARAMS
+// ("<Param1> <Val1> <Param2> <Val2> ..."), e.g., TOPOR_FUZZ_EXTRA_PARAMS="/inprocessing/on 1 /inprocessing/conflicts_before_next 1 /inprocessing/vivify/on 1 /inprocessing/vivify/effort 1e9" cargo test fuzz
+thread_local!
+{
+	static EXTRA_PARAMS: RefCell<Vec<(String, f64)>> = RefCell::new(
+	{
+		let env = std::env::var("TOPOR_FUZZ_EXTRA_PARAMS").unwrap_or_default();
+		let tokens: Vec<&str> = env.split_whitespace().collect();
+		tokens.chunks(2).map(|nv| (nv[0].to_string(), nv[1].parse().expect("TOPOR_FUZZ_EXTRA_PARAMS: a value is not a number"))).collect()
+	});
+}
+
+// The statistics lines of the Rust-only extensions ("c ToporExt ...") at the end of the scenarios of this thread since the previous invocation:
+// a test of an extension uses them to make sure that its scenarios do exercise the extension
+thread_local!
+{
+	static EXT_STATS: RefCell<Vec<String>> = const { RefCell::new(vec![]) };
+}
+
+pub fn TakeExtStats() -> Vec<String>
+{
+	EXT_STATS.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+pub fn SetExtraParams(params: &[(&str, f64)])
+{
+	EXTRA_PARAMS.with(|p| *p.borrow_mut() = params.iter().map(|(n, v)| (n.to_string(), *v)).collect());
+}
+
 // A DRAT sink, which is shared between the solver and the harness
 #[derive(Clone, Default)]
 pub struct CSharedSink
@@ -707,6 +739,7 @@ pub fn RunScenario(s: &TFuzzScenario, solverMode: u8, failAllocsAfter: Option<u6
 	}
 
 	let mut solver = NewFuzzSolver(solverMode, s.m_VarsNumHint);
+	EXTRA_PARAMS.with(|p| p.borrow().iter().for_each(|(name, val)| solver.FSetParam(name, *val)));
 	if s.m_Drat != 0
 	{
 		solver.FDumpDrat(Box::new(drat.clone()), s.m_Drat.is_multiple_of(2), s.m_Drat > 2);
@@ -859,6 +892,11 @@ pub fn RunScenario(s: &TFuzzScenario, solverMode: u8, failAllocsAfter: Option<u6
 		assert!(!solver.FGetStatusExplanation().is_empty());
 		// The scenarios consist of legal API invocations only, so the solver may get into an erroneous state only because of a (deliberate) memory-out
 		assert!(failAllocsAfter.is_some(), "The solver unexpectedly moved to an erroneous state: {}", solver.FGetStatusExplanation());
+	}
+	else if failAllocsAfter.is_none()
+	{
+		let stats = solver.FStats();
+		EXT_STATS.with(|s| s.borrow_mut().extend(stats.lines().filter(|l| l.starts_with("c ToporExt ")).map(|l| l.to_string())));
 	}
 	drop(solver);
 	alloc_fault::never_fail();
