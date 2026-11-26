@@ -120,6 +120,10 @@ Four instances cannot support nested cross-validation, so the planner gets no in
    Found in a smoke test on one 3-colouring fold with tiny round caps, before the real fit: ngboost's log score is unclipped, and on the near-deterministic variables of 3-colouring (isolated vertices) it reaches an infinite mean after a few rounds at learning rate 0.1,
    which makes the fold-averaged curve infinite from there on. The clipped log loss is the one used everywhere else (the inner scores of `logreg` and `gbm`, and the reported metric); where both are finite they agreed in the smoke test to every printed digit.
    The curves are computed from `staged_predict_proba` (ngboost) and from the trees and scales of `OffsetBernoulliNGB`.
+2. **Diverging ngboost fits.** In the first launch of the fit stage, an inner fit of `ngb_stack` on 3-colouring raised ngboost's "the fit diverged at iteration 138" (a logit overflows, the natural gradient is not finite) and stopped the stage
+   (no result had been looked at; the 45 `logreg`, 45 `ngb_lr` and 16 `ngb_stack` fold files written before were kept, none of them affected). The protocol had no rule for this. Rule added:
+   an inner fold whose fit diverges keeps the rounds fitted before the divergence, and its validation curve is infinite from the diverging round on, so the fold-averaged curve, and therefore the choice of rounds, stays before it;
+   if the final refit of the chosen setting diverges, the next grid point by inner score is used (recorded per fold as `final_diverged`). The number of inner folds that diverged is stored per grid point.
 
 ## Results
 

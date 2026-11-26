@@ -204,19 +204,37 @@ def fit_ngb(Xtr, ytr, gtr, inner, Xte, lr_res=None, fixed=None):
 	else:
 		for d, lr in TREE_GRID:
 			cmax = NGB_CAP[lr]
-			curves = []
+			curves, div = [], 0
 			for tr, va in masks:
 				tr = cap(tr)
-				m = new_ngb(d, lr, cmax).fit(Xtr[tr], ytr[tr])
+				m = new_ngb(d, lr, cmax)
+				try:
+					m.fit(Xtr[tr], ytr[tr])
+					diverged = False
+				except ValueError as e:
+					# ngboost raises when its fit diverges (a logit overflows); the rounds fitted before are kept, and the curve is infinite from there on (Deviations, 2)
+					assert "diverged" in str(e), e
+					diverged, div = True, div + 1
 				# the log loss with p clipped as in metrics(): ngboost's own validation score is unclipped and becomes infinite on near-deterministic variables
-				curves.append(pad([ll(q[:, 1], ytr[va]) for q in m.staged_predict_proba(Xtr[va])], cmax))
+				curve = [ll(q[:, 1], ytr[va]) for q in m.staged_predict_proba(Xtr[va])]
+				curves.append(np.array(curve + [float("inf")] * (cmax - len(curve))) if diverged else pad(curve, cmax))
 			avg = np.mean(curves, axis=0)
-			grid[(d, lr)] = (float(avg.min()), int(np.argmin(avg)) + 1, cmax, float(avg[-1]))
-		d, lr = min(TREE_GRID, key=lambda g: (grid[g][0], TREE_GRID.index(g)))
-		n = grid[(d, lr)][1]
+			grid[(d, lr)] = (float(avg.min()), int(np.argmin(avg)) + 1, cmax, float(avg[-1]), div)
+	# the final fit; should it diverge, the next grid point by inner score
+	order = [(fixed["depth"], fixed["lr"])] if fixed else [g for g in sorted(TREE_GRID, key=lambda g: (grid[g][0], TREE_GRID.index(g))) if np.isfinite(grid[g][0])]
+	diverged = []
 	full = cap(np.arange(len(ytr)))
-	p = new_ngb(d, lr, n).fit(Xtr[full], ytr[full]).predict_proba(Xte)[:, 1]
-	return {"p": p, "depth": d, "lr": lr, "rounds": n, "cap": NGB_CAP[lr], "grid": {f"{g[0]}/{g[1]}": v for g, v in grid.items()}}
+	for d, lr in order:
+		n = fixed["rounds"] if fixed else grid[(d, lr)][1]
+		try:
+			p = new_ngb(d, lr, n).fit(Xtr[full], ytr[full]).predict_proba(Xte)[:, 1]
+			break
+		except ValueError as e:
+			assert "diverged" in str(e), e
+			diverged.append(f"{d}/{lr}")
+	else:
+		raise RuntimeError("every grid point diverged")
+	return {"p": p, "depth": d, "lr": lr, "rounds": n, "cap": NGB_CAP[lr], "grid": {f"{g[0]}/{g[1]}": v for g, v in grid.items()}, "final_diverged": diverged}
 
 def fit_ngb_lr(Xtr, ytr, gtr, inner, Xte, lr_res, fixed=None):
 	oof, offTe = lr_res["oof"], lr_res["logit_te"]
@@ -652,6 +670,21 @@ def stage_report(a):
 			cellsM.append(f"{np.median(margins):.5f}")
 		cellsM.insert(4, f"{np.median(gains):.5f}")
 		md.append(f"| {TITLES[fam]} | " + " | ".join(cellsM) + " |")
+	# diverging ngboost fits (Deviations, 2)
+	md += ["", "Diverging ngboost fits (Deviations, 2): per family and method, the inner fits that diverged (out of 15 outer folds x 6 grid points x 4 inner folds = 360), and the final refits that diverged and fell back to the next grid point.", "",
+		"| family | ngb: inner / final | ngb_stack: inner / final |", "|---|---|---|"]
+	for fam in FAMILIES:
+		cs = []
+		for m in ("ngb", "ngb_stack"):
+			inner_d = final_d = 0
+			for seed in SEEDS:
+				for k in range(K_OUTER):
+					r = load(os.path.join(fold_dir(a.out, fam, seed, k), m + ".npz"))
+					inner_d += sum(v[4] for v in r["grid"].values() if len(v) > 4)
+					final_d += len(r.get("final_diverged", []))
+			out[f"diverged/{fam}/{m}"] = [inner_d, final_d]
+			cs.append(f"{inner_d} / {final_d}")
+		md.append(f"| {TITLES[fam]} | " + " | ".join(cs) + " |")
 	md.append("")
 
 	# ---- solving
