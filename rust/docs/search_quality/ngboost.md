@@ -5,6 +5,11 @@ Two predictions were tried: the value of each variable in a model (advice throug
 All the tables are in [`ngboost_tables.md`](ngboost_tables.md) (sections 1 to 6, referred to below); the scripts are `scripts/ngb_*.py`.
 A follow-up question, whether NGBoost can be built on top of the logistic regression that turned out best, is answered in [its own section](#ngboost-on-a-logistic-regression-baseline-section-6).
 
+**Re-evaluated with nested cross-validation** ([`ngboost_nested_cv.md`](ngboost_nested_cv.md), pre-registered): every hyperparameter and round count chosen in inner folds by instance, 5-fold outer loops repeated with 3 shuffles, every solver comparison at three flip settings with a Holm-adjusted decision rule.
+The conclusions here stand. No learnt predictor (`gbm`, `gbm_iso`, `ngb`, `ngb_lr`, `ngb_stack`) is distinguishable from the logistic regression in paired conflicts (confident-first) on any family. `logreg:all+conf_x1` again takes 0.08 to 0.10 of the baseline's conflicts on random 3-SAT.
+Tuned NGBoost needs 1.6 to 1.7 times `logreg`'s conflicts there (not significant after Holm), and `ngb_lr` is `logreg` (0.97 to 0.99, intervals 0.88 to 1.09). The two apparent wins of section 6 are gone.
+The only claims that pass the rule concern the untrained Jeroslow-Wang order: 4 times `logreg`'s conflicts on random 3-SAT, and 0.47 to 0.50 of them on 3-colouring, where it also beats the baseline. The trees' better log loss on factoring (about -0.01) does not reach the solver.
+
 ## Answer
 
 * **Is it possible?** Yes. NGBoost trains and predicts on features computed from the CNF in linear time, and everything it says reaches the solver through the existing hints.
