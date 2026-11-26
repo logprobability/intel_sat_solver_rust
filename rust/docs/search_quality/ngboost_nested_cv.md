@@ -205,6 +205,8 @@ Geometric-mean ratio of conflicts to `logreg`'s (per-instance log ratio averaged
 
 On 3-colouring the learnt methods are below `logreg` in all 15 cells (0.73 to 0.97), and two of them (`ngb`, `ngb_stack`) pass at two of the three settings. This is not claimed (the rule requires all three), and it has a plain reading:
 `logreg:all+conf_x1` is itself *worse* than the baseline on colouring (1.23 / 0.95 / 1.03), while the others are near 1 (0.75 to 1.09); the comparison is "predictors of the base rate with different orders of near-ties", not a calibration effect.
+On random 3-SAT the bootstrap intervals of `gbm`, `gbm_iso` and `ngb` exclude 1 at most settings while their Wilcoxon p does not survive Holm (and is 0.03 to 0.2 before it). These are consistent: the deficit of the geometric mean comes from a minority of instances with large ratios (wins / losses about 38 / 50), not from a uniform shift that a rank test would pick up.
+For `jw` on colouring, "beats the baseline" is against the baseline only: as pre-registered, this protocol ran no uninformative controls (`perm_x1`, `rand_phase`) on the generated families. The controls of the earlier study on these colouring instances were at 0.83 to 1.23 of the baseline, and that is the context in which 0.47 to 0.61 stands out.
 Repeats separately (generated tables, last primary table): on random 3-SAT `ngb` is 1.43 to 2.13 of `logreg` per repeat, `ngb_lr` 0.93 to 1.07; the repeats agree in direction for every method on random 3-SAT except `ngb_lr` (which straddles 1) and disagree in direction for most on factoring.
 
 **Phases only (`:all` against `logreg:all`, secondary):** nothing on any family has a Holm p below 0.18; on random 3-SAT all six are 0.87 to 1.15 of `logreg`, and `ngb_lr:all` gives the `logreg` hints on 83 of 89 instances.
@@ -295,4 +297,5 @@ From the repository root, with the cached data of the earlier study in `W/work` 
     W/venv/bin/python rust/scripts/ngb_nested_cv.py --work W/work --out W/ncv --stage report                            # writes W/ncv/report.md (= ngboost_nested_cv_tables.md)
 
 Every stage checkpoints (one file per fitted outer fold and method, one CSV row per solver run, hint files by content hash); rerunning the same command continues where it stopped.
-`--stage solve --dry-run` counts the runs without making them. The report's bootstrap and the folds are seeded; `ngb_lr.py`'s `OffsetBernoulliNGB` gained parameters for its rate, depth and patience whose defaults are the earlier constants.
+`--stage solve --dry-run` counts the runs without making them. The report's bootstrap and the folds are seeded; `ngb_lr.py`'s `OffsetBernoulliNGB` gained parameters for its rate, depth and patience whose defaults are the earlier constants. This was checked by rerunning `ngb_lr.py --stage fit` on a copy of the earlier inputs: all 12 arrays of `preds_lr.npz` are bit-identical to the earlier ones.
+The fit stage took about 1.5 h of wall time in two launches (the first stopped at the divergence of Deviations, 2; the second, 53 minutes, finished the remaining 119 fold-method fits and the planner).
