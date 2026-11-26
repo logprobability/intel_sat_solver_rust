@@ -40,6 +40,8 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
 
   The views compose (`as_of(t).since(s)`, `history().as_of(t)`, ...); transacting against one is an error. `Db::datoms(e, a, v)` scans a view.
   `Db::tx_range(from, to)` reads the log: each transaction of the bases `from..to` with its entity and datoms (as Datomic's `tx-range`).
+  `Db::index_range(a, lo, hi)` reads the datoms of an attribute whose value is within bounds, in value order (Datomic's `index-range`),
+  in any view: the range is located in the AVET index (in each compressed segment, by the ranks of the bounds in its dictionary), not scanned for.
   The views take a basis; `Db::basis_of_instant(i)` (the last basis whose transaction is at or before instant `i`) and `Db::basis_of_tx(tx)`
   give the basis of a time or a transaction entity, so `db.as_of(db.basis_of_instant(i))` is the database at time `i` (binary searches,
   as instants never decrease and transaction entities increase with the basis).
@@ -173,6 +175,24 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     | history `datoms(e, a)`               | 271 (509)      | 97 (216)                 |
     | as-of `attr_datoms(a)`, per datom    | 32 (53)        | 16 (15)                  |
     | `tx_range`, per datom                | 45 (80)        | 29 (28)                  |
+  * `Conn::compact()` (and `Db::compacted()`, for a value) merges each history index into one segment, which is what a value opened
+    from a checkpoint has: the value reads the same, and its history, `since` and `as_of` reads move from the first column to the second.
+    It needs no mode: the connection takes transactions as before (they go to a new tail and to segments of their own), the values taken
+    earlier keep their indexes, and neither the data nor the log changes. On the database of the table, it took 153 ms, and in the same
+    run the reads by entity or value took 135 to 251 ns compacted, against 516 to 596 ns before and 182 to 281 ns opened from the
+    checkpoint (one run on a busy machine, so higher than the table's minima; `history_read_timings` prints the three).
+* **Text transactions** (`src/txparse.rs`). `Conn::transact_str(text)` (and `Db::transact_str`, `Db::parse_tx`) reads Datomic's
+  transaction data in EDN into the `Tx` builder, so a database can be defined and written without Rust code:
+  `[{:db/ident :person/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+  {:db/id "alice" :person/name "Alice" :person/friend ["bob" {:person/name "Carol"}]} [:db/add "bob" :person/name "Bob"]
+  [:db/retract [:person/name "Dave"] :person/friend 17] [:db/retractEntity 18] [:db/cas 17 :person/age nil 30]]`.
+  * Attribute maps (those with `:db/ident`) define attributes, or alter existing ones, giving only what changes (`:db/unique nil` drops
+    uniqueness); they are read first, so the transaction's data can use them. `:db/doc` and `:db/index` are accepted and ignored.
+  * Entities are ids, tempid strings (`"datomic.tx"` is the transaction's entity, and its `:db/txInstant` the transaction's instant) and
+    lookup refs. Entity maps assert their attributes of `:db/id` (or of a new entity), a vector giving the values of a cardinality-many
+    attribute, and a nested map an entity that a Ref attribute refers to. The report (`TextTxReport`) maps each tempid string to its entity.
+  * The operations are `:db/add`, `:db/retract`, `:db/retractEntity` and `:db/cas` (and `:db.fn/retractEntity`, `:db.fn/cas`).
+    Syntax errors carry their line and column; the transaction's own errors are the builder's.
 * **Queries** (`src/query.rs`). Datalog-style queries over any view: patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`),
   comparison predicates, `not`/`not-join` and `or`/`or-join` (nested to any depth) and rule calls (see Rules), run as nested loops, each pattern using the index selected by its bound positions.
   * `not` keeps the rows for which its body has no solution; its join variables (all of its body's, or the `not-join` list) must be bound when it runs,
@@ -183,6 +203,22 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     is a clause that binds them, at a cost estimated from its branches; no clause both needs and binds, which keeps the encoding sound.
     Each run plans the bodies once (with the SAT planner, within a budget), counting the join variables bound where they run as constants,
     and runs them in an environment of their own.
+  * Ranges: a pattern that binds its value (with its entity unbound) reads only the range of the AVET index that the comparisons of its
+    body allow, when they compare that value with a constant or with a variable bound before the pattern, of the attribute's type
+    (a bound of another type, such as a Float for an Int attribute, is compared numerically and stays with its predicate). It applies in
+    the bodies of `not`, `or` and rules too, and in every view. On 20,000 transactions (`cargo test --release range_timings -- --ignored
+    --nocapture`, one run), the top 1% of an attribute's values (704 datoms of about 130,000): `index_range` 10 µs against 6.4 ms for
+    filtering the attribute, and the query `[?e :n ?v] [(>= ?v 990)]` 2.2 ms against 15.5 ms with the bound left to the predicate
+    (as of a past basis: 187 µs against 11.9 ms, and 1.7 ms against 15.3 ms).
+  * The planner costs the range: a comparison of a variable with a constant is *charged at* the first pattern whose value is that
+    variable (of the constant's type). The pattern's estimates are scaled by the fraction of its datoms that the comparison keeps,
+    counted in the index in logarithmic time (`Db::range_fraction`: ranks in the current treap, whose nodes hold their subtree's size,
+    and range lengths in the history segments), and the comparison itself then counts as keeping every row. That is exact where the
+    pattern reads the range; where its entity is bound first, the fraction is applied one clause early. The fractions of several
+    comparisons multiply (so a range between two bounds is overestimated), and a since or as-of view uses the latest value's fraction,
+    like its other statistics. The comparison may be added before or after the pattern: the planner re-weighs the affected clause
+    (`Planner::reweigh`). On the database above, `[?e :tag "a"] [?e :n ?v] [(>= ?v 990)]` (200 entities, where a quarter of the tags are "a") now
+    starts from the range: 1.3 ms, against 27.5 ms held to the previous plan with `require_before` (1.1 ms against 11.2 ms as of a past basis).
   * Find specs (`Query::find`) take plain terms and the aggregates `count`, `count-distinct`, `sum`, `min`, `max` and `avg`, grouped by the plain terms,
     over the distinct tuples of the find and `with` variables, as in Datomic. `sum` of Ints is an exact Int (an error on overflow), and a Float
     once any value is a Float; `avg` is a Float; both take only numbers. Text queries add `(pull ?e [pattern])` in any position and
@@ -217,7 +253,9 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     Feasibility itself is decided exactly by the greedy order (being able to run is monotone in the set of clauses that ran); the core comes
     from the SAT solver (`IsAssumptionRequired` over the constraints' assumptions, shrunk by deletion) and is re-confirmed by that test,
     falling back to deletion with the test if the solver runs out of budget.
-  * Larger queries use one incremental SAT solver per query, encoded when first needed and then extended clause by clause (nothing is retracted),
+  * Larger queries use one incremental SAT solver per query, encoded when first needed and then extended clause by clause (nothing is retracted;
+    the one change that the encoding can't absorb, a clause re-weighed after it was encoded because a comparison added later bounds its range,
+    starts the solver over, and the next refinement encodes the query again),
     with a refinement bounded by a conflict budget after each clause (each solve is charged at least one conflict, so the budget also bounds
     the number of solves, and a spent budget solves nothing; a finite budget is clamped so that the solver's threshold, its conflict count
     plus the budget, doesn't wrap; and a solve can overshoot by the few conflicts of its last round of conflict analysis).
@@ -259,7 +297,12 @@ The crate depends on the solver by path (`../rust`), with the solver's profiles 
                             # through string and ref-valued identities against a naive fixpoint, foreign tempids and lookups, the history and since views of
                             # every past value against the transactions' logs, history queries and pull against brute force,
                             # random queries with (nested) not and or in every clause order against a bottom-up relational
-                            # evaluator, aggregates against a hand grouping, text queries against the builder, blanks in not and or, transitive closure
+                            # evaluator, aggregates against a hand grouping, text queries against the builder, text transactions against the builder
+                            # (the same database, entity ids and history included) and their errors' positions, compaction against the
+                            # value it came from (and the same transactions after it), value ranges of the indexes against filtered
+                            # scans (every index order, view, kind of bound and comparison, Floats with their zeros and NaN), the planner's
+                            # range fractions against counts, re-weighed clauses against brute force (the DP and SAT), plans that start
+                            # from a small range in every order of adding the clauses, blanks in not and or, transitive closure
                             # (four formulations, random graphs with cycles) against Floyd-Warshall, mutual recursion against a
                             # parity search, stratified negation, random rule programs against a naive simultaneous fixpoint,
                             # and the plan count of semi-naive evaluation on a long chain; the durable log: a random history reopened
@@ -283,6 +326,9 @@ This is a start. What is missing, roughly in order of value:
   brute-force test extended to such clauses); attribute variables in patterns; function and binding expressions (`[(f ?x) ?y]`);
   the aggregates `median`, `variance` and `stddev`. The cost model doesn't see inside `not` and `or`
   (a `not` has a fixed selectivity, a binding `or` the cost of its branches with nothing bound).
+* Writes in the language: transactions driven by a query (a transaction template instantiated for each row of a query's result, as
+  SQL's `UPDATE`/`DELETE ... WHERE`; atomic for free, since a connection has one writer), with expressions in the template;
+  `[:db/retract e :attr]` without a value; reverse attributes (`:ns/_name`) in entity maps; a place for `:db/doc`.
 * Time: the planner's estimates for `since` and `as_of` views
   (they use the latest value's statistics). An as-of view derives each read from the history, so it costs more than a read of the current value.
   In a history view, the current-state accessors (`values`, `lookup`, ...) still read the current datoms; only scans and queries see the history.
@@ -302,8 +348,16 @@ This is a start. What is missing, roughly in order of value:
   cut SAT's time from ~40 s; reducing the adder columns in rounds instead of chains made it much slower.)
 * Ordering constraints: only `require_before` on the query's top-level clauses (not inside `not`, `or` or rule bodies), no text syntax,
   and no way to drop an accepted constraint.
-* Cost model: independence assumptions and fixed predicate selectivities; no histograms.
+* Cost model: independence assumptions; no histograms. A comparison with a constant is measured in the index, but one with a variable,
+  or with a constant of another type than the attribute's, still has a fixed selectivity, as does `not`. A pattern whose entity is bound
+  is estimated as if every such entity had the attribute, which overrates plans that start from the other pattern of a join.
+* Indexes: Datomic's five are here (EAVT, AEVT, AVET and VAET, current and historical, and the log), with range access to AVET.
+  Not here: a general `datoms`/`seek-datoms` over any index from any position (the accessors read by key prefix, and `index_range` by value),
+  composite tuple indexes (`:db/tupleAttrs`: they need a tuple value type, and with it composite unique keys), and Datomic's fulltext
+  index (a tokenizer and an inverted index kept beside the datoms, eventually consistent in Datomic, and absent from Datomic Cloud).
 * Storage: the log is durable (`Conn::open`) and checkpoints make opening fast, but the database is in memory, and so is its whole
   history (`Conn` keeps one value, whose history indexes serve every past one). Missing: index segments on disk, read lazily (so that memory
   isn't bounded by the database's size), log compaction (the log keeps every record, the checkpoint only caches them), an automatic
   checkpoint policy, access by several processes (today one connection holds the file's lock), and group commit (each transaction syncs on its own).
+  `Conn::compact` only merges the history; a read-only mode would add to it a shared file lock (several reading processes), a static layout
+  of the current indexes (to be measured against the treaps) and rule relations cached across queries.

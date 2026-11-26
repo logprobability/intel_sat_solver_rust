@@ -43,11 +43,12 @@
 //! code as `transact`, so a reopened connection has the same values, down to the index contents and statistics.
 //! `Conn::checkpoint` writes a `Snapshot` next to the log, from which `Db::from_snapshot` rebuilds the value without replaying (see `log`).
 
-use crate::hist::{Change, HIndex, Key, AEVT, AVET, EAVT, LOG, VAET};
+use crate::hist::{after, before, Change, HIndex, Key, AEVT, AVET, EAVT, LOG, VAET};
 use crate::log::Log;
 use crate::pmap::PMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::ops::Bound;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1034,6 +1035,20 @@ impl Db
 		self.history
 	}
 
+	/// This value (or view) with each history index merged into one segment: it reads the same, and its history, `since` and `as_of`
+	/// reads are faster (they search one segment rather than merge several; the README has the timings). It takes time linear in the
+	/// history, and the values derived from the result by `transact` stay nearly as compact (they add small segments).
+	/// A value opened from a checkpoint is compact already
+	pub fn compacted(&self) -> Db
+	{
+		let mut db = self.clone();
+		for index in [&mut db.heavt, &mut db.haevt, &mut db.havet, &mut db.hvaet, &mut db.tlog]
+		{
+			index.compact();
+		}
+		db
+	}
+
 	/// The statistics of the attribute's datoms in this view: the history's in a history view; in a `since` or `as_of` view,
 	/// those of the whole (latest) database, an estimate
 	pub fn stats(&self, a: AttrId) -> AttrStats
@@ -1048,7 +1063,7 @@ impl Db
 		let d = |e: Eid, v: &Value, tx: Eid, added: bool| Datom { e, a, v: v.clone(), tx, added };
 		let hist = |index: &HIndex, prefix: &[Key]| index.scan(prefix).map(|c| c.datom()).collect();
 		// An as-of view reads the history, which gives the current datoms as of its basis
-		let mut out: Vec<Datom> = match (self.history || self.upto.is_some(), e, v)
+		let out: Vec<Datom> = match (self.history || self.upto.is_some(), e, v)
 		{
 			(false, Some(e), Some(v)) => self.eavt.get(&(e, a, v.clone())).map(|tx| d(e, v, *tx, true)).into_iter().collect(),
 			(false, Some(e), None) => self.eavt.seek(|k| (k.0, k.1) < (e, a)).take_while(|(k, _)| (k.0, k.1) == (e, a)).map(|(k, tx)| d(e, &k.2, *tx, true)).collect(),
@@ -1059,6 +1074,48 @@ impl Db
 			(true, None, Some(v)) => hist(&self.havet, &[Key::A(a), Key::V(v)]),
 			(true, None, None) => hist(&self.haevt, &[Key::A(a)]),
 		};
+		self.in_view(out)
+	}
+
+	/// The datoms of attribute `a` in this view whose value is within the bounds, in the order of the AVET index (by value, then entity):
+	/// Datomic's `index-range`. The range is located in the index, so the cost is that of the datoms returned (in an as-of or history view,
+	/// of their history). The values of an attribute have its type, so bounds of another type give all of its datoms or none
+	pub fn index_range(&self, a: AttrId, lo: Bound<&Value>, hi: Bound<&Value>) -> Vec<Datom>
+	{
+		let out = if self.history || self.upto.is_some()
+		{
+			self.havet.scan_range(&[Key::A(a)], lo, hi).map(|c| c.datom()).collect()
+		}
+		else
+		{
+			let rows = self.avet.seek(|k| k.0 < a || (k.0 == a && before(&k.1, lo))).take_while(|(k, _)| k.0 == a && !after(&k.1, hi));
+			rows.map(|(k, tx)| Datom { e: k.2, a, v: k.1.clone(), tx: *tx, added: true }).collect()
+		};
+		self.in_view(out)
+	}
+
+	/// The fraction of the datoms that `stats` counts for attribute `a` whose value is within the bounds, for the planner: counted in
+	/// the index (in logarithmic time, without reading the datoms), so exact for the current value and for its history view, and like
+	/// `stats` an estimate from the latest value in a `since` or `as_of` view. 1 for an attribute without datoms
+	pub(crate) fn range_fraction(&self, a: AttrId, lo: Bound<&Value>, hi: Bound<&Value>) -> f64
+	{
+		let total = self.stats(a).datoms;
+		let count = if self.history
+		{
+			self.havet.count_range(&[Key::A(a)], lo, hi)
+		}
+		else
+		{
+			let (start, end) = (self.avet.rank(|k| k.0 < a || (k.0 == a && before(&k.1, lo))), self.avet.rank(|k| k.0 < a || (k.0 == a && !after(&k.1, hi))));
+			end.saturating_sub(start)
+		};
+		if total == 0 { 1.0 } else { (count as f64 / total as f64).min(1.0) }
+	}
+
+	// The datoms of this view among those read from its indexes (the current ones, or the history's in a history or as-of view),
+	// which are in an index's order
+	fn in_view(&self, mut out: Vec<Datom>) -> Vec<Datom>
+	{
 		match (self.upto, self.history)
 		{
 			(Some(upto), true) => out.retain(|d| d.tx <= upto),
@@ -1952,6 +2009,13 @@ impl Conn
 			Some(log) => log.checkpoint(&self.db),
 			None => Err(Error::Io("an in-memory connection has no log to checkpoint".into())),
 		}
+	}
+
+	/// Compact the current value's history indexes (see `Db::compacted`), for the values and views taken from now on; the values
+	/// taken before keep their indexes. It changes neither the data nor the log, and the connection takes transactions as before
+	pub fn compact(&mut self)
+	{
+		self.db = self.db.compacted();
 	}
 
 	/// The database as of basis `t` (None if `t` is in the future): a view of the current value (see `Db::as_of`)
@@ -3231,6 +3295,121 @@ pub(crate) mod tests
 			assert_eq!(view.transact(&Tx::new()).err(), Some(Error::FilteredDb));
 		}
 		assert_eq!(latest.as_of(latest.basis_t()).unwrap().upto, None);
+	}
+
+	// index_range against the attribute's datoms filtered and sorted in AVET order, on every kind of view, for every attribute
+	// (the transactions' instants included) and bounds of every kind, on values of the attribute and of other types
+	#[test]
+	fn index_range_matches_a_filtered_scan()
+	{
+		let (conn, _) = random_conn(37, 60);
+		let db = conn.db();
+		let views = [
+			("current", db.clone()),
+			("compacted", db.compacted()),
+			("history", db.history()),
+			("as of 30", db.as_of(30).unwrap()),
+			("history as of 45", db.as_of(45).unwrap().history()),
+			("since 20", db.since(20).unwrap()),
+			("as of 50 since 10", db.as_of(50).unwrap().since(10).unwrap()),
+			("history since 25", db.history().since(25).unwrap()),
+		];
+		let mut rng = Rng::new(9);
+		let mut nonempty = 0;
+		for (what, view) in &views
+		{
+			for name in RANDOM_ATTRS.iter().chain([&TX_INSTANT])
+			{
+				let a = db.attr_id(name).unwrap();
+				let all = view.datoms(None, a, None);
+				let mut vals: Vec<Value> = db.history().datoms(None, a, None).into_iter().map(|d| d.v).collect();
+				vals.extend([Value::Int(-1), Value::Int(2), Value::from("b"), Value::Bool(true), Value::Ref(3), Value::Instant(305)]);
+				for _ in 0..40
+				{
+					let mut bound = || {
+						let v = &vals[(rng.next() % vals.len() as u64) as usize];
+						match rng.next() % 4
+						{
+							0 => Bound::Unbounded,
+							1 => Bound::Excluded(v),
+							_ => Bound::Included(v),
+						}
+					};
+					let (lo, hi) = (bound(), bound());
+					let within = |d: &&Datom| {
+						let above = match lo
+						{
+							Bound::Unbounded => true,
+							Bound::Included(v) => d.v >= *v,
+							Bound::Excluded(v) => d.v > *v,
+						};
+						above && match hi
+						{
+							Bound::Unbounded => true,
+							Bound::Included(v) => d.v <= *v,
+							Bound::Excluded(v) => d.v < *v,
+						}
+					};
+					let mut want: Vec<Datom> = all.iter().filter(within).cloned().collect();
+					want.sort_by(|x, y| (&x.v, x.e, x.tx, x.added).cmp(&(&y.v, y.e, y.tx, y.added)));
+					nonempty += usize::from(!want.is_empty() && want.len() < all.len());
+					assert_eq!(view.index_range(a, lo, hi), want, "{what}: {name} from {lo:?} to {hi:?}");
+					// The planner's fraction is that count, where the view's statistics are its own
+					if ["current", "compacted", "history"].contains(what)
+					{
+						assert_eq!(all.len() as u64, view.stats(a).datoms, "{what}: {name}");
+						let counted = view.range_fraction(a, lo, hi) * all.len() as f64;
+						assert!(all.is_empty() || (counted - want.len() as f64).abs() < 1e-6, "{what}: {name} from {lo:?} to {hi:?}: {counted} of {}", want.len());
+					}
+				}
+			}
+		}
+		assert!(nonempty > 300, "{nonempty} proper ranges with datoms");
+	}
+
+	// A compacted value is the same database, with one segment per history index, and so are its views; the value it came from keeps
+	// its segments; and the same transactions on both (one of them compacted again now and then) give the same values
+	#[test]
+	fn compaction_keeps_the_database()
+	{
+		let (mut conn, reports) = random_conn(31, 60);
+		let mut plain = conn.db();
+		conn.compact();
+		let mut compact = conn.db();
+		for index in [&compact.heavt, &compact.haevt, &compact.havet, &compact.hvaet, &compact.tlog]
+		{
+			assert_eq!(index.segments(), 1);
+		}
+		assert!(plain.heavt.segments() > 1 && plain.tlog.segments() > 1, "the history was in several segments");
+		assert_same_db(&compact, &plain, "compacted");
+		for t in (0..=reports.len() as T).step_by(7)
+		{
+			assert_same_reads(&conn.as_of(t).unwrap(), &plain.as_of(t).unwrap(), &format!("compacted, as of {t}"));
+			assert_same_reads(&compact.history().since(t).unwrap(), &plain.history().since(t).unwrap(), &format!("compacted, history since {t}"));
+		}
+		assert_same_db(&compact.as_of(20).unwrap().compacted(), &plain.as_of(20).unwrap(), "a compacted view");
+
+		let mut rng = Rng::new(5);
+		for i in 0..80
+		{
+			let mut tx = Tx::new();
+			let e = if i % 3 == 0 { tx.temp() } else { Entity::Id(reports[0].tempids[(rng.next() % 10) as usize]) };
+			tx.add(e, "n", (rng.next() % 5) as i64).add(e, "tag", ["a", "b", "c"][(rng.next() % 3) as usize]);
+			tx.add(e, "ref", Entity::Id(reports[0].tempids[(rng.next() % 10) as usize])).with_instant(1000 + i);
+			plain = plain.transact(&tx).unwrap().db_after;
+			compact = compact.transact(&tx).unwrap().db_after;
+			if i % 7 == 3
+			{
+				compact = compact.compacted();
+			}
+			if i % 10 == 9
+			{
+				assert_same_db(&compact, &plain, &format!("{i} transactions after the compaction"));
+			}
+		}
+		assert!(compact.heavt.segments() > 1, "the transactions after a compaction go to segments of their own");
+		assert_same_reads(&compact.as_of(70).unwrap(), &plain.as_of(70).unwrap(), "as of 70, after the compaction");
+		assert_same_reads(&compact.history(), &plain.history(), "the history, after the compaction");
 	}
 
 	// Throughput of bulk loads (release: cargo test --release bulk_timings -- --ignored --nocapture): large transactions of new entities,

@@ -23,9 +23,10 @@ enum Node<K, V>
 	{
 		keys: Vec<K>, vals: Vec<V>
 	},
+	/// `len` is the number of entries of the subtree, for `rank`
 	Branch
 	{
-		keys: Vec<K>, kids: Vec<Arc<Node<K, V>>>
+		keys: Vec<K>, kids: Vec<Arc<Node<K, V>>>, len: usize
 	},
 }
 
@@ -39,6 +40,27 @@ impl<K, V> Node<K, V>
 			Node::Branch { kids, .. } => kids.len(),
 		}
 	}
+
+	/// The number of entries of the subtree
+	fn count(&self) -> usize
+	{
+		match self
+		{
+			Node::Leaf { keys, .. } => keys.len(),
+			Node::Branch { len, .. } => *len,
+		}
+	}
+
+	fn branch(keys: Vec<K>, kids: Vec<Arc<Node<K, V>>>) -> Self
+	{
+		let len = total(&kids);
+		Node::Branch { keys, kids, len }
+	}
+}
+
+fn total<K, V>(kids: &[Arc<Node<K, V>>]) -> usize
+{
+	kids.iter().map(|n| n.count()).sum()
 }
 
 pub struct PMap<K, V>
@@ -101,10 +123,11 @@ fn ins<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, k: K, v: V, near: Option<&d
 				(None, Some((rk[0].clone(), Arc::new(Node::Leaf { keys: rk, vals: rv }))))
 			}
 		},
-		Node::Branch { keys, kids } =>
+		Node::Branch { keys, kids, len } =>
 		{
 			let i = keys.partition_point(|s| *s <= k);
 			let (old, split) = ins(Arc::make_mut(&mut kids[i]), k, v, near, found);
+			*len += old.is_none() as usize;
 			if let Some((sep, right)) = split
 			{
 				keys.insert(i, sep);
@@ -116,7 +139,8 @@ fn ins<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, k: K, v: V, near: Option<&d
 					let rkids = kids.split_off(mid);
 					let mut rkeys = keys.split_off(mid - 1);
 					let up = rkeys.remove(0);
-					return (old, Some((up, Arc::new(Node::Branch { keys: rkeys, kids: rkids }))));
+					*len = total(kids);
+					return (old, Some((up, Arc::new(Node::branch(rkeys, rkids)))));
 				}
 			}
 			(old, None)
@@ -140,10 +164,11 @@ fn rem<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, k: &K, near: Option<&dyn Fn
 			}
 			vals.remove(i)
 		}
-		Node::Branch { keys, kids } =>
+		Node::Branch { keys, kids, len } =>
 		{
 			let i = keys.partition_point(|s| s <= k);
 			let old = rem(Arc::make_mut(&mut kids[i]), k, near, found);
+			*len -= 1;
 			if kids[i].size() < MIN && kids.len() > 1
 			{
 				rebalance(keys, kids, i);
@@ -178,12 +203,13 @@ fn rebalance<K: Ord + Clone, V: Clone>(keys: &mut Vec<K>, kids: &mut Vec<Arc<Nod
 					false
 				}
 			}
-			(Node::Branch { keys: lk, kids: lc }, Node::Branch { keys: rk, kids: rc }) =>
+			(Node::Branch { keys: lk, kids: lc, len: ll }, Node::Branch { keys: rk, kids: rc, len: rl }) =>
 			{
 				// The separator between the two comes down between their children
 				lk.push(keys[l].clone());
 				lk.append(rk);
 				lc.append(rc);
+				*ll += *rl;
 				if lc.len() <= B
 				{
 					true
@@ -195,6 +221,7 @@ fn rebalance<K: Ord + Clone, V: Clone>(keys: &mut Vec<K>, kids: &mut Vec<Arc<Nod
 					let mut tail = lk.split_off(mid - 1);
 					keys[l] = tail.remove(0);
 					*rk = tail;
+					(*ll, *rl) = (total(lc), total(rc));
 					false
 				}
 			}
@@ -277,7 +304,7 @@ fn ins_batch<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, batch: &mut Batch<K, 
 			extra.reverse();
 			extra
 		}
-		Node::Branch { keys, kids } =>
+		Node::Branch { keys, kids, len } =>
 		{
 			// Straight to the child of the next entry; it takes every entry below its upper bound
 			while let Some((k, _)) = batch.peek().filter(|(k, _)| below(k))
@@ -291,12 +318,15 @@ fn ins_batch<K: Ord + Clone, V: Clone>(n: &mut Node<K, V>, batch: &mut Batch<K, 
 					kids.insert(i + 1 + j, node);
 				}
 			}
+			*len = total(kids);
 			if kids.len() <= B
 			{
 				return Vec::new();
 			}
 			let (new_keys, new_kids) = (std::mem::take(keys), std::mem::take(kids));
-			split_branch(keys, kids, new_keys, new_kids)
+			let extra = split_branch(keys, kids, new_keys, new_kids);
+			*len = total(kids);
+			extra
 		}
 	}
 }
@@ -314,7 +344,7 @@ fn split_branch<K: Clone, V>(keys: &mut Vec<K>, kids: &mut Vec<Arc<Node<K, V>>>,
 		match up
 		{
 			None => (*keys, *kids) = (chunk_keys, chunk_kids),
-			Some(sep) => out.push((sep, Arc::new(Node::Branch { keys: chunk_keys, kids: chunk_kids }))),
+			Some(sep) => out.push((sep, Arc::new(Node::branch(chunk_keys, chunk_kids)))),
 		}
 	}
 	out
@@ -345,7 +375,7 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V>
 			match n
 			{
 				Node::Leaf { keys, vals } => return keys.binary_search(key).ok().map(|i| &vals[i]),
-				Node::Branch { keys, kids } => n = &kids[keys.partition_point(|s| s <= key)],
+				Node::Branch { keys, kids, .. } => n = &kids[keys.partition_point(|s| s <= key)],
 			}
 		}
 	}
@@ -401,7 +431,7 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V>
 		if let Some((sep, right)) = split
 		{
 			let left = self.root.take().expect("the root just split");
-			self.root = Some(Arc::new(Node::Branch { keys: vec![sep], kids: vec![left, right] }));
+			self.root = Some(Arc::new(Node::branch(vec![sep], vec![left, right])));
 		}
 		self.len += old.is_none() as usize;
 		(old, found)
@@ -472,7 +502,7 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V>
 				new_kids.push(node);
 			}
 			extra = split_branch(&mut keys, &mut kids, new_keys, new_kids);
-			self.root = Some(Arc::new(Node::Branch { keys, kids }));
+			self.root = Some(Arc::new(Node::branch(keys, kids)));
 		}
 		self.len += count;
 		out
@@ -505,7 +535,7 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V>
 					let group: Vec<(K, Arc<Node<K, V>>)> = items.by_ref().take(s).collect();
 					let first = group[0].0.clone();
 					let (firsts, kids): (Vec<K>, Vec<Arc<Node<K, V>>>) = group.into_iter().unzip();
-					(first, Arc::new(Node::Branch { keys: firsts.into_iter().skip(1).collect(), kids }))
+					(first, Arc::new(Node::branch(firsts.into_iter().skip(1).collect(), kids)))
 				})
 				.collect();
 		}
@@ -530,7 +560,7 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V>
 			match n
 			{
 				// The children before j hold only keys below a separator that is below; the first key not below is in kids[j] or after it
-				Node::Branch { keys, kids } =>
+				Node::Branch { keys, kids, .. } =>
 				{
 					let j = keys.partition_point(|s| below(s));
 					it.stack.push((kids, j));
@@ -563,7 +593,7 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V>
 					assert!(keys.iter().all(|k| lo.map_or(true, |l| l <= k) && hi.map_or(true, |h| k < h)), "a key outside its separators");
 					(1, keys.len())
 				}
-				Node::Branch { keys, kids } =>
+				Node::Branch { keys, kids, len } =>
 				{
 					assert_eq!(keys.len() + 1, kids.len());
 					assert!(kids.len() >= 2, "a branch with one child");
@@ -578,6 +608,7 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V>
 						depth = Some(d);
 						count += c;
 					}
+					assert_eq!(*len, count, "a branch's count");
 					(1 + depth.expect("a branch has children"), count)
 				}
 			}
@@ -589,6 +620,28 @@ impl<K: Ord + Clone, V: Clone> PMap<K, V>
 			{
 				assert!(r.size() > 0, "an empty root");
 				assert_eq!(walk(r, true, None, None).1, self.len);
+			}
+		}
+	}
+
+	/// The number of keys for which `below` is true (monotone, as for `seek`: the keys before the one `seek` starts at),
+	/// in logarithmic time, from the subtrees' counts
+	pub fn rank(&self, below: impl Fn(&K) -> bool) -> usize
+	{
+		let mut rank = 0;
+		let Some(mut n) = self.root.as_deref() else { return 0 };
+		loop
+		{
+			match n
+			{
+				// As in seek: the children before j hold only keys that are below
+				Node::Branch { keys, kids, .. } =>
+				{
+					let j = keys.partition_point(|s| below(s));
+					rank += total(&kids[..j]);
+					n = &kids[j];
+				}
+				Node::Leaf { keys, .. } => return rank + keys.partition_point(|k| below(k)),
 			}
 		}
 	}
@@ -696,6 +749,10 @@ mod tests
 				let lo = range / 2;
 				assert!(m.seek(|k| *k < lo).map(|(k, _)| *k).eq(b.range(lo..).map(|(k, _)| *k)));
 				assert_eq!(m.get(&7), b.get(&7));
+				for bound in [0, 1, range / 2, range - 1, range, range + 100]
+				{
+					assert_eq!(m.rank(|k| *k < bound), b.range(..bound).count(), "the rank of {bound}");
+				}
 			}
 		}
 	}
@@ -747,6 +804,10 @@ mod tests
 				m.check();
 			}
 			assert!(m.iter().map(|(k, v)| (*k, *v)).eq(b.iter().map(|(k, v)| (*k, *v))));
+			for bound in [0, 17, 5_000, 9_999, 10_000]
+			{
+				assert_eq!(m.rank(|k| *k < bound), b.range(..bound).count(), "the rank of {bound} among {n} and more");
+			}
 		}
 	}
 

@@ -8,6 +8,8 @@
 //! `run` then finishes the optimization (within `RUN_BUDGET` conflicts) and executes the plan as nested loops,
 //! each clause using the index that its bound positions select (EAVT, AVET or AEVT; their history counterparts in a history view,
 //! where a pattern can also match the datom's transaction and added flag, see `Query::pattern_tx`).
+//! A pattern that binds its value reads only the range of AVET that its body's comparisons of that value allow (`Step::Range`),
+//! and the planner estimates the pattern by the fraction of its attribute that comparisons with constants keep (`Query::charge`).
 //! The `parse` module reads the same queries from a Datalog text (`Db::q`).
 //!
 //! # Clauses
@@ -41,10 +43,11 @@
 //! As in Datomic, absent attributes are left out, explicit entries override the wildcard's entry for the same attribute,
 //! and a reverse attribute's key is its name with `_` before the local part (`person/_friend`).
 
-use crate::db::{AttrId, AttrStats, Cardinality, Db, Eid, Error, Value, ValueType};
+use crate::db::{AttrId, AttrStats, Cardinality, Datom, Db, Eid, Error, Value, ValueType};
 use crate::planner::{fanout_of_weight, greedy_order, monotone, weight_of_fanout, ClauseShape, Plan, Planner, VarId};
 use crate::rules::{Ctx, Rels, Rule};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 /// The conflict budget of the refinement that follows every added clause
 const ONLINE_BUDGET: u64 = 1000;
@@ -159,6 +162,19 @@ impl Cmp
 		}
 	}
 
+	// The comparison of the operands in the other order: `l op r` is `r op.flipped() l`
+	fn flipped(self) -> Cmp
+	{
+		match self
+		{
+			Cmp::Lt => Cmp::Gt,
+			Cmp::Le => Cmp::Ge,
+			Cmp::Gt => Cmp::Lt,
+			Cmp::Ge => Cmp::Le,
+			Cmp::Eq | Cmp::Ne => self,
+		}
+	}
+
 	// The estimated fraction of the rows that pass
 	fn selectivity(self) -> f64
 	{
@@ -267,10 +283,11 @@ pub(crate) fn unbound_need(body: &[Clause], pre: &BTreeSet<VarId>) -> Option<Var
 	body.iter().flat_map(|c| c.needs_binds().0).find(|x| !pre.contains(x) && !binds.contains(x))
 }
 
-/// The planner's weights of a pattern, from the attribute's statistics: the fanout is the number of datoms matching per input row
-pub(crate) fn pattern_weights(s: AttrStats) -> [u32; 4]
+/// The planner's weights of a pattern, from the attribute's statistics: the fanout is the number of datoms matching per input row,
+/// of which the comparisons charged at the pattern keep the fraction `kept`
+pub(crate) fn pattern_weights(s: AttrStats, kept: f64) -> [u32; 4]
 {
-	let d = s.datoms as f64;
+	let d = s.datoms as f64 * kept;
 	let (e, v) = (s.entities.max(1) as f64, s.values.max(1) as f64);
 	monotone([d, d / e, d / v, d / (e * v)].map(weight_of_fanout))
 }
@@ -354,11 +371,35 @@ pub enum Find
 	Agg(Agg, Term),
 }
 
+// The tighter of a bound and a new one (which isn't unbounded): the greater of lower bounds, the lesser of upper ones,
+// and the exclusive one of two at the same value
+fn tighter(cur: Bound<Value>, new: Bound<Value>, lower: bool) -> Bound<Value>
+{
+	let (Bound::Included(c) | Bound::Excluded(c), Bound::Included(n) | Bound::Excluded(n)) = (&cur, &new)
+	else
+	{
+		return new;
+	};
+	match if lower { n.cmp(c) } else { c.cmp(n) }
+	{
+		std::cmp::Ordering::Greater => new,
+		std::cmp::Ordering::Less => cur,
+		std::cmp::Ordering::Equal => if matches!(new, Bound::Excluded(_)) { new } else { cur },
+	}
+}
+
 /// A clause of a run, with the bodies of `not` and `or` ordered for the variables bound where they run
 pub(crate) enum Step<'a>
 {
 	/// A pattern or a predicate
 	Clause(&'a Clause),
+	/// A pattern that binds its value with its entity unbound, restricted by the comparisons of its body between that value and a term
+	/// bound before it (`value op term`): it reads their range of the AVET index rather than the whole attribute. The comparisons stay
+	/// in the body, so the range only has to include what they accept
+	Range
+	{
+		pattern: &'a Clause, bounds: Vec<(Cmp, &'a Term)>
+	},
 	Not
 	{
 		join: &'a [VarId], body: Vec<Step<'a>>
@@ -601,17 +642,72 @@ impl Query
 		let calls = self.materialize(&c, &mut rels);
 		self.rels = rels;
 		self.rules_used |= calls?;
-		let shape = self.shape(&c, &vec![false; self.vars.len()], &Ctx { rels: &self.rels, delta: None });
 		self.clauses.push(c);
+		let (i, pre, ctx) = (self.clauses.len() - 1, vec![false; self.vars.len()], Ctx { rels: &self.rels, delta: None });
+		let shape = self.shape(&self.clauses, i, &pre, &ctx);
+		// The earlier clauses whose estimates the clause changes: the pattern that a comparison is charged at, and the comparisons
+		// that are charged at a pattern (see `charge`)
+		let charged: Vec<usize> = match &self.clauses[i]
+		{
+			Clause::Pred { .. } => self.charge(&self.clauses[i], &self.clauses, &pre).map(|charge| charge.0).into_iter().collect(),
+			Clause::Pattern { .. } => (0..i).filter(|&p| self.charge(&self.clauses[p], &self.clauses, &pre).is_some_and(|charge| charge.0 == i)).collect(),
+			_ => Vec::new(),
+		};
+		let reweighed: Vec<(usize, [u32; 4])> = charged.into_iter().map(|c| (c, self.shape(&self.clauses, c, &pre, &ctx).weights)).collect();
 		self.planner.add_clause(shape, self.vars.len());
+		for (c, weights) in reweighed
+		{
+			self.planner.reweigh(c, weights);
+		}
 		self.planner.refine(ONLINE_BUDGET);
-		Ok(self.clauses.len() - 1)
+		Ok(i)
 	}
 
-	// The planner's view of a clause, with the variables of `pre` bound beforehand (they count as constants);
-	// a rule call is estimated from the relation that `ctx` gives it
-	pub(crate) fn shape(&self, c: &Clause, pre: &[bool], ctx: &Ctx) -> ClauseShape
+	// Where a comparison's selectivity is charged: a comparison of a variable (not bound beforehand) with a constant is charged at the
+	// first pattern of `body` whose value is that variable, if the attribute has the constant's type. Gives that pattern's index and
+	// attribute, and the comparison as `value op constant`. The pattern's estimates are scaled by the fraction of its datoms that the
+	// comparison keeps (`kept`), which is exact when the pattern reads the range (`Step::Range`), and the comparison then keeps every row
+	fn charge<'c>(&self, c: &'c Clause, body: &[Clause], pre: &[bool]) -> Option<(usize, AttrId, Cmp, &'c Value)>
 	{
+		let (x, op, k) = match c
+		{
+			Clause::Pred { op, l: Term::Var(x), r: Term::Val(k) } => (*x, *op, k),
+			Clause::Pred { op, l: Term::Val(k), r: Term::Var(x) } => (*x, op.flipped(), k),
+			_ => return None,
+		};
+		if pre[x]
+		{
+			return None;
+		}
+		let (at, a) = body.iter().enumerate().find_map(|(i, b)| match b
+		{
+			Clause::Pattern { a, v, .. } if var_of(v) == Some(x) => Some((i, *a)),
+			_ => None,
+		})?;
+		(self.db.attr(a).value_type == k.value_type()).then_some((at, a, op, k))
+	}
+
+	// The fraction of the datoms of attribute `a` whose value `v` satisfies `v op k`, counted in the index
+	fn kept(&self, a: AttrId, op: Cmp, k: &Value) -> f64
+	{
+		let part = |lo, hi| self.db.range_fraction(a, lo, hi);
+		let (inc, exc, open) = (Bound::Included(k), Bound::Excluded(k), Bound::Unbounded);
+		match op
+		{
+			Cmp::Eq => part(inc, inc),
+			Cmp::Ne => 1.0 - part(inc, inc),
+			Cmp::Lt => part(open, exc),
+			Cmp::Le => part(open, inc),
+			Cmp::Gt => part(exc, open),
+			Cmp::Ge => part(inc, open),
+		}
+	}
+
+	// The planner's view of clause `i` of `body`, with the variables of `pre` bound beforehand (they count as constants);
+	// a rule call is estimated from the relation that `ctx` gives it
+	pub(crate) fn shape(&self, body: &[Clause], i: usize, pre: &[bool], ctx: &Ctx) -> ClauseShape
+	{
+		let c = &body[i];
 		let free = |vs: Vec<VarId>| -> Vec<VarId> { vs.into_iter().filter(|&x| !pre[x]).collect() };
 		let (needs, binds) = c.needs_binds();
 		let (needs, binds) = (free(needs), free(binds));
@@ -621,15 +717,22 @@ impl Query
 			{
 				// The tx and added positions bind their variables, but the cost model only distinguishes the entity and value positions
 				let slot = |t: &Term| var_of(t).filter(|&x| !pre[x]);
-				ClauseShape { slots: [slot(e), slot(v)], needs, binds, weights: pattern_weights(self.db.stats(*a)) }
+				// The comparisons charged at the pattern (their fractions multiply, as if independent)
+				let charges = body.iter().filter_map(|p| self.charge(p, body, pre)).filter(|charge| charge.0 == i);
+				let kept: f64 = charges.map(|(_, a, op, k)| self.kept(a, op, k)).product();
+				ClauseShape { slots: [slot(e), slot(v)], needs, binds, weights: pattern_weights(self.db.stats(*a), kept) }
 			}
 			Clause::Rule { args, .. } =>
 			{
 				// Like a pattern whose entity and value positions are the first two arguments
 				let slot = |i: usize| args.get(i).and_then(var_of).filter(|&x| !pre[x]);
-				ClauseShape { slots: [slot(0), slot(1)], needs, binds, weights: pattern_weights(ctx.relation(c).stats()) }
+				ClauseShape { slots: [slot(0), slot(1)], needs, binds, weights: pattern_weights(ctx.relation(c).stats(), 1.0) }
 			}
-			Clause::Pred { op, .. } => ClauseShape { slots: [None, None], needs, binds, weights: [weight_of_fanout(op.selectivity()); 4] },
+			Clause::Pred { op, .. } =>
+			{
+				let passing = if self.charge(c, body, pre).is_some() { 1.0 } else { op.selectivity() };
+				ClauseShape { slots: [None, None], needs, binds, weights: [weight_of_fanout(passing); 4] }
+			}
 			Clause::Not { .. } => ClauseShape { slots: [None, None], needs, binds, weights: [weight_of_fanout(NOT_SELECTIVITY); 4] },
 			Clause::Or { branches, .. } =>
 			{
@@ -642,7 +745,7 @@ impl Query
 				let mut rows = 0.0;
 				for b in branches
 				{
-					let shapes: Vec<ClauseShape> = b.iter().map(|c| self.shape(c, &inner, ctx)).collect();
+					let shapes: Vec<ClauseShape> = (0..b.len()).map(|i| self.shape(b, i, &inner, ctx)).collect();
 					let mut bound = vec![false; pre.len()];
 					let mut log2 = 0.0;
 					for k in greedy_order(&shapes, pre.len(), &[]).expect("unconstrained clauses always have an order")
@@ -799,6 +902,21 @@ impl Query
 			};
 			steps.push(match clause
 			{
+				Clause::Pattern { e: Term::Var(e), v: Term::Var(v), .. } if !bound[*e] && !bound[*v] =>
+				{
+					// The comparisons of the value with a constant, or with a variable bound before the pattern
+					let known = |t: &Term| var_of(t).map_or(true, |x| bound[x]);
+					let bounds: Vec<(Cmp, &Term)> = clauses
+						.iter()
+						.filter_map(|c| match c
+						{
+							Clause::Pred { op, l, r } if *op != Cmp::Ne && var_of(l) == Some(*v) && known(r) => Some((*op, r)),
+							Clause::Pred { op, l, r } if *op != Cmp::Ne && var_of(r) == Some(*v) && known(l) => Some((op.flipped(), l)),
+							_ => None,
+						})
+						.collect();
+					if bounds.is_empty() { Step::Clause(clause) } else { Step::Range { pattern: clause, bounds } }
+				}
 				Clause::Pattern { .. } | Clause::Pred { .. } => Step::Clause(clause),
 				Clause::Rule { rule, args } => Step::Rule { rule: *rule, delta: ctx.is_delta(clause), args },
 				Clause::Not { join, body } => Step::Not { join, body: self.compile_body(body, inner(join), ctx, BODY_BUDGET)? },
@@ -820,9 +938,9 @@ impl Query
 	pub(crate) fn compile_body<'a>(&'a self, body: &'a [Clause], mut bound: Vec<bool>, ctx: &Ctx, budget: u64) -> Result<Vec<Step<'a>>, Error>
 	{
 		let mut planner = Planner::new();
-		for c in body
+		for i in 0..body.len()
 		{
-			planner.add_clause(self.shape(c, &bound, ctx), bound.len());
+			planner.add_clause(self.shape(body, i, &bound, ctx), bound.len());
 		}
 		let order = planner.refine(budget).order.clone();
 		self.compile(body, &order, &mut bound, ctx)
@@ -867,6 +985,34 @@ impl Query
 		inner
 	}
 
+	// Run the rest of the steps for each datom that the pattern matches among `rows`, binding the pattern's variables
+	fn exec_rows(&self, rows: Vec<Datom>, pattern: &Clause, rest: &[Step], env: &mut Vec<Option<Value>>, rels: &Rels, emit: &mut dyn FnMut(&[Option<Value>]) -> bool) -> bool
+	{
+		let Clause::Pattern { e, v, tx, added, .. } = pattern
+		else
+		{
+			unreachable!("the rows of a pattern");
+		};
+		for d in rows
+		{
+			let mut newly = Vec::new();
+			let ok = Self::unify(e, Value::Ref(d.e), env, &mut newly)
+				&& Self::unify(v, d.v, env, &mut newly)
+				&& tx.as_ref().map_or(true, |t| Self::unify(t, Value::Ref(d.tx), env, &mut newly))
+				&& added.as_ref().map_or(true, |t| Self::unify(t, Value::Bool(d.added), env, &mut newly));
+			let go = !ok || self.exec(rest, env, rels, emit);
+			for x in newly
+			{
+				env[x] = None;
+			}
+			if !go
+			{
+				return false;
+			}
+		}
+		true
+	}
+
 	// Run the steps from `env`, calling `emit` on every solution; stops as soon as `emit` returns false, and returns false then.
 	// Rule calls read the relations of `rels`
 	pub(crate) fn exec(&self, steps: &[Step], env: &mut Vec<Option<Value>>, rels: &Rels, emit: &mut dyn FnMut(&[Option<Value>]) -> bool) -> bool
@@ -878,7 +1024,7 @@ impl Query
 		};
 		match step
 		{
-			Step::Clause(Clause::Pattern { e, a, v, tx, added }) =>
+			Step::Clause(pattern @ Clause::Pattern { e, a, v, .. }) =>
 			{
 				let eid = match Self::eval(e, env)
 				{
@@ -889,24 +1035,41 @@ impl Query
 				};
 				// The index scan of the view (the bound tx and added terms filter its rows)
 				let rows = self.db.datoms(eid, *a, Self::eval(v, env).as_ref());
-				for d in rows
+				self.exec_rows(rows, pattern, rest, env, rels, emit)
+			}
+			Step::Range { pattern, bounds } =>
+			{
+				let Clause::Pattern { a, .. } = pattern
+				else
 				{
-					let mut newly = Vec::new();
-					let ok = Self::unify(e, Value::Ref(d.e), env, &mut newly)
-						&& Self::unify(v, d.v, env, &mut newly)
-						&& tx.as_ref().map_or(true, |t| Self::unify(t, Value::Ref(d.tx), env, &mut newly))
-						&& added.as_ref().map_or(true, |t| Self::unify(t, Value::Bool(d.added), env, &mut newly));
-					let go = !ok || self.exec(rest, env, rels, emit);
-					for x in newly
+					unreachable!("compile makes ranges of patterns");
+				};
+				// A bound of another type than the attribute's is compared numerically (Int and Float) or decided by the types' order: it is left to its predicate
+				let ty = self.db.attr(*a).value_type;
+				let (mut lo, mut hi) = (Bound::Unbounded, Bound::Unbounded);
+				for (op, t) in bounds
+				{
+					let val = Self::eval(t, env).expect("compile checked that the bound's variable is bound");
+					if val.value_type() != ty
 					{
-						env[x] = None;
+						continue;
 					}
-					if !go
+					match op
 					{
-						return false;
+						Cmp::Gt => lo = tighter(lo, Bound::Excluded(val), true),
+						Cmp::Ge => lo = tighter(lo, Bound::Included(val), true),
+						Cmp::Lt => hi = tighter(hi, Bound::Excluded(val), false),
+						Cmp::Le => hi = tighter(hi, Bound::Included(val), false),
+						Cmp::Eq =>
+						{
+							lo = tighter(lo, Bound::Included(val.clone()), true);
+							hi = tighter(hi, Bound::Included(val), false);
+						}
+						Cmp::Ne => unreachable!("!= bounds no range"),
 					}
 				}
-				true
+				let rows = self.db.index_range(*a, lo.as_ref(), hi.as_ref());
+				self.exec_rows(rows, pattern, rest, env, rels, emit)
 			}
 			Step::Rule { rule, delta, args } =>
 			{
@@ -2256,5 +2419,164 @@ pub(crate) mod tests
 			}
 		}
 		assert!(nested > 500, "too few nested entities: {nested}");
+	}
+
+	// A pattern whose value is compared with a constant or with a variable bound before it reads a range of the index (`Step::Range`),
+	// and gives the rows of the whole attribute filtered by the comparison: every operator in both operand orders, constants of the
+	// attribute's type (the zeros, infinities and NaN of the Floats too) and of other types, on every kind of view
+	#[test]
+	fn range_predicates_match_a_filtered_scan()
+	{
+		use crate::db::tests::random_conn;
+		let (mut conn, _) = random_conn(41, 60);
+		let mut tx = Tx::new();
+		tx.define("f", ValueType::Float, Cardinality::Many).with_instant(10_000);
+		for f in [-0.0, 0.0, 1.5, -2.0, 3.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY]
+		{
+			let e = tx.temp();
+			tx.add(e, "f", f);
+		}
+		conn.transact(&tx).unwrap();
+		let db = conn.db();
+		let consts = |attr: &str| -> Vec<Value> {
+			match attr
+			{
+				"tag" => ["", "a", "b", "bb", "c"].map(Value::from).into_iter().chain([Value::Int(1)]).collect(),
+				"f" => [-0.0, 0.0, 1.5, 2.0, f64::NAN, f64::INFINITY].map(Value::Float).into_iter().chain([Value::Int(0), Value::Int(3), "a".into()]).collect(),
+				_ => [-1, 0, 2, 3, 9].map(Value::Int).into_iter().chain([Value::Float(1.5), Value::Float(f64::NAN), "a".into(), true.into()]).collect(),
+			}
+		};
+		let steps_of = |q: &Query, order: &[usize]| -> Vec<Option<usize>> {
+			let steps = q.compile(&q.clauses, order, &mut vec![false; q.vars.len()], &Ctx { rels: &q.rels, delta: None }).unwrap();
+			steps.iter().map(|s| if let Step::Range { bounds, .. } = s { Some(bounds.len()) } else { None }).collect()
+		};
+		let mut proper = 0;
+		for (what, view) in [("current", db.clone()), ("as of 40", db.as_of(40).unwrap()), ("history", db.history()), ("since 30", db.since(30).unwrap())]
+		{
+			for attr in ["n", "key", "tag", "f"]
+			{
+				let Some(a) = view.attr_id(attr)
+				else
+				{
+					continue;
+				};
+				let all = view.datoms(None, a, None);
+				for c in consts(attr)
+				{
+					for op in [Cmp::Eq, Cmp::Ne, Cmp::Lt, Cmp::Le, Cmp::Gt, Cmp::Ge]
+					{
+						for flip in [false, true]
+						{
+							let mut q = view.query();
+							let (e, v) = (q.var("?e"), q.var("?v"));
+							q.pattern(e.clone(), attr, v.clone()).unwrap();
+							let (l, r) = if flip { (Term::Val(c.clone()), v.clone()) } else { (v.clone(), Term::Val(c.clone())) };
+							q.pred(l, op, r).unwrap();
+							assert_eq!(steps_of(&q, &[0, 1]), [(op != Cmp::Ne).then_some(1), None]);
+							let want: BTreeSet<Vec<Value>> =
+								all.iter().filter(|d| if flip { op.holds(&c, &d.v) } else { op.holds(&d.v, &c) }).map(|d| vec![Value::Ref(d.e), d.v.clone()]).collect();
+							proper += usize::from(!want.is_empty() && want.len() < all.len());
+							assert_eq!(q.run(&[e, v]).unwrap(), want.into_iter().collect::<Vec<_>>(), "{what}: {attr} {op:?} {c:?} (flipped: {flip})");
+						}
+					}
+				}
+			}
+		}
+		assert!(proper > 300, "{proper} comparisons keeping some of the datoms");
+
+		// A bound from a variable and one from a constant: both when the variable is bound before the pattern; in the other order
+		// the constant's alone, and the other pattern's value is then bounded by this one's
+		let mut q = db.query();
+		let (x, lo, e, v) = (q.var("?x"), q.var("?lo"), q.var("?e"), q.var("?v"));
+		q.pattern(x.clone(), "key", lo.clone()).unwrap();
+		q.pattern(e.clone(), "n", v.clone()).unwrap();
+		q.pred(lo.clone(), Cmp::Le, v.clone()).unwrap();
+		q.pred(v.clone(), Cmp::Lt, 3).unwrap();
+		assert_eq!(steps_of(&q, &[0, 1, 2, 3]), [None, Some(2), None, None]);
+		assert_eq!(steps_of(&q, &[1, 0, 2, 3]), [Some(1), Some(1), None, None]);
+		let (key, n) = (db.attr_id("key").unwrap(), db.attr_id("n").unwrap());
+		let mut want = BTreeSet::new();
+		for k in db.datoms(None, key, None)
+		{
+			want.extend(db.datoms(None, n, None).into_iter().filter(|d| k.v <= d.v && d.v < Value::Int(3)).map(|d| vec![Value::Ref(k.e), Value::Ref(d.e), d.v]));
+		}
+		assert!(want.len() > 3);
+		let want: Vec<Vec<Value>> = want.into_iter().collect();
+		let find = [x, e, v];
+		assert_eq!(q.run_in_order(&[0, 1, 2, 3], &find).unwrap(), want);
+		assert_eq!(q.run_in_order(&[1, 0, 2, 3], &find).unwrap(), want);
+		assert_eq!(q.run(&find).unwrap(), want);
+
+		// In the body of a not, from its join variable: the entities with the greatest n
+		let most = db.datoms(None, n, None).into_iter().map(|d| d.v).max().unwrap();
+		let want: Vec<Vec<Value>> = db.datoms(None, n, Some(&most)).into_iter().map(|d| vec![Value::Ref(d.e)]).collect();
+		assert_eq!(db.q("[:find ?e :where [?e :n ?v] (not-join [?v] [?o :n ?w] [(> ?w ?v)])]", &[]).unwrap(), want);
+	}
+
+	// The planner costs a range by the fraction of the attribute that it keeps, counted in the index: the plan starts from a pattern
+	// whose range is small, whatever the order in which the pattern and its comparisons were added, and not from one whose range
+	// is most of the attribute, nor for a bound that isn't read from the index
+	#[test]
+	fn the_plan_starts_from_a_small_range()
+	{
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		tx.define("big", ValueType::Int, Cardinality::One).define("small", ValueType::Str, Cardinality::One);
+		for i in 0..2000
+		{
+			let e = tx.temp();
+			tx.add(e, "big", i);
+			if i % 2 == 0
+			{
+				tx.add(e, "small", "s");
+			}
+		}
+		conn.transact(&tx).unwrap();
+		let db = conn.db();
+		// The clauses of `[?e :small ?w] [?e :big ?v] [(?v op bound)]`, added in the order `added`; returns the plan in terms of
+		// 's' (small), 'b' (big) and 'p' (the comparison), and the entities found
+		let run = |view: &Db, added: &str, lo: Value, hi: Option<i64>| -> (String, usize) {
+			let mut q = view.query();
+			let (e, w, v) = (q.var("?e"), q.var("?w"), q.var("?v"));
+			let mut names = Vec::new();
+			for c in added.chars()
+			{
+				match c
+				{
+					's' => q.pattern(e.clone(), "small", w.clone()).unwrap(),
+					'b' => q.pattern(e.clone(), "big", v.clone()).unwrap(),
+					_ => q.pred(v.clone(), Cmp::Ge, lo.clone()).unwrap(),
+				};
+				names.push(c);
+			}
+			if let Some(hi) = hi
+			{
+				q.pred(hi, Cmp::Gt, v.clone()).unwrap();
+				names.push('q');
+			}
+			let found = q.run(&[e]).unwrap().len();
+			assert!(q.plan().optimal);
+			(q.plan().order.iter().map(|&c| names[c]).collect(), found)
+		};
+		for added in ["sbp", "spb", "psb", "pbs", "bsp", "bps"]
+		{
+			// 20 of the 2000 values: from the range. 1900 of them: from the 1000 datoms of small
+			let (plan, found) = run(&db, added, Value::Int(1980), None);
+			assert!(plan.starts_with('b') && found == 10, "{added}: {plan}, {found} found");
+			let (plan, found) = run(&db, added, Value::Int(100), None);
+			assert!(plan.starts_with('s') && found == 950, "{added}: {plan}, {found} found");
+			// Two bounds: 20 values between them
+			let (plan, found) = run(&db, added, Value::Int(100), Some(120));
+			assert!(plan.starts_with('b') && found == 10, "{added}: {plan}, {found} found");
+			// A Float bound is compared numerically, by the predicate: the fixed estimate, a third of the attribute
+			let (plan, found) = run(&db, added, Value::Float(1980.0), None);
+			assert!(plan.starts_with('s') && found == 10, "{added}: {plan}, {found} found");
+			// The history has the same datoms here, and an as-of view the latest value's estimates
+			for view in [db.history(), db.as_of(1).unwrap()]
+			{
+				let (plan, found) = run(&view, added, Value::Int(1980), None);
+				assert!(plan.starts_with('b') && found == 10, "{added}: {plan}, {found} found");
+			}
+		}
 	}
 }

@@ -1196,7 +1196,7 @@ mod tests
 		}
 	}
 
-	// The time of the reads served by the history indexes, on a replayed value and on one opened from a checkpoint
+	// The time of the reads served by the history indexes, on a replayed value, on that value compacted, and on one opened from a checkpoint
 	// (release: cargo test --release history_read_timings -- --ignored --nocapture)
 	#[test]
 	#[ignore]
@@ -1210,7 +1210,10 @@ mod tests
 		conn.checkpoint().unwrap();
 		drop(conn);
 		let reopened = Conn::open(&path).unwrap().db();
-		for (what, db) in [("replayed", replayed), ("from the checkpoint", reopened)]
+		let t = std::time::Instant::now();
+		let compacted = replayed.compacted();
+		println!("compacted in {:?}", t.elapsed());
+		for (what, db) in [("replayed", replayed), ("compacted", compacted), ("from the checkpoint", reopened)]
 		{
 			let (n, tag, rf) = (db.attr_id("n").unwrap(), db.attr_id("tag").unwrap(), db.attr_id("ref").unwrap());
 			let (entries, bytes) = db.history_size();
@@ -1233,6 +1236,49 @@ mod tests
 			time("as-of attr_datoms, per datom", scanned.max(1), &mut || past.attr_datoms(rf).count());
 			let logged: usize = db.tx_range(1, db.basis_t() + 1).iter().map(|t| t.data.len()).sum();
 			time("tx_range, per datom", logged, &mut || db.tx_range(1, db.basis_t() + 1).iter().map(|t| t.data.len()).sum());
+		}
+	}
+
+	// The time of reading the top 1% of an attribute's values: from the index (`index_range`) and by filtering the attribute, and by a query
+	// whose comparison bounds the index against the same query with a Float bound, which is left to the predicate
+	// (release: cargo test --release range_timings -- --ignored --nocapture)
+	#[test]
+	#[ignore]
+	fn range_timings()
+	{
+		use std::ops::Bound;
+		let scratch = Scratch::new("range_timings");
+		let path = scratch.path("ranges.log");
+		big_log(&path, 20_000);
+		let db = Conn::open(&path).unwrap().db().compacted();
+		let (n, lo) = (db.attr_id("n").unwrap(), Value::Int(990));
+		for (what, view) in [("current", db.clone()), ("as of 3/4", db.as_of(db.basis_t() * 3 / 4).unwrap()), ("history", db.history())]
+		{
+			let time = |name: &str, f: &mut dyn FnMut() -> usize| {
+				let (t, mut rows) = (std::time::Instant::now(), 0);
+				for _ in 0..20
+				{
+					rows = f();
+				}
+				println!("{what}: {name}: {:?} ({rows} rows)", t.elapsed() / 20);
+			};
+			time("index_range", &mut || view.index_range(n, Bound::Included(&lo), Bound::Unbounded).len());
+			time("the attribute, filtered", &mut || view.datoms(None, n, None).into_iter().filter(|d| d.v >= lo).count());
+			time("query, bound in the index", &mut || view.q("[:find ?e ?v :where [?e :n ?v] [(>= ?v 990)]]", &[]).unwrap().len());
+			time("query, bound left to the predicate", &mut || view.q("[:find ?e ?v :where [?e :n ?v] [(>= ?v 990.0)]]", &[]).unwrap().len());
+			// A join that the planner starts from the range once it costs it (a quarter of the tags are "a")
+			time("join, range costed", &mut || view.q("[:find ?e :where [?e :tag \"a\"] [?e :n ?v] [(>= ?v 990)]]", &[]).unwrap().len());
+			time("join, bound left to the predicate", &mut || view.q("[:find ?e :where [?e :tag \"a\"] [?e :n ?v] [(>= ?v 990.0)]]", &[]).unwrap().len());
+			// The same join held to the plan that starts from the tags, which was the plan before ranges were costed
+			time("join, from the tags", &mut || {
+				let mut q = view.query();
+				let (e, v) = (q.var("?e"), q.var("?v"));
+				let tags = q.pattern(e.clone(), "tag", "a").unwrap();
+				let ns = q.pattern(e.clone(), "n", v.clone()).unwrap();
+				q.pred(v, crate::query::Cmp::Ge, 990).unwrap();
+				q.require_before(tags, ns).unwrap();
+				q.run(&[e]).unwrap().len()
+			});
 		}
 	}
 }

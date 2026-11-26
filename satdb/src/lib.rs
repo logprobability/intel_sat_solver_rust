@@ -12,11 +12,13 @@
 //! * `rules`: Datalog rules, recursive and mutually recursive ones included, evaluated bottom-up (stratified, semi-naive,
 //!   each body planned by the SAT planner once per stratum) when a query first calls them.
 //! * `parse`: the text syntax of queries (a subset of Datomic's Datalog, in EDN), read into the query builder (`Db::q`, `Db::q_rules`), and of pull patterns (`Db::pull_str`).
+//! * `txparse`: the text syntax of transactions (Datomic's transaction data, in EDN), read into the transaction builder (`Conn::transact_str`).
 //! * `planner`: the join order, by an exact dynamic program for queries of up to 16 clauses and an incremental SAT encoding beyond,
 //!   with hard ordering constraints (`Query::require_before`), whose conflicts the SAT solver's UNSAT cores explain (see its documentation).
 //! * `pmap`: the persistent sorted map under the current indexes, a B+-tree with in-place updates of unshared nodes; `bemap`: a persistent
 //!   Bε-tree measured against it and not used (see its documentation).
-//! * `hist` and `succinct` (private): the history indexes, which only grow: immutable compressed segments (Elias-Fano sequences and bit-packed rows) and a small tail.
+//! * `hist` and `succinct` (private): the history indexes, which only grow: immutable compressed segments (Elias-Fano sequences and bit-packed rows) and a small tail;
+//!   `Conn::compact` merges them into one segment, for faster history and as-of reads.
 //!
 //! ```
 //! use satdb::{Cardinality, Cmp, Conn, Entity, Tx, Value, ValueType};
@@ -51,6 +53,15 @@
 //!               [(above ?a ?b) [?a :person/boss ?c] (above ?c ?b)]]";
 //! let text = "[:find ?name :in $ % :where [?a :person/name \"Alice\"] (above ?a ?b) [?b :person/name ?name]]";
 //! assert_eq!(conn.db().q_rules(text, rules, &[]).unwrap(), vec![vec![Value::from("Bob")], vec![Value::from("Carol")]]);
+//!
+//! // A transaction as text: tempids are strings, and the report has their entities
+//! let report = conn.transact_str(r#"[{:db/id "dan" :person/name "Dan" :person/boss "erin"} [:db/add "erin" :person/name "Erin"]]"#).unwrap();
+//! let text = "[:find ?name :in $ ?d :where [?d :person/boss ?b] [?b :person/name ?name]]";
+//! assert_eq!(conn.db().q(text, &[Value::Ref(report.tempids["dan"]).into()]).unwrap(), vec![vec![Value::from("Erin")]]);
+//!
+//! // Compacting the history makes the reads of past values faster, and changes nothing else
+//! conn.compact();
+//! assert!(conn.as_of(2).unwrap().q(text, &[Value::Ref(report.tempids["dan"]).into()]).unwrap().is_empty());
 //! ```
 
 pub mod db;
@@ -63,12 +74,14 @@ pub mod pmap;
 pub mod query;
 pub mod rules;
 mod succinct;
+pub mod txparse;
 
 pub use db::{Attr, AttrId, AttrStats, Cardinality, Conn, Datom, Db, Eid, Entity, Error, Tx, TxLogEntry, TxReport, TxValue, Unique, Value, ValueType, T, TX_INSTANT};
 pub use parse::{Cell, Found, Input, TextQuery};
 pub use planner::{Plan, PlanSource};
 pub use query::{Agg, Clause, Cmp, Find, Nested, Pull, PullOpts, PullValue, Pulled, Query, Term};
 pub use rules::RuleStats;
+pub use txparse::{TextTx, TextTxReport};
 
 #[cfg(test)]
 pub(crate) mod testutil
