@@ -4,6 +4,18 @@
 # Usage: bench_vs_cpp.py --exe NAME=PATH [--exe NAME=PATH ...] [--repeats N] [--timeout SEC] [--csv OUT] instance.cnf ... [-- extra solver parameters]
 import argparse, csv, os, re, resource, statistics, subprocess, sys, time
 
+# The verdicts of the queries (one letter each: S(AT), U(NSAT), C(ONFLICT_OUT), T(IMEOUT), ...) and the counters of the last statistics line
+# (the columns "Confs", "Decs" and "Rsts"; the statistics are printed at /verbosity/level 1 and are cumulative over the queries)
+def parse(out):
+	verdicts = " ".join(l.split()[1][0] for l in out.splitlines() if l.startswith("s "))
+	confs = decs = rsts = None
+	for l in out.splitlines():
+		l = re.sub(r"\x1b\[[0-9;]*m", "", l)
+		if l.startswith("c ToporStt ") and "CpuT0" not in l:
+			t = l.split()
+			confs, decs, rsts = int(t[8]), int(t[9]), int(t[-2])
+	return {"verdicts": verdicts, "confs": confs, "decs": decs, "rsts": rsts}
+
 def run(exe, inst, params, timeout):
 	before = resource.getrusage(resource.RUSAGE_CHILDREN)
 	start = time.perf_counter()
@@ -15,14 +27,8 @@ def run(exe, inst, params, timeout):
 	wall = time.perf_counter() - start
 	after = resource.getrusage(resource.RUSAGE_CHILDREN)
 	cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
-	verdicts = " ".join(l.split()[1][0] for l in out.splitlines() if l.startswith("s "))
-	# The conflicts of the last statistics line (the column "Confs")
-	confs = None
-	for l in out.splitlines():
-		l = re.sub(r"\x1b\[[0-9;]*m", "", l)
-		if l.startswith("c ToporStt ") and "CpuT0" not in l:
-			confs = int(l.split()[8])
-	return {"wall": wall, "cpu": cpu, "code": code, "verdicts": verdicts, "confs": confs}
+	res = parse(out)
+	return {"wall": wall, "cpu": cpu, "code": code, "verdicts": res["verdicts"], "confs": res["confs"]}
 
 def main():
 	argv = sys.argv[1:]
@@ -53,4 +59,5 @@ def main():
 			w.writeheader()
 			w.writerows(rows)
 
-main()
+if __name__ == "__main__":
+	main()

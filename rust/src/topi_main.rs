@@ -1310,6 +1310,11 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			self.m_PrevAiCap = self.m_AssignmentInfo.cap();
 		}
 
+		// Rust-only extension (topi_ext_hints.rs): apply the phase and score hints, if any have been recorded (none can be, unless their parameters are on)
+		self.ExtHintsApplyPending();
+		// Rust-only extension (topi_ext_target_phase.rs): the start of a query for target/best-phase saving and rephasing (nothing, unless their parameters are on)
+		self.ExtTargetPhaseInitQuery();
+
 		// CDCL loop
 		while self.m_Status.get() == TToporStatus::STATUS_UNDECIDED
 		{
@@ -1331,6 +1336,11 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			}
 
 			self.InprocessIfRequired();
+			// Rust-only extension (topi_ext_vivify.rs): vivification may decide the query (a global contradiction, a falsified assumption or a model) or serve a request to stop it; nothing, unless /inprocessing/vivify/on is set
+			if self.m_Params.m_ParamVivifyOn.get() && self.m_Status.get() != TToporStatus::STATUS_UNDECIDED
+			{
+				ReturnTrv!(self.StatusToRetVal());
+			}
 			self.SimplifyIfRequired();
 			self.DeleteClausesIfRequired();
 			self.CompressBuffersIfRequired();
@@ -1354,6 +1364,11 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 
 			let mut contradictionInfo = self.BCP();
 			let isContradictionBeforeConflictAnalysis = contradictionInfo.IsContradiction();
+			// Rust-only extension (topi_ext_target_phase.rs): the assignment below the conflicting level may be the new target (nothing, unless the parameters are on)
+			if isContradictionBeforeConflictAnalysis
+			{
+				self.ExtTargetPhaseOnConflict();
+			}
 
 			self.ConflictAnalysisLoop(&mut contradictionInfo);
 			if self.IsUnrecoverable()
@@ -1433,6 +1448,8 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 			if self.m_Status.get() == TToporStatus::STATUS_UNDECIDED && isContradictionBeforeConflictAnalysis && self.Restart()
 			{
 				self.Backtrack(self.m_DecLevelOfLastAssignedAssumption as TLit, false, false);
+				// Rust-only extension (topi_ext_target_phase.rs): rephase, if it's time (never, unless /phase/rephase/conf_init is non-0)
+				self.ExtTargetPhaseRephaseIfRequired();
 				if self.M_GetNextUnitClause.is_some()
 				{
 					let assignedVarsNumBefore = self.m_AssignedVarsNum;

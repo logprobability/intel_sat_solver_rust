@@ -89,5 +89,7 @@ impl<Ind: TUInd, const Compress: bool> CTopi<Ind, Compress>
 		debug_assert!(self.NV(1) || self.P(&("Inprocessing started for time ".to_string() + &self.m_Stat.m_Ings.to_string() + "; m_SolveInvs = " + &self.m_IngLastSolveInv.to_string() + "; m_Conflicts = " + &self.m_IngLastConflicts.to_string())));
 
 		self.IngRemoveBinaryWatchesIfRequired();
+		// Rust-only extension (topi_ext_vivify.rs): vivification of the learnt clauses (nothing, unless /inprocessing/vivify/on is set)
+		self.ExtVivifyIfRequired();
 	}
 }
