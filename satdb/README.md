@@ -31,7 +31,7 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     schema, and the durable log records alterations like definitions.
 * **History and time** (`src/db.rs`). The current indexes map each datom to the transaction that asserted it, and five append-only
   history indexes (EAVT/AEVT/AVET/VAET order with keys ending in `(tx, added)`, and the log in transaction order) keep every assertion and
-  retraction, all persistent; a schema history keeps every definition and alteration. Three views, each a cheap clone with a marker, filter the reads:
+  retraction, all persistent (compressed segments, see History indexes); a schema history keeps every definition and alteration. Three views, each a cheap clone with a marker, filter the reads:
   * `Db::history()`: every change, with its `added` flag (and history statistics for the planner);
   * `Db::since(t)`: only the datoms of transactions after basis `t`, for every read, pull included;
   * `Db::as_of(t)`: the value as of basis `t`, with the schema of the time: every read derives that time's datoms from the history indexes
@@ -64,18 +64,20 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
     be derived (counters, schema history, transactions, and the history in log order). It is written to a temporary file, synced and renamed.
     On open, an intact checkpoint (both checksums) whose covered log prefix ends at a record boundary, has the CRC-32 the checkpoint records
     (so it is *this* log's), and whose basis is the number of records it covers is used: `Db::from_snapshot` sorts the history into each index's
-    order and builds every map in linear time (`PMap::from_sorted`), deriving the current indexes and the statistics, and only the later
+    order and builds every index in linear time (`PMap::from_sorted`, `HIndex::from_sorted`), deriving the current indexes and the statistics, and only the later
     records are replayed. Any other checkpoint is silently ignored and the log replayed in full: the log holds the data, the checkpoint is a cache.
     The rebuild is a second implementation of the indexes, which the tests compare with `transact`'s at every basis of random workloads.
 
-    Timings (release, transactions of 20 assertions, `cargo test --release open_timings -- --ignored --nocapture`; opening by replay costs
-    the path-copying inserts into every index, about 25 µs per datom at 50k transactions, which the bulk build avoids):
+    Timings (release, transactions of 20 assertions, `cargo test --release open_timings -- --ignored --nocapture`; opening by replay
+    inserts into the four current indexes, in place since replay owns the value, and merges the history's segments; the bulk build avoids
+    both). One run on a busy machine, back to back with the same test on the history indexes as B+-trees like the current ones, in brackets
+    (with every index a treap, replaying 50,000 transactions took 25.8 s on a quieter machine):
 
-    | transactions | log      | open by replay | checkpoint written | open from the checkpoint |
-    |--------------|----------|----------------|--------------------|--------------------------|
-    | 1,000        | 0.5 MB   | 139 ms         | 16 ms (0.7 MB)     | 16 ms                    |
-    | 10,000       | 5.0 MB   | 3.96 s         | 62 ms (6.9 MB)     | 252 ms                   |
-    | 50,000       | 25.1 MB  | 25.8 s         | 441 ms (34.5 MB)   | 1.20 s                   |
+    | transactions | log      | open by replay   | checkpoint written | open from the checkpoint |
+    |--------------|----------|------------------|--------------------|--------------------------|
+    | 1,000        | 0.5 MB   | 114 ms (56 ms)   | 17 ms (0.7 MB)     | 18 ms (15 ms)            |
+    | 10,000       | 5.0 MB   | 1.70 s (0.92 s)  | 50 ms (6.9 MB)     | 200 ms (155 ms)          |
+    | 50,000       | 25.1 MB  | 10.6 s (7.01 s)  | 248 ms (34.5 MB)   | 1.38 s (0.76 s)          |
 * **Pull** (`src/query.rs`). `Db::pull(pattern, eid)` reads an entity as a tree (`Pulled`): attribute lists, the wildcard (which pulls
   components recursively, stopping at cycles), nested patterns for Ref attributes, and reverse refs through VAET (`Pull::reverse`, key `ns/_name`).
   Cardinality-one attributes and reverse components give one value, the others a list; absent attributes are left out. The pattern is
@@ -83,8 +85,94 @@ A Datomic-inspired immutable database whose query planner runs on the Rust fork 
   `Pull::recurse(depth)` pulls the referenced entities by the enclosing pattern again, to a depth or (None) until an entity repeats on the
   path, where it stays a Ref (Datomic's `{:attr ...}` and `{:attr 3}`). `Db::pull_str` reads a pattern in Datomic's EDN syntax
   (`[:person/name * :person/_friend [:person/aka :limit 2 :as "aliases"] {:person/friend [:person/name]} {:person/boss ...}]`).
-* **Persistent indexes** (`src/pmap.rs`). A treap with `Arc`-shared nodes and hash-of-key priorities: an update copies one root-to-leaf path,
-  and the tree's shape depends on its key set only.
+* **Persistent indexes** (`src/pmap.rs`). A persistent B+-tree, as in DataScript's persistent-sorted-set and Rust's `im`, instead of the
+  first version's binary treap. It holds the current indexes, the schema and the statistics:
+  * wide nodes (`B` = 32 entries per leaf, 32 children per branch; 16 and 64 were measured and are slower), so an update copies about
+    log₃₂ n nodes rather than log₂ n, and scans read contiguous arrays;
+  * classic B+ separators (deletions never touch them), merging or rebalancing below half full, every leaf at one depth;
+  * in-place updates of nodes that no other version shares (`insert_mut`/`remove_mut` through `Arc::make_mut`: the "transient" idea of
+    Clojure, or the reuse of Perceus), so a transaction copies each path it touches once (the previous value stays valid) and then
+    updates it in place, and log replay, which owns its value, copies nothing;
+  * linear-time bulk loading with evenly filled nodes (`from_sorted`), which checkpoints use.
+
+  The tests check the tree's invariants after every operation of random workloads against `BTreeMap`, with every version kept and
+  compared again at the end, and that an in-place update copies exactly the nodes another version shares.
+
+  Timings (release, `cargo test --release index_timings -- --ignored --nocapture`, transactions of 20 assertions, a quarter of them on new entities):
+
+  | | treap | B+-tree, copying updates | B+-tree, in-place updates | + fat-node persistence in `Conn` | + statistics from neighbors |
+  |---|---|---|---|---|---|
+  | 10,000 transactions | 5.21 s | 2.44 s | 1.36 s | 0.67 s | 0.68-0.76 s |
+  | 50,000 transactions | 31.9 s | 21.6 s | 14.8 s | 5.76 s | 5.1-5.3 s |
+  | 7,085 point reads (10k) | 6.9 ms | 3.5 ms | 3.0 ms | 3.1 ms | 2.6-3.9 ms |
+  | scan of an attribute (10k) | 1.5 ms | 0.59 ms | 0.52 ms | 0.45 ms | 0.5 ms |
+  | opening a log of 50k by replay | 25.8 s | | 6.12 s | | |
+  | opening it from a checkpoint | 1.20 s | | 0.68 s | | |
+
+  (The machine is noisy: the last column is the range of three runs. These were measured while the history indexes were B+-trees too;
+  they are compressed segments now, see History indexes, which cost on writes what is measured there.)
+
+  Persistence as Demaine teaches it (MIT 6.851, after Driscoll, Sarnak, Sleator and Tarjan) comes in two forms: *path copying* (copy what
+  an update touches, so every version keeps its own root) and *fat nodes* (one structure, every change stored with its version, a version
+  read by its time). The history indexes already are the fat-node form, which is also the dictionary case of retroactive data structures
+  (Demaine, Iacono and Langerman, 2004/2007): each datom is stored with the times it was asserted and retracted, which answers queries about
+  any past time (their Theorem 6 remark). So `Conn::transact` doesn't keep the value before the transaction by path copying as well:
+  `Db::transact` is split into `plan` (everything that can fail, uniqueness included, checked against the value before the transaction)
+  and an infallible apply, and the connection plans, logs, lets go of its value and applies the changes in place; the report's `db_before`
+  is an `as_of` view. A value that a caller still holds keeps `Arc::make_mut` copying, so sharing stays correct, and `Db::transact` on a
+  plain value still returns both values whole. Then the statistics (distinct entities and values per attribute) come from the neighbors
+  of the key an insertion or removal changes (`PMap::insert_mut_near`) instead of separate searches, four fewer descents per datom.
+
+  Then a transaction's assertions go into each current index as one sorted batch
+  (`PMap::insert_batch_mut`): a single pass in which each child gets the entries below its separator, a node that gets none isn't
+  touched (or copied), and an overflowing node splits into evenly filled siblings; with a prefix predicate the batch also reports, per entry,
+  whether an older key shares its prefix, for the statistics. Retractions stay one by one. Measured by alternating the builds before and
+  after (the machine is noisy): transactions of 20 scattered datoms gain nothing measurable (0.78 s vs 0.74 s for 10k, 5.6 s vs 5.7 s for
+  50k: each entry lands in its own leaf, so a batch shares only the hot top levels), while bulk loads, where the entries cluster
+  (`cargo test --release bulk_timings -- --ignored --nocapture`: 200 transactions of 200 new entities with 5 attributes each), went from
+  240-257 ms to 131-154 ms (with the history indexes batched likewise, as B+-trees).
+
+  Changing the past (inserting a transaction at an earlier time) would need the paper's rollback method here, since cardinality-one and
+  uniqueness make the operations non-commutative. What a small transaction pays now is the tree work itself (comparisons, shifting entries
+  within leaves, a descent per datom and index).
+
+  A write-buffered tree was tried and measured, and isn't used: `src/bemap.rs` is a persistent Bε-tree (Brodal and Fagerberg 2003, made
+  practical by Bender, Farach-Colton et al.'s write-optimized trees; Demaine's part in this line is the cache-oblivious B-tree with Bender and
+  Farach-Colton), with message buffers in the branches, whole-buffer flushes and merged iteration, tested against `BTreeMap` like `pmap`.
+  Against the B+-tree on 1M scattered keys (`cargo test --release bemap_vs_pmap -- --ignored --nocapture`, best buffer size 256 of
+  128-2048): insertions 0.91-1.85x as fast (about 1.35x typically), point reads 1.44-1.79x slower, scans 2.3-5.3x slower. A transaction
+  reads the indexes as it plans and queries scan them, and the statistics need what an insertion sees at its leaf, so the gain on writes
+  doesn't pay for the cost on reads: in memory, a B+-tree insertion costs only its descent and a short shift in a leaf, which is what the
+  buffers amortize, while the Bε-tree's real advantage is in block transfers, which an in-memory index doesn't make.
+* **History indexes** (`src/hist.rs`, `src/succinct.rs`). The history only grows, so its five indexes are static compressed structures rather
+  than trees: each is a few immutable sorted *segments* and a small sorted tail of the latest entries (a full tail becomes a segment, merged
+  with the segments that aren't at least 4 times its size, on their integers), all behind `Arc`s, so a clone is two reference counts.
+  * In a segment a value is its rank in the segment's sorted dictionary, each column is as wide as its largest integer, and the leading
+    columns of an entry (as many as fit in 64 bits) are one integer. Those integers are non-decreasing and stored as an Elias-Fano
+    sequence, so the entries of a key prefix are found by two successor searches (a few cache lines, whatever the segment's length);
+    the other columns are packed row by row.
+  * `succinct` has the building blocks, written from the published designs (the ones sdsl-lite implements as `int_vector`, `bit_vector_il`
+    and `sd_vector`): bit-packed fields, a bit vector with select whose counters are interleaved with its bits, and Elias-Fano.
+  * An entry takes 8 to 9 bytes (a treap node was about 90). A read merges the ranges of the segments, so it is fastest on a value
+    opened from a checkpoint (one segment); opening from a checkpoint itself is about 10% slower than with treaps, and a long scan of
+    one segment is no faster (it decodes about as fast as the bulk-built treap was walked).
+  * Writes pay for it: an entry is rewritten each time its segment is merged. Back to back with the history indexes as B+-trees filled in
+    batches (one run each on a busy machine): 10,000 transactions of 20 assertions take 1.55 s (1.00 s), 50,000 take 11.5 s (9.06 s),
+    and the bulk load of `bulk_timings` 840 ms (171 ms).
+
+    Timings of the reads the history serves, in ns (release, `cargo test --release history_read_timings -- --ignored --nocapture`:
+    20,000 transactions, about 460,000 history entries, random entities; the minimum of 5 runs interleaved with the treap version, in brackets;
+    measured while the current indexes were treaps, which these reads don't touch):
+
+    | read                                 | after a replay | opened from a checkpoint |
+    |--------------------------------------|----------------|--------------------------|
+    | as-of `entity_datoms(e)`             | 306 (734)      | 120 (296)                |
+    | as-of `values(e, a)`                 | 237 (430)      | 90 (215)                 |
+    | as-of `entities(a, v)`, ~50 entities | 4534 (12417)   | 2418 (4825)              |
+    | as-of `referrers(e)`                 | 221 (264)      | 99 (125)                 |
+    | history `datoms(e, a)`               | 271 (509)      | 97 (216)                 |
+    | as-of `attr_datoms(a)`, per datom    | 32 (53)        | 16 (15)                  |
+    | `tx_range`, per datom                | 45 (80)        | 29 (28)                  |
 * **Queries** (`src/query.rs`). Datalog-style queries over any view: patterns `[e attr v]` (or `[e attr v tx added]`, `Query::pattern_tx`),
   comparison predicates, `not`/`not-join` and `or`/`or-join` (nested to any depth) and rule calls (see Rules), run as nested loops, each pattern using the index selected by its bound positions.
   * `not` keeps the rows for which its body has no solution; its join variables (all of its body's, or the `not-join` list) must be bound when it runs,

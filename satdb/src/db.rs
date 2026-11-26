@@ -1,4 +1,4 @@
-//! The database value: the current datoms in four persistent indexes, the history in three more, the schema and the per-attribute statistics the planner estimates with.
+//! The database value: the current datoms in four persistent indexes, the history in five more (see `hist`), the schema and the per-attribute statistics the planner estimates with.
 //!
 //! A `Db` is immutable. `transact` returns a new `Db` that shares all the unchanged index nodes with the old one,
 //! so keeping every past version (see `Conn::as_of`) costs only the changed paths.
@@ -43,6 +43,7 @@
 //! code as `transact`, so a reopened connection has the same values, down to the index contents and statistics.
 //! `Conn::checkpoint` writes a `Snapshot` next to the log, from which `Db::from_snapshot` rebuilds the value without replaying (see `log`).
 
+use crate::hist::{Change, HIndex, Key, AEVT, AVET, EAVT, LOG, VAET};
 use crate::log::Log;
 use crate::pmap::PMap;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -376,8 +377,6 @@ impl fmt::Display for Error
 
 impl std::error::Error for Error {}
 
-type PSet<K> = PMap<K, ()>;
-
 /// One of two iterators of the same items: the current indexes', or a derivation from the history's (in an `as_of` view)
 enum Either<A, B>
 {
@@ -415,14 +414,14 @@ pub struct Db
 	avet: PMap<(AttrId, Value, Eid), Eid>,
 	/// The reverse index of the Ref datoms: (referenced entity, attribute, referring entity)
 	vaet: PMap<(Eid, AttrId, Eid), Eid>,
-	// The history: every assertion and retraction ever applied, as (.., tx, added); it only grows
-	heavt: PSet<(Eid, AttrId, Value, Eid, bool)>,
-	haevt: PSet<(AttrId, Eid, Value, Eid, bool)>,
-	havet: PSet<(AttrId, Value, Eid, Eid, bool)>,
-	/// The history of the Ref datoms in VAET order, (target, a, e, tx, added)
-	hvaet: PSet<(Eid, AttrId, Eid, Eid, bool)>,
-	/// The log: the history in transaction order, (tx, e, a, v, added)
-	tlog: PSet<(Eid, Eid, AttrId, Value, bool)>,
+	// The history: every assertion and retraction ever applied, in each order (then by tx and added); it only grows (see `hist`)
+	heavt: HIndex,
+	haevt: HIndex,
+	havet: HIndex,
+	/// The history of the Ref datoms in VAET order
+	hvaet: HIndex,
+	/// The log: the history in transaction order
+	tlog: HIndex,
 	/// Every definition and alteration of an attribute, by the basis that made it
 	schema: PMap<(AttrId, T), Attr>,
 	/// The statistics of the history (distinct entities and values ever)
@@ -680,7 +679,8 @@ pub(crate) struct TxRecord
 
 impl TxReport
 {
-	/// The record of this transaction for the durable log
+	/// The record of this transaction for the durable log (the tests compare it with what the connection logged)
+	#[cfg(test)]
 	pub(crate) fn record(&self) -> TxRecord
 	{
 		let (before, after) = (&self.db_before, &self.db_after);
@@ -693,6 +693,53 @@ impl TxReport
 		};
 		let changes = |added: bool| self.tx_data[1..].iter().filter(|d| d.added == added).map(|d| (d.e, d.a, d.v.clone())).collect();
 		TxRecord { basis_t: after.basis_t, tx: self.tx, next_eid: after.next_eid, instant, attrs, retracted: changes(false), asserted: changes(true) }
+	}
+}
+
+/// A transaction that `Db::plan` accepted: the value with its schema, basis and entity ids updated (still sharing the indexes of the value
+/// before it), and the changes that `finish` applies, which can't fail
+struct Planned
+{
+	db: Db,
+	tx: Eid,
+	instant: i64,
+	retracted: Vec<(Eid, AttrId, Value)>,
+	asserted: Vec<(Eid, AttrId, Value)>,
+	tempids: Vec<Eid>,
+	lookups: Vec<Eid>,
+	tx_id: u64,
+}
+
+impl Planned
+{
+	/// The record of the transaction for the durable log, given the value before it
+	fn record(&self, before: &Db) -> TxRecord
+	{
+		let after = &self.db;
+		// The attributes the transaction defined or altered
+		let attrs = (0..after.attrs.len() as AttrId).filter(|&a| before.try_attr(a) != Some(after.attr(a))).map(|a| (a, after.attr(a).clone())).collect();
+		TxRecord {
+			basis_t: after.basis_t,
+			tx: self.tx,
+			next_eid: after.next_eid,
+			instant: self.instant,
+			attrs,
+			retracted: self.retracted.clone(),
+			asserted: self.asserted.clone(),
+		}
+	}
+
+	/// Apply the changes: in place, for the indexes that no other value shares (see `pmap`)
+	fn finish(self, db_before: Db) -> TxReport
+	{
+		let Planned { mut db, tx, instant, retracted, asserted, tempids, lookups, tx_id } = self;
+		db.apply(tx, instant, &retracted, &asserted);
+		let instant_attr = db.attr_id(TX_INSTANT).expect("built in");
+		let datom = |(e, a, v): (Eid, AttrId, Value), added: bool| Datom { e, a, v, tx, added };
+		let mut tx_data = vec![datom((tx, instant_attr, Value::Instant(instant)), true)];
+		tx_data.extend(retracted.into_iter().map(|d| datom(d, false)));
+		tx_data.extend(asserted.into_iter().map(|d| datom(d, true)));
+		TxReport { db_before, db_after: db, tx, tempids, lookups, tx_data, tx_id }
 	}
 }
 
@@ -814,11 +861,11 @@ impl Db
 			aevt: PMap::new(),
 			avet: PMap::new(),
 			vaet: PMap::new(),
-			heavt: PMap::new(),
-			haevt: PMap::new(),
-			havet: PMap::new(),
-			hvaet: PMap::new(),
-			tlog: PMap::new(),
+			heavt: HIndex::new(EAVT),
+			haevt: HIndex::new(AEVT),
+			havet: HIndex::new(AVET),
+			hvaet: HIndex::new(VAET),
+			tlog: HIndex::new(LOG),
 			schema: PMap::new(),
 			hstats: PMap::new(),
 			txs: PMap::new(),
@@ -876,8 +923,8 @@ impl Db
 		let (mut attrs, mut attr_ids) = (PMap::new(), PMap::new());
 		for ((a, _), def) in self.schema.iter().filter(|((_, at), _)| *at <= t)
 		{
-			attrs = attrs.insert(*a, def.clone());
-			attr_ids = attr_ids.insert(def.name.clone(), *a);
+			attrs.insert_mut(*a, def.clone());
+			attr_ids.insert_mut(def.name.clone(), *a);
 		}
 		// Transaction t + 1's entity is the first id it allocated (before its tempids)
 		let next_eid = self.txs.get(&(t + 1)).copied().unwrap_or(self.next_eid);
@@ -890,9 +937,9 @@ impl Db
 	{
 		let Some(tx) = self.tx_of(t) else { return 0 };
 		let a = self.attr_id(TX_INSTANT).expect("built in");
-		match self.heavt.seek(|k| (k.0, k.1) < (tx, a)).next()
+		match self.heavt.scan(&[Key::E(tx), Key::A(a)]).next()
 		{
-			Some(((e, b, Value::Instant(i), _, true), _)) if (*e, *b) == (tx, a) => *i,
+			Some(Change { v: Value::Instant(i), added: true, .. }) => *i,
 			_ => unreachable!("every transaction has its instant"),
 		}
 	}
@@ -926,14 +973,14 @@ impl Db
 
 	/// The datoms current as of transaction `upto`, from history entries in index order (each datom's entries together, in transaction order):
 	/// a datom is current when its last change at or before `upto` is an assertion, which gives its transaction
-	fn current_as_of<'a, K>(entries: impl Iterator<Item = &'a K>, same: impl Fn(&K, &K) -> bool, change: impl Fn(&K) -> (Eid, bool), upto: Eid) -> Vec<(&'a K, Eid)>
+	fn current_as_of<K: Copy>(entries: impl Iterator<Item = K>, same: impl Fn(&K, &K) -> bool, change: impl Fn(&K) -> (Eid, bool), upto: Eid) -> Vec<(K, Eid)>
 	{
 		let mut out = Vec::new();
-		let mut group: Option<&K> = None;
-		let mut last: Option<(&K, Eid, bool)> = None;
+		let mut group: Option<K> = None;
+		let mut last: Option<(K, Eid, bool)> = None;
 		for k in entries
 		{
-			if group.map_or(true, |g| !same(g, k))
+			if group.map_or(true, |g| !same(&g, &k))
 			{
 				if let Some((d, tx, true)) = last.take()
 				{
@@ -941,7 +988,7 @@ impl Db
 				}
 				group = Some(k);
 			}
-			let (tx, added) = change(k);
+			let (tx, added) = change(&k);
 			if tx <= upto
 			{
 				last = Some((k, tx, added));
@@ -961,7 +1008,7 @@ impl Db
 		(from.max(1)..to.min(self.basis_t + 1))
 			.map(|t| {
 				let tx = self.tx_of(t).expect("every basis up to this one has a transaction");
-				let data = self.tlog.seek(|k| k.0 < tx).take_while(|(k, _)| k.0 == tx).map(|(k, _)| Datom { e: k.1, a: k.2, v: k.3.clone(), tx, added: k.4 }).collect();
+				let data = self.tlog.scan(&[Key::Tx(tx)]).map(|c| c.datom()).collect();
 				TxLogEntry { t, tx, data }
 			})
 			.collect()
@@ -999,6 +1046,7 @@ impl Db
 	pub fn datoms(&self, e: Option<Eid>, a: AttrId, v: Option<&Value>) -> Vec<Datom>
 	{
 		let d = |e: Eid, v: &Value, tx: Eid, added: bool| Datom { e, a, v: v.clone(), tx, added };
+		let hist = |index: &HIndex, prefix: &[Key]| index.scan(prefix).map(|c| c.datom()).collect();
 		// An as-of view reads the history, which gives the current datoms as of its basis
 		let mut out: Vec<Datom> = match (self.history || self.upto.is_some(), e, v)
 		{
@@ -1006,13 +1054,10 @@ impl Db
 			(false, Some(e), None) => self.eavt.seek(|k| (k.0, k.1) < (e, a)).take_while(|(k, _)| (k.0, k.1) == (e, a)).map(|(k, tx)| d(e, &k.2, *tx, true)).collect(),
 			(false, None, Some(v)) => self.avet.seek(|k| (k.0, &k.1) < (a, v)).take_while(|(k, _)| (k.0, &k.1) == (a, v)).map(|(k, tx)| d(k.2, v, *tx, true)).collect(),
 			(false, None, None) => self.aevt.seek(|k| k.0 < a).take_while(|(k, _)| k.0 == a).map(|(k, tx)| d(k.1, &k.2, *tx, true)).collect(),
-			(true, Some(e), Some(v)) =>
-			{
-				self.heavt.seek(|k| (k.0, k.1, &k.2) < (e, a, v)).take_while(|(k, _)| (k.0, k.1, &k.2) == (e, a, v)).map(|(k, _)| d(e, v, k.3, k.4)).collect()
-			}
-			(true, Some(e), None) => self.heavt.seek(|k| (k.0, k.1) < (e, a)).take_while(|(k, _)| (k.0, k.1) == (e, a)).map(|(k, _)| d(e, &k.2, k.3, k.4)).collect(),
-			(true, None, Some(v)) => self.havet.seek(|k| (k.0, &k.1) < (a, v)).take_while(|(k, _)| (k.0, &k.1) == (a, v)).map(|(k, _)| d(k.2, v, k.3, k.4)).collect(),
-			(true, None, None) => self.haevt.seek(|k| k.0 < a).take_while(|(k, _)| k.0 == a).map(|(k, _)| d(k.1, &k.2, k.3, k.4)).collect(),
+			(true, Some(e), Some(v)) => hist(&self.heavt, &[Key::E(e), Key::A(a), Key::V(v)]),
+			(true, Some(e), None) => hist(&self.heavt, &[Key::E(e), Key::A(a)]),
+			(true, None, Some(v)) => hist(&self.havet, &[Key::A(a), Key::V(v)]),
+			(true, None, None) => hist(&self.haevt, &[Key::A(a)]),
 		};
 		match (self.upto, self.history)
 		{
@@ -1042,8 +1087,8 @@ impl Db
 			None => Either::Now(self.eavt.seek(move |k| (k.0, k.1) < (e, a)).take_while(move |(k, _)| k.0 == e && k.1 == a).filter(move |(_, tx)| **tx > since).map(|(k, _)| &k.2)),
 			Some(upto) =>
 			{
-				let hist = self.heavt.seek(move |k| (k.0, k.1) < (e, a)).take_while(move |(k, _)| (k.0, k.1) == (e, a)).map(|(k, _)| k);
-				Either::Then(Self::current_as_of(hist, |x, y| x.2 == y.2, |k| (k.3, k.4), upto).into_iter().filter(move |(_, tx)| *tx > since).map(|(k, _)| &k.2))
+				let hist = self.heavt.scan(&[Key::E(e), Key::A(a)]);
+				Either::Then(Self::current_as_of(hist, |x, y| x.v == y.v, |k| (k.tx, k.added), upto).into_iter().filter(move |(_, tx)| *tx > since).map(|(k, _)| k.v))
 			}
 		}
 	}
@@ -1057,8 +1102,8 @@ impl Db
 			None => Either::Now(self.eavt.seek(move |k| k.0 < e).take_while(move |(k, _)| k.0 == e).filter(move |(_, tx)| **tx > since).map(|(k, _)| (k.1, &k.2))),
 			Some(upto) =>
 			{
-				let hist = self.heavt.seek(move |k| k.0 < e).take_while(move |(k, _)| k.0 == e).map(|(k, _)| k);
-				Either::Then(Self::current_as_of(hist, |x, y| (x.1, &x.2) == (y.1, &y.2), |k| (k.3, k.4), upto).into_iter().filter(move |(_, tx)| *tx > since).map(|(k, _)| (k.1, &k.2)))
+				let hist = self.heavt.scan(&[Key::E(e)]);
+				Either::Then(Self::current_as_of(hist, |x, y| (x.a, x.v) == (y.a, y.v), |k| (k.tx, k.added), upto).into_iter().filter(move |(_, tx)| *tx > since).map(|(k, _)| (k.a, k.v)))
 			}
 		}
 	}
@@ -1074,8 +1119,8 @@ impl Db
 			),
 			Some(upto) =>
 			{
-				let hist = self.havet.seek(move |k| (k.0, &k.1) < (a, v)).take_while(move |(k, _)| (k.0, &k.1) == (a, v)).map(|(k, _)| k);
-				Either::Then(Self::current_as_of(hist, |x, y| x.2 == y.2, |k| (k.3, k.4), upto).into_iter().filter(move |(_, tx)| *tx > since).map(|(k, _)| k.2))
+				let hist = self.havet.scan(&[Key::A(a), Key::V(v)]);
+				Either::Then(Self::current_as_of(hist, |x, y| x.e == y.e, |k| (k.tx, k.added), upto).into_iter().filter(move |(_, tx)| *tx > since).map(|(k, _)| k.e))
 			}
 		}
 	}
@@ -1089,8 +1134,8 @@ impl Db
 			None => Either::Now(self.vaet.seek(move |k| k.0 < target).take_while(move |(k, _)| k.0 == target).filter(move |(_, tx)| **tx > since).map(|(k, _)| (k.1, k.2))),
 			Some(upto) =>
 			{
-				let hist = self.hvaet.seek(move |k| k.0 < target).take_while(move |(k, _)| k.0 == target).map(|(k, _)| k);
-				Either::Then(Self::current_as_of(hist, |x, y| (x.1, x.2) == (y.1, y.2), |k| (k.3, k.4), upto).into_iter().filter(move |(_, tx)| *tx > since).map(|(k, _)| (k.1, k.2)))
+				let hist = self.hvaet.scan(&[Key::V(&Value::Ref(target))]);
+				Either::Then(Self::current_as_of(hist, |x, y| (x.a, x.e) == (y.a, y.e), |k| (k.tx, k.added), upto).into_iter().filter(move |(_, tx)| *tx > since).map(|(k, _)| (k.a, k.e)))
 			}
 		}
 	}
@@ -1104,8 +1149,8 @@ impl Db
 			None => Either::Now(self.aevt.seek(move |k| k.0 < a).take_while(move |(k, _)| k.0 == a).filter(move |(_, tx)| **tx > since).map(|(k, _)| (k.1, &k.2))),
 			Some(upto) =>
 			{
-				let hist = self.haevt.seek(move |k| k.0 < a).take_while(move |(k, _)| k.0 == a).map(|(k, _)| k);
-				Either::Then(Self::current_as_of(hist, |x, y| (x.1, &x.2) == (y.1, &y.2), |k| (k.3, k.4), upto).into_iter().filter(move |(_, tx)| *tx > since).map(|(k, _)| (k.1, &k.2)))
+				let hist = self.haevt.scan(&[Key::A(a)]);
+				Either::Then(Self::current_as_of(hist, |x, y| (x.e, x.v) == (y.e, y.v), |k| (k.tx, k.added), upto).into_iter().filter(move |(_, tx)| *tx > since).map(|(k, _)| (k.e, k.v)))
 			}
 		}
 	}
@@ -1117,8 +1162,8 @@ impl Db
 			None => self.eavt.get(&(e, a, v.clone())).is_some_and(|tx| *tx > self.since),
 			Some(upto) =>
 			{
-				let hist = self.heavt.seek(|k| (k.0, k.1, &k.2) < (e, a, v)).take_while(|(k, _)| (k.0, k.1, &k.2) == (e, a, v)).map(|(k, _)| k);
-				Self::current_as_of(hist, |_, _| true, |k| (k.3, k.4), upto).first().is_some_and(|(_, tx)| *tx > self.since)
+				let hist = self.heavt.scan(&[Key::E(e), Key::A(a), Key::V(v)]);
+				Self::current_as_of(hist, |_, _| true, |k| (k.tx, k.added), upto).first().is_some_and(|(_, tx)| *tx > self.since)
 			}
 		}
 	}
@@ -1140,6 +1185,13 @@ impl Db
 	}
 
 	pub fn transact(&self, tx: &Tx) -> Result<TxReport, Error>
+	{
+		Ok(self.plan(tx)?.finish(self.clone()))
+	}
+
+	// Phases 1 to 5 and the checks of 6 (see the module documentation): everything that can fail, without changing any index.
+	// The planned value shares this one's indexes until `Planned::finish` applies the changes
+	fn plan(&self, tx: &Tx) -> Result<Planned, Error>
 	{
 		if self.history || self.since != 0 || self.upto.is_some()
 		{
@@ -1164,7 +1216,7 @@ impl Db
 		// The transaction's entity is the first id it allocates (before its tempids): `as_of` relies on it for the next entity id of a past basis
 		let tx_eid = db.next_eid;
 		db.next_eid += 1;
-		db.txs = db.txs.insert(db.basis_t, tx_eid);
+		db.txs.insert_mut(db.basis_t, tx_eid);
 
 		// Phase 2: the lookup refs, against the data before the transaction (db has only its schema changes so far)
 		let lookups = tx
@@ -1365,7 +1417,7 @@ impl Db
 			prev = Some(d);
 		}
 
-		// Phase 6: apply, then check the unique attributes
+		// Phase 6: the changes, and the unique attributes checked on the result before anything is applied
 		let mut retracted: BTreeSet<(Eid, AttrId, Value)> = rets.into_iter().filter(|(e, a, v)| self.has(*e, *a, v)).collect();
 		for (e, a, v) in &adds
 		{
@@ -1375,21 +1427,22 @@ impl Db
 			}
 		}
 		let asserted: Vec<(Eid, AttrId, Value)> = adds.into_iter().filter(|(e, a, v)| !self.has(*e, *a, v)).collect();
-		let retracted: Vec<(Eid, AttrId, Value)> = retracted.into_iter().collect();
-		db.apply(tx_eid, instant, &retracted, &asserted);
-		for (_, a, v) in &asserted
+		// The holders of a unique value after the transaction: those before it that keep it, and those that get it
+		let mut gets: HashMap<(AttrId, &Value), Vec<Eid>> = HashMap::new();
+		for (e, a, v) in asserted.iter().filter(|(_, a, _)| db.attr(*a).unique.is_some())
 		{
-			if db.attr(*a).unique.is_some() && db.entities(*a, v).nth(1).is_some()
+			gets.entry((*a, v)).or_default().push(*e);
+		}
+		for ((a, v), new) in &gets
+		{
+			let kept = self.entities(*a, v).filter(|x| !retracted.contains(&(*x, *a, (*v).clone()))).count();
+			if kept + new.len() > 1
 			{
-				return Err(Error::UniqueConflict { attr: db.attr_name(*a), value: v.clone() });
+				return Err(Error::UniqueConflict { attr: db.attr_name(*a), value: (*v).clone() });
 			}
 		}
-		let instant_attr = db.attr_id(TX_INSTANT).expect("built in");
-		let datom = |(e, a, v): (Eid, AttrId, Value), added: bool| Datom { e, a, v, tx: tx_eid, added };
-		let mut tx_data = vec![datom((tx_eid, instant_attr, Value::Instant(instant)), true)];
-		tx_data.extend(retracted.into_iter().map(|d| datom(d, false)));
-		tx_data.extend(asserted.into_iter().map(|d| datom(d, true)));
-		Ok(TxReport { db_before: self.clone(), db_after: db, tx: tx_eid, tempids, lookups, tx_data, tx_id: tx.id })
+		drop(gets);
+		Ok(Planned { db, tx: tx_eid, instant, retracted: retracted.into_iter().collect(), asserted, tempids, lookups, tx_id: tx.id })
 	}
 
 	fn define(&mut self, def: &Attr) -> Result<(), Error>
@@ -1450,17 +1503,17 @@ impl Db
 				prev = Some((v, *e));
 			}
 		}
-		self.schema = self.schema.insert((a, self.basis_t), def.clone());
-		self.attrs = self.attrs.insert(a, def.clone());
+		self.schema.insert_mut((a, self.basis_t), def.clone());
+		self.attrs.insert_mut(a, def.clone());
 		Ok(())
 	}
 
 	fn add_attr(&mut self, def: Attr)
 	{
 		let a = self.attrs.len() as AttrId;
-		self.attr_ids = self.attr_ids.insert(def.name.clone(), a);
-		self.schema = self.schema.insert((a, self.basis_t), def.clone());
-		self.attrs = self.attrs.insert(a, def);
+		self.attr_ids.insert_mut(def.name.clone(), a);
+		self.schema.insert_mut((a, self.basis_t), def.clone());
+		self.attrs.insert_mut(a, def);
 	}
 
 	fn attr_name(&self, a: AttrId) -> String
@@ -1474,24 +1527,22 @@ impl Db
 	}
 
 	// The datom changes of transaction tx (shared by transact and replay): the retractions of present datoms, the assertions of absent ones, and the instant
+	// The retractions go one by one; the assertions (the instant included) and every change's history go in as one batch per index
 	fn apply(&mut self, tx: Eid, instant: i64, retracted: &[(Eid, AttrId, Value)], asserted: &[(Eid, AttrId, Value)])
 	{
-		for (e, a, v) in retracted
-		{
-			self.remove(*e, *a, v, tx);
-		}
-		for (e, a, v) in asserted
-		{
-			self.insert(*e, *a, v, tx);
-		}
+		let retracted: Vec<(Eid, AttrId, Value)> = retracted.iter().filter(|(e, a, v)| self.remove(*e, *a, v)).cloned().collect();
 		let instant_attr = self.attr_id(TX_INSTANT).expect("built in");
-		self.insert(tx, instant_attr, &Value::Instant(instant), tx);
+		let mut asserted = asserted.to_vec();
+		asserted.push((tx, instant_attr, Value::Instant(instant)));
+		self.insert_current(&asserted, tx);
+		self.log_batch(tx, &retracted, &asserted);
 	}
 
 	/// Apply a transaction read back from the durable log: the database the transaction that wrote `rec` produced, if `self` is the database before it.
 	/// A record that doesn't fit (its basis, entity ids, schema, value types, a retraction of an absent datom, an assertion of a present one,
-	/// or a result that breaks cardinality or uniqueness) is refused with an explanation, so a corrupt record never produces an inconsistent value
-	pub(crate) fn replay(&self, rec: &TxRecord) -> Result<Db, String>
+	/// or a result that breaks cardinality or uniqueness) is refused with an explanation, so a corrupt record never produces an inconsistent value.
+	/// It consumes `self`, so the indexes, which no other value shares, are updated in place (log replay copies no paths)
+	pub(crate) fn replay(self, rec: &TxRecord) -> Result<Db, String>
 	{
 		debug_assert!(!self.history && self.since == 0 && self.upto.is_none(), "the log replays unfiltered values");
 		if rec.basis_t != self.basis_t + 1
@@ -1506,7 +1557,7 @@ impl Db
 		{
 			return Err(format!("instant {} before {}", rec.instant, self.instant));
 		}
-		let mut db = self.clone();
+		let mut db = self;
 		// The schema history records changes by basis
 		db.basis_t = rec.basis_t;
 		if rec.attrs.windows(2).any(|w| w[0].0 >= w[1].0)
@@ -1557,7 +1608,7 @@ impl Db
 		db.basis_t = rec.basis_t;
 		db.next_eid = rec.next_eid;
 		db.instant = rec.instant;
-		db.txs = db.txs.insert(rec.basis_t, rec.tx);
+		db.txs.insert_mut(rec.basis_t, rec.tx);
 		db.apply(rec.tx, rec.instant, &rec.retracted, &rec.asserted);
 		for (e, a, v) in &rec.asserted
 		{
@@ -1581,7 +1632,7 @@ impl Db
 			instant: self.instant,
 			schema: self.schema.iter().map(|(k, def)| (*k, def.clone())).collect(),
 			txs: self.txs.iter().map(|(t, tx)| (*t, *tx)).collect(),
-			history: self.tlog.iter().map(|(k, _)| k.clone()).collect(),
+			history: self.tlog.iter().map(|c| (c.tx, c.e, c.a, c.v.clone(), c.added)).collect(),
 		}
 	}
 
@@ -1620,26 +1671,37 @@ impl Db
 		names.sort();
 		increasing(names.windows(2).all(|w| w[0].0 < w[1].0), "attribute names")?;
 
-		// The history in each index's order
 		fn sorted<K: Ord>(mut v: Vec<K>) -> Vec<K>
 		{
 			v.sort_unstable();
 			v
 		}
-		let heavt = sorted(s.history.iter().map(|(tx, e, a, v, added)| (*e, *a, v.clone(), *tx, *added)).collect());
-		let haevt = sorted(s.history.iter().map(|(tx, e, a, v, added)| (*a, *e, v.clone(), *tx, *added)).collect());
-		let havet = sorted(s.history.iter().map(|(tx, e, a, v, added)| (*a, v.clone(), *e, *tx, *added)).collect());
-		let hvaet = sorted(s.history.iter().filter_map(|(tx, e, a, v, added)| if let Value::Ref(r) = v { Some((*r, *a, *e, *tx, *added)) } else { None }).collect());
+		// The history (it is in log order) in each index's order
+		let ever: BTreeSet<AttrId> = s.history.iter().map(|k| k.2).collect();
+		let tlog: Vec<Datom> = s.history.into_iter().map(|(tx, e, a, v, added)| Datom { e, a, v, tx, added }).collect();
+		fn sorted_by(mut v: Vec<Datom>, cmp: impl Fn(&Datom, &Datom) -> std::cmp::Ordering) -> Vec<Datom>
+		{
+			v.sort_unstable_by(cmp);
+			v
+		}
+		macro_rules! by {
+			($($field:ident),*) => {
+				|x: &Datom, y: &Datom| ($(&x.$field),*).cmp(&($(&y.$field),*))
+			};
+		}
+		let heavt = sorted_by(tlog.clone(), by!(e, a, v, tx, added));
+		let haevt = sorted_by(tlog.clone(), by!(a, e, v, tx, added));
+		let havet = sorted_by(tlog.clone(), by!(a, v, e, tx, added));
+		let hvaet = sorted_by(tlog.iter().filter(|d| matches!(d.v, Value::Ref(_))).cloned().collect(), by!(v, a, e, tx, added));
 		// The current datoms (EAVT order), each with the transaction of its last change, an assertion
 		let current: Vec<(Eid, AttrId, Value, Eid)> =
-			Self::current_as_of(heavt.iter(), |x, y| (x.0, x.1, &x.2) == (y.0, y.1, &y.2), |k| (k.3, k.4), Eid::MAX).into_iter().map(|(k, tx)| (k.0, k.1, k.2.clone(), tx)).collect();
+			Self::current_as_of(heavt.iter(), |x, y| (x.e, x.a, &x.v) == (y.e, y.a, &y.v), |d| (d.tx, d.added), Eid::MAX).into_iter().map(|(d, tx)| (d.e, d.a, d.v.clone(), tx)).collect();
 		let aevt = sorted(current.iter().map(|(e, a, v, tx)| ((*a, *e, v.clone()), *tx)).collect());
 		let avet = sorted(current.iter().map(|(e, a, v, tx)| ((*a, v.clone(), *e), *tx)).collect());
 		let vaet = sorted(current.iter().filter_map(|(e, a, v, tx)| if let Value::Ref(r) = v { Some(((*r, *a, *e), *tx)) } else { None }).collect());
 
 		// The statistics: the number of entries, and of distinct (attribute, entity) and (attribute, value) pairs, of each attribute
 		// that ever had a datom (as transact keeps one for every attribute it ever inserted, zero counts included)
-		let ever: BTreeSet<AttrId> = s.history.iter().map(|k| k.2).collect();
 		let count = |ae: &mut dyn Iterator<Item = (AttrId, bool)>, av: &mut dyn Iterator<Item = (AttrId, bool)>, datoms: &mut dyn Iterator<Item = AttrId>| {
 			let mut stats: BTreeMap<AttrId, AttrStats> = ever.iter().map(|a| (*a, AttrStats::default())).collect();
 			for a in datoms
@@ -1662,7 +1724,7 @@ impl Db
 			list.iter().enumerate().map(move |(i, k)| (key(k).0, i == 0 || key(&list[i - 1]) != key(k)))
 		}
 		let stats = count(&mut firsts(&aevt, |k| (k.0 .0, k.0 .1)), &mut firsts(&avet, |k| (k.0 .0, &k.0 .1)), &mut aevt.iter().map(|k| k.0 .0));
-		let hstats = count(&mut firsts(&haevt, |k| (k.0, k.1)), &mut firsts(&havet, |k| (k.0, &k.1)), &mut haevt.iter().map(|k| k.0));
+		let hstats = count(&mut firsts(&haevt, |d| (d.a, d.e)), &mut firsts(&havet, |d| (d.a, &d.v)), &mut haevt.iter().map(|d| d.a));
 
 		Ok(Db {
 			basis_t: s.basis_t,
@@ -1675,11 +1737,11 @@ impl Db
 			aevt: PMap::from_sorted(aevt),
 			avet: PMap::from_sorted(avet),
 			vaet: PMap::from_sorted(vaet),
-			heavt: PMap::from_sorted(heavt.into_iter().map(|k| (k, ()))),
-			haevt: PMap::from_sorted(haevt.into_iter().map(|k| (k, ()))),
-			havet: PMap::from_sorted(havet.into_iter().map(|k| (k, ()))),
-			hvaet: PMap::from_sorted(hvaet.into_iter().map(|k| (k, ()))),
-			tlog: PMap::from_sorted(s.history.into_iter().map(|k| (k, ()))),
+			heavt: HIndex::from_sorted(EAVT, heavt),
+			haevt: HIndex::from_sorted(AEVT, haevt),
+			havet: HIndex::from_sorted(AVET, havet),
+			hvaet: HIndex::from_sorted(VAET, hvaet),
+			tlog: HIndex::from_sorted(LOG, tlog),
 			schema: PMap::from_sorted(s.schema),
 			hstats,
 			txs: PMap::from_sorted(s.txs),
@@ -1689,64 +1751,121 @@ impl Db
 		})
 	}
 
-	// Assert an absent datom in transaction tx (insert and remove only see unfiltered values, as transact refuses views)
-	fn insert(&mut self, e: Eid, a: AttrId, v: &Value, tx: Eid)
-	{
-		let mut s = self.stats(a);
-		s.datoms += 1;
-		s.entities += self.values(e, a).next().is_none() as u64;
-		s.values += self.entities(a, v).next().is_none() as u64;
-		self.stats = self.stats.insert(a, s);
-		self.eavt = self.eavt.insert((e, a, v.clone()), tx);
-		self.aevt = self.aevt.insert((a, e, v.clone()), tx);
-		self.avet = self.avet.insert((a, v.clone(), e), tx);
-		if let Value::Ref(r) = v
-		{
-			self.vaet = self.vaet.insert((*r, a, e), tx);
-		}
-		self.log(e, a, v, tx, true);
-	}
+	// The statistics count distinct entities and values: whether another key of an index shares a changed key's (attribute, entity) or
+	// (attribute, value) prefix is what the removal or the batch insertion itself shows from the keys around it (`PMap::remove_mut_near`,
+	// `PMap::insert_batch_mut`), and only when those are in another leaf does it take a search of its own
 
-	// Retract a datom in transaction tx; returns whether it was present
-	fn remove(&mut self, e: Eid, a: AttrId, v: &Value, tx: Eid) -> bool
+	// Retract a present datom from the current indexes (insertions and removals only see unfiltered values, as transact refuses views);
+	// returns whether it was present
+	fn remove(&mut self, e: Eid, a: AttrId, v: &Value) -> bool
 	{
-		if !self.eavt.contains_key(&(e, a, v.clone()))
+		if self.eavt.remove_mut(&(e, a, v.clone())).is_none()
 		{
 			return false;
 		}
-		self.eavt = self.eavt.remove(&(e, a, v.clone()));
-		self.aevt = self.aevt.remove(&(a, e, v.clone()));
-		self.avet = self.avet.remove(&(a, v.clone(), e));
+		let other_e = self.aevt.remove_mut_near(&(a, e, v.clone()), |k| (k.0, k.1) == (a, e)).expect("the indexes agree").1.unwrap_or_else(|| self.values(e, a).next().is_some());
+		let other_v = self.avet.remove_mut_near(&(a, v.clone(), e), |k| k.0 == a && k.1 == *v).expect("the indexes agree").1.unwrap_or_else(|| self.entities(a, v).next().is_some());
 		if let Value::Ref(r) = v
 		{
-			self.vaet = self.vaet.remove(&(*r, a, e));
+			self.vaet.remove_mut(&(*r, a, e));
 		}
 		let mut s = self.stats(a);
 		s.datoms -= 1;
-		s.entities -= self.values(e, a).next().is_none() as u64;
-		s.values -= self.entities(a, v).next().is_none() as u64;
-		self.stats = self.stats.insert(a, s);
-		self.log(e, a, v, tx, false);
+		s.entities -= !other_e as u64;
+		s.values -= !other_v as u64;
+		self.stats.insert_mut(a, s);
 		true
 	}
 
-	// Append a change to the history indexes (a transaction changes a datom once at most, so the keys are new)
-	fn log(&mut self, e: Eid, a: AttrId, v: &Value, tx: Eid, added: bool)
+	// Assert absent datoms in the current indexes, as one batch per index (each touched node visited once)
+	fn insert_current(&mut self, datoms: &[(Eid, AttrId, Value)], tx: Eid)
 	{
-		let mut s = self.hstats.get(&a).copied().unwrap_or_default();
-		s.datoms += 1;
-		s.entities += self.haevt.seek(|k| (k.0, k.1) < (a, e)).next().map_or(true, |(k, _)| (k.0, k.1) != (a, e)) as u64;
-		s.values += self.havet.seek(|k| (k.0, &k.1) < (a, v)).next().map_or(true, |(k, _)| (k.0, &k.1) != (a, v)) as u64;
-		self.hstats = self.hstats.insert(a, s);
-		self.heavt = self.heavt.insert((e, a, v.clone(), tx, added), ());
-		self.haevt = self.haevt.insert((a, e, v.clone(), tx, added), ());
-		self.havet = self.havet.insert((a, v.clone(), e, tx, added), ());
-		if let Value::Ref(r) = v
+		let mut deltas: BTreeMap<AttrId, AttrStats> = BTreeMap::new();
+		for (_, a, _) in datoms
 		{
-			self.hvaet = self.hvaet.insert((*r, a, e, tx, added), ());
+			deltas.entry(*a).or_default().datoms += 1;
 		}
-		self.tlog = self.tlog.insert((tx, e, a, v.clone(), added), ());
+		self.eavt.insert_batch_mut(sorted_batch(datoms.iter().map(|(e, a, v)| ((*e, *a, v.clone()), tx))), None);
+		let aevt = sorted_batch(datoms.iter().map(|(e, a, v)| ((*a, *e, v.clone()), tx)));
+		let keys: Vec<(AttrId, Eid)> = aevt.iter().map(|(k, _)| (k.0, k.1)).collect();
+		let answers = self.aevt.insert_batch_mut(aevt, Some(&|x, y| (x.0, x.1) == (y.0, y.1)));
+		for (a, _) in fresh_groups(&keys, &answers, |(a, e)| self.values(*e, *a).count())
+		{
+			deltas.entry(*a).or_default().entities += 1;
+		}
+		let avet = sorted_batch(datoms.iter().map(|(e, a, v)| ((*a, v.clone(), *e), tx)));
+		let keys: Vec<(AttrId, Value)> = avet.iter().map(|(k, _)| (k.0, k.1.clone())).collect();
+		let answers = self.avet.insert_batch_mut(avet, Some(&|x, y| x.0 == y.0 && x.1 == y.1));
+		for (a, _) in fresh_groups(&keys, &answers, |(a, v)| self.entities(*a, v).count())
+		{
+			deltas.entry(*a).or_default().values += 1;
+		}
+		let refs = sorted_batch(datoms.iter().filter_map(|(e, a, v)| if let Value::Ref(r) = v { Some(((*r, *a, *e), tx)) } else { None }));
+		self.vaet.insert_batch_mut(refs, None);
+		for (a, d) in deltas
+		{
+			let mut s = self.stats(a);
+			(s.datoms, s.entities, s.values) = (s.datoms + d.datoms, s.entities + d.entities, s.values + d.values);
+			self.stats.insert_mut(a, s);
+		}
 	}
+
+	// Append transaction tx's changes to the history indexes (a transaction changes a datom once at most, so the entries are new)
+	fn log_batch(&mut self, tx: Eid, retracted: &[(Eid, AttrId, Value)], asserted: &[(Eid, AttrId, Value)])
+	{
+		for (e, a, v, added) in retracted.iter().map(|(e, a, v)| (*e, *a, v, false)).chain(asserted.iter().map(|(e, a, v)| (*e, *a, v, true)))
+		{
+			let mut s = self.hstats.get(&a).copied().unwrap_or_default();
+			s.datoms += 1;
+			s.entities += !self.haevt.contains(&[Key::A(a), Key::E(e)]) as u64;
+			s.values += !self.havet.contains(&[Key::A(a), Key::V(v)]) as u64;
+			self.hstats.insert_mut(a, s);
+			let d = Datom { e, a, v: v.clone(), tx, added };
+			self.heavt.insert(d.clone());
+			self.haevt.insert(d.clone());
+			self.havet.insert(d.clone());
+			if let Value::Ref(_) = v
+			{
+				self.hvaet.insert(d.clone());
+			}
+			self.tlog.insert(d);
+		}
+	}
+
+	/// The entries of the five history indexes together, and the bytes they take (which the timing tests report)
+	#[cfg(test)]
+	pub(crate) fn history_size(&self) -> (usize, usize)
+	{
+		[&self.heavt, &self.haevt, &self.havet, &self.hvaet, &self.tlog].iter().fold((0, 0), |(n, bytes), h| (n + h.len(), bytes + h.heap_bytes()))
+	}
+}
+
+// A batch for `PMap::insert_batch_mut`: the entries in key order
+fn sorted_batch<K: Ord, V>(entries: impl Iterator<Item = (K, V)>) -> Vec<(K, V)>
+{
+	let mut v: Vec<(K, V)> = entries.collect();
+	v.sort_unstable_by(|x, y| x.0.cmp(&y.0));
+	v
+}
+
+// The prefixes that a batch made new: for each group of equal prefixes in the batch (`keys`, in order), the prefix if no key that was in
+// the index before has it, from the batch's answers or, where its leaves couldn't tell, by counting the keys with the prefix now (`count`)
+fn fresh_groups<'k, P: PartialEq>(keys: &'k [P], answers: &[Option<bool>], count: impl Fn(&P) -> usize) -> Vec<&'k P>
+{
+	let mut out = Vec::new();
+	let mut s = 0;
+	while s < keys.len()
+	{
+		let e = s + keys[s..].iter().take_while(|k| **k == keys[s]).count();
+		let group = &answers[s..e];
+		let old = if group.contains(&Some(true)) { true } else if group.contains(&None) { count(&keys[s]) > e - s } else { false };
+		if !old
+		{
+			out.push(&keys[s]);
+		}
+		s = e;
+	}
+	out
 }
 
 /// A connection: the current database value, in memory (`Conn::new`) or backed by a durable log (`Conn::open`).
@@ -1800,15 +1919,24 @@ impl Conn
 		self.db.clone()
 	}
 
-	/// Apply a transaction; on a durable connection, it returns once the transaction's record is appended to the log and synced
+	/// Apply a transaction; on a durable connection, it returns once the transaction's record is appended to the log and synced.
+	///
+	/// The history already keeps every past value (each change is stored with its transaction: the *fat-node* method of partial
+	/// persistence), so the connection doesn't also keep the value before the transaction by path copying: it plans the transaction
+	/// (everything that can fail), lets go of its value, and applies the changes to the indexes in place, unless something else
+	/// (a value a caller holds, a report) still shares them. The report's `db_before` is an `as_of` view of the new value.
 	pub fn transact(&mut self, tx: &Tx) -> Result<TxReport, Error>
 	{
-		let report = self.db.transact(tx)?;
+		let planned = self.db.plan(tx)?;
 		// Durable before it is visible: a transaction whose append fails isn't committed
 		if let Some(log) = &mut self.log
 		{
-			log.append(&report.record())?;
+			log.append(&planned.record(&self.db))?;
 		}
+		let t = self.db.basis_t;
+		self.db = Db::default();
+		let mut report = planned.finish(Db::default());
+		report.db_before = report.db_after.as_of(t).expect("an earlier basis");
 		self.db = report.db_after.clone();
 		Ok(report)
 	}
@@ -2644,11 +2772,10 @@ pub(crate) mod tests
 		assert_eq!(all(&x.aevt), all(&y.aevt), "{what}");
 		assert_eq!(all(&x.avet), all(&y.avet), "{what}");
 		assert_eq!(all(&x.vaet), all(&y.vaet), "{what}");
-		assert_eq!(all(&x.heavt), all(&y.heavt), "{what}");
-		assert_eq!(all(&x.haevt), all(&y.haevt), "{what}");
-		assert_eq!(all(&x.havet), all(&y.havet), "{what}");
-		assert_eq!(all(&x.hvaet), all(&y.hvaet), "{what}");
-		assert_eq!(all(&x.tlog), all(&y.tlog), "{what}");
+		for (hx, hy) in [(&x.heavt, &y.heavt), (&x.haevt, &y.haevt), (&x.havet, &y.havet), (&x.hvaet, &y.hvaet), (&x.tlog, &y.tlog)]
+		{
+			assert_eq!(hx.iter().map(|c| c.datom()).collect::<Vec<_>>(), hy.iter().map(|c| c.datom()).collect::<Vec<_>>(), "{what}");
+		}
 		assert_eq!(all(&x.schema), all(&y.schema), "{what}");
 	}
 
@@ -2907,10 +3034,10 @@ pub(crate) mod tests
 		// An alteration is recorded for the durable log, and replays to the same value
 		let mut tx = Tx::new();
 		tx.alter_attr(Attr::new("person/email", ValueType::Str, Cardinality::One));
-		let rep = conn.transact(&tx).unwrap();
+		let rep = conn.db().transact(&tx).unwrap();
 		let email = conn.db().attr_id("person/email").unwrap();
 		assert_eq!(rep.record().attrs, vec![(email, Attr::new("person/email", ValueType::Str, Cardinality::One))]);
-		assert_same_db(&rep.db_before.replay(&rep.record()).unwrap(), &rep.db_after, "replayed alteration");
+		assert_same_db(&rep.db_before.clone().replay(&rep.record()).unwrap(), &rep.db_after, "replayed alteration");
 	}
 
 	#[test]
@@ -3104,5 +3231,92 @@ pub(crate) mod tests
 			assert_eq!(view.transact(&Tx::new()).err(), Some(Error::FilteredDb));
 		}
 		assert_eq!(latest.as_of(latest.basis_t()).unwrap().upto, None);
+	}
+
+	// Throughput of bulk loads (release: cargo test --release bulk_timings -- --ignored --nocapture): large transactions of new entities,
+	// 200 entities of 5 attributes each per transaction, so that each index's insertions cluster
+	#[test]
+	#[ignore]
+	fn bulk_timings()
+	{
+		let mut conn = Conn::new();
+		let mut tx = Tx::new();
+		for a in ["a", "b", "c", "d"]
+		{
+			tx.define(a, ValueType::Int, Cardinality::One);
+		}
+		tx.define("name", ValueType::Str, Cardinality::One);
+		conn.transact(&tx).unwrap();
+		let t = std::time::Instant::now();
+		for round in 0..200i64
+		{
+			let mut tx = Tx::new();
+			for i in 0..200i64
+			{
+				let e = tx.temp();
+				let n = round * 200 + i;
+				tx.add(e, "a", n % 97).add(e, "b", n % 13).add(e, "c", n).add(e, "d", -n).add(e, "name", format!("entity {n}").as_str());
+			}
+			conn.transact(&tx).unwrap();
+		}
+		println!("bulk: 200 transactions of 1000 datoms: {:?}", t.elapsed());
+	}
+
+	// Throughput of the indexes (release: cargo test --release index_timings -- --ignored --nocapture): transactions of 20 assertions
+	// (a quarter on new entities), then reads of the current value, of a past one (as_of) and a full scan
+	#[test]
+	#[ignore]
+	fn index_timings()
+	{
+		for txs in [10_000, 50_000]
+		{
+			let mut conn = Conn::new();
+			let mut tx = Tx::new();
+			tx.define("n", ValueType::Int, Cardinality::One).define("tag", ValueType::Str, Cardinality::Many).define("ref", ValueType::Ref, Cardinality::Many);
+			conn.transact(&tx).unwrap();
+			let mut rng = Rng::new(3);
+			let mut eids: Vec<Eid> = Vec::new();
+			let t = std::time::Instant::now();
+			for _ in 1..txs
+			{
+				let mut tx = Tx::new();
+				for _ in 0..20
+				{
+					let e = if eids.is_empty() || rng.next() % 4 == 0 { tx.temp() } else { Entity::Id(eids[(rng.next() % eids.len() as u64) as usize]) };
+					match rng.next() % 3
+					{
+						0 => tx.add(e, "n", (rng.next() % 1000) as i64),
+						1 => tx.add(e, "tag", ["a", "b", "c", "d"][(rng.next() % 4) as usize]),
+						_ if !eids.is_empty() => tx.add(e, "ref", Entity::Id(eids[(rng.next() % eids.len() as u64) as usize])),
+						_ => tx.add(e, "n", 0),
+					};
+				}
+				if let Ok(r) = conn.transact(&tx)
+				{
+					eids.extend(r.tempids.iter().copied());
+				}
+			}
+			let transact = t.elapsed();
+			let db = conn.db();
+			let (n, tag) = (db.attr_id("n").unwrap(), db.attr_id("tag").unwrap());
+			let t = std::time::Instant::now();
+			let mut hits = 0usize;
+			for (i, e) in eids.iter().enumerate().step_by(7)
+			{
+				hits += db.values(*e, n).count() + db.entities(tag, &Value::from(["a", "b", "c", "d"][i % 4])).take(10).count();
+			}
+			let reads = t.elapsed();
+			let past = db.as_of(db.basis_t() / 2).unwrap();
+			let t = std::time::Instant::now();
+			for e in eids.iter().take(eids.len() / 2).step_by(7)
+			{
+				hits += past.values(*e, n).count();
+			}
+			let past_reads = t.elapsed();
+			let t = std::time::Instant::now();
+			hits += db.attr_datoms(tag).count();
+			let scan = t.elapsed();
+			println!("{txs} transactions ({} entities): transact {transact:?}; {} point reads {reads:?}; as-of reads {past_reads:?}; scan {scan:?} ({hits})", eids.len(), eids.len() / 7);
+		}
 	}
 }

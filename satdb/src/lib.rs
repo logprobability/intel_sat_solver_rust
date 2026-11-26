@@ -14,7 +14,9 @@
 //! * `parse`: the text syntax of queries (a subset of Datomic's Datalog, in EDN), read into the query builder (`Db::q`, `Db::q_rules`), and of pull patterns (`Db::pull_str`).
 //! * `planner`: the join order, by an exact dynamic program for queries of up to 16 clauses and an incremental SAT encoding beyond,
 //!   with hard ordering constraints (`Query::require_before`), whose conflicts the SAT solver's UNSAT cores explain (see its documentation).
-//! * `pmap`: the persistent sorted map under the indexes.
+//! * `pmap`: the persistent sorted map under the current indexes, a B+-tree with in-place updates of unshared nodes; `bemap`: a persistent
+//!   Bε-tree measured against it and not used (see its documentation).
+//! * `hist` and `succinct` (private): the history indexes, which only grow: immutable compressed segments (Elias-Fano sequences and bit-packed rows) and a small tail.
 //!
 //! ```
 //! use satdb::{Cardinality, Cmp, Conn, Entity, Tx, Value, ValueType};
@@ -52,12 +54,15 @@
 //! ```
 
 pub mod db;
+mod hist;
 mod log;
 pub mod parse;
 pub mod planner;
+pub mod bemap;
 pub mod pmap;
 pub mod query;
 pub mod rules;
+mod succinct;
 
 pub use db::{Attr, AttrId, AttrStats, Cardinality, Conn, Datom, Db, Eid, Entity, Error, Tx, TxLogEntry, TxReport, TxValue, Unique, Value, ValueType, T, TX_INSTANT};
 pub use parse::{Cell, Found, Input, TextQuery};
