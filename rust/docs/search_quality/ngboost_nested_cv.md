@@ -116,7 +116,10 @@ Four instances cannot support nested cross-validation, so the planner gets no in
 
 ## Deviations
 
-(none yet)
+1. **Validation curves of `ngb`, `ngb_stack` and `ngb_lr` are computed with p clipped to [1e-6, 1 - 1e-6]** instead of from ngboost's `evals_result["val"]` (and `OffsetBernoulliNGB`'s own unclipped curve).
+   Found in a smoke test on one 3-colouring fold with tiny round caps, before the real fit: ngboost's log score is unclipped, and on the near-deterministic variables of 3-colouring (isolated vertices) it reaches an infinite mean after a few rounds at learning rate 0.1,
+   which makes the fold-averaged curve infinite from there on. The clipped log loss is the one used everywhere else (the inner scores of `logreg` and `gbm`, and the reported metric); where both are finite they agreed in the smoke test to every printed digit.
+   The curves are computed from `staged_predict_proba` (ngboost) and from the trees and scales of `OffsetBernoulliNGB`.
 
 ## Results
 

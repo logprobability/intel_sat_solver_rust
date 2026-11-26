@@ -51,6 +51,10 @@ def log_loss(theta, y):
 
 # Natural-gradient boosting of a Bernoulli logit from a per-sample offset
 class OffsetBernoulliNGB:
+	# rate, depth: the learning rate and the tree depth; patience: the rounds after the best validation loss after which the fit stops (None: never; ngb_nested_cv.py records whole curves)
+	def __init__(self, rate=RATE, depth=3, patience=PATIENCE):
+		self.rate, self.depth, self.patience = rate, depth, patience
+
 	# NGBoost's line search: double the scale while the loss of the minibatch does not rise, then halve it until the loss is below the initial one
 	@staticmethod
 	def line_search(step, theta, y):
@@ -79,16 +83,16 @@ class OffsetBernoulliNGB:
 			idx = rng.choice(len(y), int(FRAC * len(y)), replace=False)
 			p = np.clip(expit(theta[idx]), EPS, 1 - EPS)
 			grad = (p - y[idx]) / (p * (1 - p))
-			tree = DecisionTreeRegressor(criterion="friedman_mse", max_depth=3, random_state=rng.randint(2 ** 31 - 1)).fit(X[idx], grad)
+			tree = DecisionTreeRegressor(criterion="friedman_mse", max_depth=self.depth, random_state=rng.randint(2 ** 31 - 1)).fit(X[idx], grad)
 			step = tree.predict(X[idx])
 			scale = self.line_search(step, theta[idx], y[idx])
 			self.trees.append(tree)
 			self.scales.append(scale)
-			theta -= RATE * scale * tree.predict(X)
+			theta -= self.rate * scale * tree.predict(X)
 			if val is not None:
-				thetaV -= RATE * scale * tree.predict(Xv)
+				thetaV -= self.rate * scale * tree.predict(Xv)
 				self.val_loss.append(log_loss(thetaV, yv))
-				if len(self.val_loss) - 1 > PATIENCE and min(self.val_loss) < min(self.val_loss[-PATIENCE:]):
+				if self.patience is not None and len(self.val_loss) - 1 > self.patience and min(self.val_loss) < min(self.val_loss[-self.patience:]):
 					break
 			if np.abs(step).mean() < 1e-4:
 				break
@@ -97,7 +101,7 @@ class OffsetBernoulliNGB:
 	def logit(self, X, offset):
 		theta = np.array(offset, dtype=float)
 		for tree, scale in zip(self.trees, self.scales):
-			theta -= RATE * scale * tree.predict(X)
+			theta -= self.rate * scale * tree.predict(X)
 		return theta
 
 # The stock NGBClassifier with the early stopping used here: returns (probabilities of Xte, rounds chosen, validation loss at 0 rounds, at the chosen number, seconds per predicted row)
